@@ -81,7 +81,7 @@ python train.py selfplay --generations 10 --games 4
 ├── attnres.py              # Block Attention Residuals
 ├── train.py                # CLI entry point (selfplay / randopt modes)
 ├── setup.sh                # RunPod / Linux GPU setup
-├── experiments/            # Individual experiment scripts
+├── experiments/            # Individual experiment scripts (exp001-017)
 └── .github/instructions/   # Agent instructions
 ```
 
@@ -97,12 +97,23 @@ python train.py selfplay --generations 10 --games 4
 - **exp010**: Unfreezing backbone doesn't help — data volume is the bottleneck
 - **exp012b**: Stockfish depth-10 labels. 5K positions → 14.2% accuracy, top3 31%. Needs more data + compute
 
+### Phase 3: Advanced training & search (exp013-017, in progress)
+- **exp013**: Action-value Q(s,a) training — label ALL legal moves per position with Stockfish, ~30× more gradient signal per position
+- **exp014**: Monte Carlo Tree Search at inference — use policy head as prior + value head for leaf evaluation
+- **exp015**: LoRA fine-tuning of Qwen backbone attention layers (rank=16, alpha=32) to unlock backbone adaptation
+- **exp016**: Enriched board encoder with attack maps, pawn structure, material balance, game phase, mobility (71 tokens vs 67)
+- **exp017**: Data scaling law measurement — fit power law at 1K/5K/10K/20K and extrapolate to 100K-1M
+
 ### Next Steps
-1. Scale to 50K-100K Stockfish-labeled positions on RunPod GPU
-2. Longer training (20+ epochs) with cosine LR schedule
-3. Multi-move soft targets from Stockfish
-4. Value head integration for search during game play
-5. **Goal: Beat Stockfish** at progressively higher depth levels
+1. **Scale data to 100K+ Stockfish-labeled positions** on RunPod GPU — scaling law (exp017) suggests this is the single biggest lever
+2. **Action-value training (exp013)**: Train on all legal move evaluations per position for denser gradient signal
+3. **MCTS search (exp014)**: Use policy+value heads for tree search at inference to improve playing strength beyond raw accuracy
+4. **LoRA fine-tuning (exp015)**: Unfreeze backbone attention via low-rank adaptation — likely matters more at larger data volumes
+5. **Rich features (exp016)**: Attack maps, pawn structure, material balance give the encoder more chess knowledge
+6. **Knowledge distillation**: Use Stockfish top-3 moves as soft targets (KL divergence loss) instead of hard best-move labels
+7. **Curriculum learning**: Train on progressively harder positions (simple endgames → complex middlegames)
+8. **Hybrid architecture**: Combine learned embeddings with lightweight CNN features for both global and local pattern recognition
+9. **Goal: Beat Stockfish** at progressively higher depth levels
 
 ## References
 
