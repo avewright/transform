@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Outputs (large, regeneratable)
+outputs/
+stockfish/
+
+# Data caches
+data/cache/
+*.json.bak
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Model weights (don't commit large files)
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
