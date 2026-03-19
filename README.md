@@ -34,10 +34,11 @@ Policy Head  Value Head
 | exp009 | 500 self-distilled | 46% (learned) vs 50% (CNN) | Learned encoder matches CNN with 21x fewer params |
 | exp010 | 500 self-distilled | 48% (all variants) | Unfreezing backbone doesn't help — data is bottleneck |
 | exp012b | 5000 Stockfish d10 | 14.2% (top3: 31%) | Stockfish labels are harder. Gets checkmated by SF d3 |
+| exp013 | 50K game-play (HF) | 25.0% (top3: 45%) | 10x data from HF dataset. Noisier labels but higher accuracy |
 
 100% legal move rate throughout (via legal-move masking).
 
-**Next milestone:** Scale to 50K-100K Stockfish-labeled positions with longer training on GPU (RunPod).
+**Next milestone:** Combine HF data volume with Stockfish labeling — re-label 50K+ positions with Stockfish for cleaner targets.
 
 ## Setup
 
@@ -97,9 +98,12 @@ python train.py selfplay --generations 10 --games 4
 - **exp010**: Unfreezing backbone doesn't help — data volume is the bottleneck
 - **exp012b**: Stockfish depth-10 labels. 5K positions → 14.2% accuracy, top3 31%. Needs more data + compute
 
+### Phase 3: Data scaling (exp013+)
+- **exp013**: 50K game-play positions from HF dataset (`avewright/chess-dataset-production-1968`). 25.0% accuracy, top3 45%. Data volume > label quality at this scale. Still loses to SF d3.
+
 ### Next Steps
-1. Scale to 50K-100K Stockfish-labeled positions on RunPod GPU
-2. Longer training (20+ epochs) with cosine LR schedule
+1. Re-label 50K+ positions with Stockfish for cleaner targets at scale
+2. Longer training (10+ epochs) — accuracy still rising at epoch 3
 3. Multi-move soft targets from Stockfish
 4. Value head integration for search during game play
 5. **Goal: Beat Stockfish** at progressively higher depth levels

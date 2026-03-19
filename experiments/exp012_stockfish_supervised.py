@@ -36,7 +36,7 @@ from model import load_base_model
 from move_vocab import VOCAB_SIZE, IDX_TO_UCI, UCI_TO_IDX, move_to_index, legal_move_mask
 from config import Config
 
-STOCKFISH_PATH = "stockfish/stockfish/stockfish-windows-x86-64-avx2.exe"
+STOCKFISH_PATH = "stockfish/stockfish/stockfish-ubuntu-x86-64-avx2"
 OUTPUT_DIR = Path("outputs/exp012_stockfish_supervised")
 CACHE_FILE = OUTPUT_DIR / "labeled_data.json"
 
