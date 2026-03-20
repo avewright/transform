@@ -1,0 +1,96 @@
+{
+  "experiment": "exp013_hf_dataset_scale",
+  "hypothesis": "50K game-play positions from HF dataset will outperform 5K Stockfish positions",
+  "data": {
+    "source": "avewright/chess-dataset-production-1968",
+    "train": 50000,
+    "eval": 500,
+    "label_type": "game-play moves (not Stockfish)",
+    "limitations": "no castling/ep metadata, noisy value labels"
+  },
+  "training": {
+    "epochs": 3,
+    "batch_size": 64,
+    "lr": 0.001,
+    "encoder_dim": 256
+  },
+  "pre_eval": {
+    "accuracy": 0.025,
+    "top3_accuracy": 0.17,
+    "total": 200
+  },
+  "final_eval": {
+    "accuracy": 0.228,
+    "top3_accuracy": 0.392,
+    "total": 500
+  },
+  "best_epoch_acc": 0.25,
+  "history": [
+    {
+      "accuracy": 0.25,
+      "top3_accuracy": 0.4,
+      "total": 200,
+      "policy_loss": 4.3557877473514095,
+      "value_loss": 0.805896693483338
+    },
+    {
+      "accuracy": 0.245,
+      "top3_accuracy": 0.415,
+      "total": 200,
+      "policy_loss": 4.180247185480259,
+      "value_loss": 0.7968604029596918
+    },
+    {
+      "accuracy": 0.25,
+      "top3_accuracy": 0.41,
+      "total": 200,
+      "policy_loss": 4.154455727933313,
+      "value_loss": 0.7935907740879546
+    }
+  ],
+  "games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 32,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 21,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 21,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 28,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "game_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 4,
+    "total": 4
+  },
+  "timing": {
+    "train_s": 1197.2765653133392,
+    "total_s": 1220.3292860984802
+  },
+  "baseline_comparison": {
+    "exp012b_acc": 0.142,
+    "exp012b_top3": 0.31,
+    "exp012b_sf_score": "0/4"
+  }
+}

@@ -34,10 +34,15 @@ Policy Head  Value Head
 | exp009 | 500 self-distilled | 46% (learned) vs 50% (CNN) | Learned encoder matches CNN with 21x fewer params |
 | exp010 | 500 self-distilled | 48% (all variants) | Unfreezing backbone doesn't help — data is bottleneck |
 | exp012b | 5000 Stockfish d10 | 14.2% (top3: 31%) | Stockfish labels are harder. Gets checkmated by SF d3 |
+| exp_av_v2 | 5K random + SF all-move | 8.8% (top3: 21.8%) | AV vs policy CE = TIE on random positions |
+| exp_av_real | 3K HF games + SF all-move | 23.6% (top3: 48.8%) | AV vs policy = TIE; real games >>  random positions |
+| exp013 | 50K HF game-play | 25.0% (top3: 45%) | Policy CE, best result so far |
 
 100% legal move rate throughout (via legal-move masking).
 
-**Next milestone:** Scale to 50K-100K Stockfish-labeled positions with longer training on GPU (RunPod).
+**Key finding:** Position quality (real games vs random play) matters far more than loss function design (policy CE vs action-value Q). Real game positions give ~23% accuracy at 3K while random positions give ~9% at 5K.
+
+**Next milestone:** Scale real-game Stockfish-labeled positions to 50K+ and test soft-target/KL formulations.
 
 ## Setup
 
@@ -97,23 +102,19 @@ python train.py selfplay --generations 10 --games 4
 - **exp010**: Unfreezing backbone doesn't help — data volume is the bottleneck
 - **exp012b**: Stockfish depth-10 labels. 5K positions → 14.2% accuracy, top3 31%. Needs more data + compute
 
-### Phase 3: Advanced training & search (exp013-017, in progress)
-- **exp013**: Action-value Q(s,a) training — label ALL legal moves per position with Stockfish, ~30× more gradient signal per position
-- **exp014**: Monte Carlo Tree Search at inference — use policy head as prior + value head for leaf evaluation
-- **exp015**: LoRA fine-tuning of Qwen backbone attention layers (rank=16, alpha=32) to unlock backbone adaptation
-- **exp016**: Enriched board encoder with attack maps, pawn structure, material balance, game phase, mobility (71 tokens vs 67)
-- **exp017**: Data scaling law measurement — fit power law at 1K/5K/10K/20K and extrapolate to 100K-1M
+### Phase 3: Supervision quality & data scaling (exp_av, exp013)
+- **exp_av_comparison_v2**: Fair A/B on 5K random positions — policy CE vs action-value Q(s,a) = TIE at 8.8%
+- **exp_av_real_games**: Same comparison on 3K real game positions — TIE at 23.4-23.6%
+- **Key insight**: Position quality (real games vs random play) dominates loss function choice. 15pp gap from data source, 0pp from AV signal
+- **exp013**: 50K HF game-play positions with policy CE → 25% accuracy (best result)
 
 ### Next Steps
-1. **Scale data to 100K+ Stockfish-labeled positions** on RunPod GPU — scaling law (exp017) suggests this is the single biggest lever
-2. **Action-value training (exp013)**: Train on all legal move evaluations per position for denser gradient signal
-3. **MCTS search (exp014)**: Use policy+value heads for tree search at inference to improve playing strength beyond raw accuracy
-4. **LoRA fine-tuning (exp015)**: Unfreeze backbone attention via low-rank adaptation — likely matters more at larger data volumes
-5. **Rich features (exp016)**: Attack maps, pawn structure, material balance give the encoder more chess knowledge
-6. **Knowledge distillation**: Use Stockfish top-3 moves as soft targets (KL divergence loss) instead of hard best-move labels
-7. **Curriculum learning**: Train on progressively harder positions (simple endgames → complex middlegames)
-8. **Hybrid architecture**: Combine learned embeddings with lightweight CNN features for both global and local pattern recognition
-9. **Goal: Beat Stockfish** at progressively higher depth levels
+1. **Scale real-game data to 50K+** with Stockfish best-move labels on HF game positions
+2. **Soft targets**: Test top-k move probabilities or KL divergence instead of hard best-move CE
+3. **Chess-native transformer**: Build small encoder-only model (12-16 layers, 384-768d) trained from scratch on chess tokens
+4. **LoRA fine-tuning (exp015)**: Unfreeze backbone attention via low-rank adaptation — test after data scaling saturates
+5. **MCTS search (exp014)**: Use policy+value heads for tree search — test after value quality improves
+6. **Goal: Beat Stockfish** at progressively higher depth levels
 
 ## References
 

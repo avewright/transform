@@ -1,0 +1,120 @@
+{
+  "experiment": "exp024_scaled_chess_transformer",
+  "hypothesis": "Full dataset unlocks higher accuracy for chess transformer",
+  "seed": 42,
+  "data": {
+    "train": 461574,
+    "eval": 1000
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "trainable": 26136066
+  },
+  "training": {
+    "epochs": 3,
+    "batch_size": 128,
+    "lr": 0.0003
+  },
+  "results": {
+    "best_acc": 0.487,
+    "final": {
+      "accuracy": 0.487,
+      "top3_accuracy": 0.739,
+      "total": 1000
+    },
+    "history": [
+      {
+        "accuracy": 0.434,
+        "top3_accuracy": 0.694,
+        "total": 1000,
+        "loss": 3.114050117727459,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.465,
+        "top3_accuracy": 0.73,
+        "total": 1000,
+        "loss": 2.4955233475955065,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.487,
+        "top3_accuracy": 0.739,
+        "total": 1000,
+        "loss": 2.3348282738540984,
+        "epoch": 3
+      }
+    ],
+    "exp023_baseline": 0.405,
+    "qwen3_spatial_baseline": 0.365
+  },
+  "games": [
+    {
+      "model_color": "white",
+      "result": "1/2-1/2",
+      "model_result": "draw",
+      "moves": 31,
+      "termination": "FIVEFOLD_REPETITION"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 19,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "1/2-1/2",
+      "model_result": "draw",
+      "moves": 39,
+      "termination": "FIVEFOLD_REPETITION"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 27,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 27,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 59,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 43,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 20,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "game_score": {
+    "wins": 0,
+    "draws": 2,
+    "losses": 6
+  },
+  "timing": {
+    "total_s": 4811.745551586151
+  }
+}

@@ -1,0 +1,148 @@
+{
+  "experiment": "exp021_search_lora",
+  "hypothesis": "Spatial+LoRA + 1-ply search improves gameplay vs SF",
+  "seed": 42,
+  "data": {
+    "train": 50000,
+    "eval": 500
+  },
+  "model": {
+    "lora_rank": 16,
+    "lora_params": 2293760,
+    "trainable": 3831812,
+    "head": "spatial"
+  },
+  "results": {
+    "best_acc": 0.365,
+    "final": {
+      "accuracy": 0.34,
+      "top3_accuracy": 0.594,
+      "total": 500
+    },
+    "history": [
+      {
+        "accuracy": 0.325,
+        "top3_accuracy": 0.53,
+        "total": 200,
+        "loss": 3.8495134828645554,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.365,
+        "top3_accuracy": 0.595,
+        "total": 200,
+        "loss": 2.912796354964566,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.34,
+        "top3_accuracy": 0.61,
+        "total": 200,
+        "loss": 2.6003926315575914,
+        "epoch": 3
+      }
+    ],
+    "spatial_baseline": 0.365
+  },
+  "policy_games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 30,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 44,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 44,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 29,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 22,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 29,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "policy_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 6
+  },
+  "search_games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 30,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 23,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 50,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 14,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 18,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 42,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "search_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 6
+  },
+  "timing": {
+    "total_s": 1778.559865474701
+  }
+}

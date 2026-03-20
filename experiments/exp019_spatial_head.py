@@ -1,0 +1,523 @@
+"""exp019: Spatial Policy Head — use per-square features for move scoring.
+
+Hypothesis: A bilinear policy head that explicitly uses from-square and to-square
+hidden states will significantly outperform the current single-token MLP head.
+
+Background: The current head takes hidden[:, 0, :] (one 1024-dim vector) and
+predicts over 5504 moves. This requires the model to compress ALL position info
+into one vector AND decode it into move-specific predictions.
+
+A spatial head instead:
+  score(from_sq, to_sq) = proj_from(hidden[from_sq]) · proj_to(hidden[to_sq])
+
+This directly uses per-square features from the backbone's 67 output tokens.
+Each move's score depends on the features of the specific squares involved.
+This is closer to AlphaZero's architecture.
+
+Comparison: Train two identical models on same 50K data, same optimizer, same
+seed. Only difference: policy head architecture.
+  A) Standard: hidden[0] → MLP → 5504 logits
+  B) Spatial: per-square bilinear scoring
+
+Primary metric: top-1 accuracy on 500 held-out positions
+Time budget: ~20 min (2 × 3 epochs × 50K)
+"""
+
+import json
+import random
+import sys
+import time
+from pathlib import Path
+
+import chess
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from chess_features import batch_boards_to_token_ids
+from chess_model import LearnedBoardEncoder, ChessModel
+from model import load_base_model
+from move_vocab import VOCAB_SIZE, UCI_TO_IDX, IDX_TO_UCI, move_to_index, legal_move_mask, index_to_move
+from config import Config
+
+OUTPUT_DIR = Path("outputs/exp019_spatial_head")
+STOCKFISH_PATH = "stockfish/stockfish/stockfish-ubuntu-x86-64-avx2"
+
+NUM_TRAIN = 50_000
+NUM_EVAL = 500
+EPOCHS = 3
+BATCH_SIZE = 64
+LR = 1e-3
+ENCODER_DIM = 256
+SEED = 42
+NUM_GAMES = 4
+GAME_SF_DEPTH = 3
+
+
+# === Spatial Policy Head ===
+
+def _build_move_square_indices():
+    """Precompute from-square and to-square indices for all moves in vocab."""
+    from_sqs = []
+    to_sqs = []
+    promo_types = []  # 0=none, 1=q, 2=r, 3=b, 4=n
+
+    promo_map = {'q': 1, 'r': 2, 'b': 3, 'n': 4}
+
+    for i in range(VOCAB_SIZE):
+        uci = IDX_TO_UCI[i]
+        from_sq = chess.parse_square(uci[:2])
+        to_sq = chess.parse_square(uci[2:4])
+        promo = promo_map.get(uci[4:5], 0)  # 0 if no promotion
+        from_sqs.append(from_sq)
+        to_sqs.append(to_sq)
+        promo_types.append(promo)
+
+    return (
+        torch.tensor(from_sqs, dtype=torch.long),
+        torch.tensor(to_sqs, dtype=torch.long),
+        torch.tensor(promo_types, dtype=torch.long),
+    )
+
+
+class SpatialPolicyHead(nn.Module):
+    """Bilinear policy head using per-square hidden features.
+
+    For move (from_sq, to_sq):
+      score = proj_from(hidden[from_sq]) · proj_to(hidden[to_sq]) + global_bias
+
+    For promotions, adds a promotion embedding to the to-square features.
+    """
+
+    def __init__(self, hidden_size: int, head_dim: int = 256):
+        super().__init__()
+        self.from_proj = nn.Linear(hidden_size, head_dim)
+        self.to_proj = nn.Linear(hidden_size, head_dim)
+        self.global_proj = nn.Linear(hidden_size, head_dim)
+
+        # Promotion embedding (5 types: none + q/r/b/n)
+        self.promo_embed = nn.Embedding(5, head_dim)
+
+        # Final scoring: combine from, to, global, promo into logit
+        self.score_proj = nn.Linear(head_dim, 1)
+
+        # Register precomputed indices
+        from_sqs, to_sqs, promo_types = _build_move_square_indices()
+        self.register_buffer('from_sqs', from_sqs)
+        self.register_buffer('to_sqs', to_sqs)
+        self.register_buffer('promo_types', promo_types)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (B, 67, H) — full backbone output
+        Returns:
+            (B, VOCAB_SIZE) policy logits
+        """
+        B = hidden_states.shape[0]
+
+        # Extract square features (tokens 3-66 are squares 0-63)
+        sq_hidden = hidden_states[:, 3:67, :]  # (B, 64, H)
+        global_hidden = hidden_states[:, 0, :]  # (B, H)
+
+        # Gather from/to features for all moves
+        from_feats = sq_hidden[:, self.from_sqs, :]  # (B, V, H)
+        to_feats = sq_hidden[:, self.to_sqs, :]  # (B, V, H)
+
+        # Project
+        from_proj = self.from_proj(from_feats)  # (B, V, D)
+        to_proj = self.to_proj(to_feats)  # (B, V, D)
+        global_proj = self.global_proj(global_hidden).unsqueeze(1)  # (B, 1, D)
+
+        # Promotion features
+        promo_feats = self.promo_embed(self.promo_types)  # (V, D)
+
+        # Combine: elementwise product of from/to + global + promo
+        combined = from_proj * to_proj + global_proj + promo_feats.unsqueeze(0)
+        logits = self.score_proj(F.relu(combined)).squeeze(-1)  # (B, V)
+
+        return logits
+
+
+class SpatialChessModel(nn.Module):
+    """Chess model with spatial policy head."""
+
+    def __init__(self, qwen_model, encoder, encoder_dim=256, freeze_backbone=True):
+        super().__init__()
+
+        if hasattr(qwen_model, 'model') and hasattr(qwen_model, 'lm_head'):
+            base_model = qwen_model.model
+        else:
+            base_model = qwen_model
+
+        self.hidden_size = getattr(base_model.config, 'hidden_size', 1024)
+        self.encoder = encoder
+        self.input_proj = nn.Linear(encoder_dim, self.hidden_size)
+        self.backbone = base_model
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Spatial policy head
+        self.policy_head = SpatialPolicyHead(self.hidden_size, head_dim=256)
+
+        # Value head (same as original)
+        self.value_head = nn.Sequential(
+            nn.Linear(self.hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3),
+        )
+
+    def forward(self, board_input, move_targets=None, value_targets=None, legal_masks=None):
+        tokens = self.encoder(board_input)
+        embeds = self.input_proj(tokens)
+        backbone_dtype = next(self.backbone.parameters()).dtype
+        embeds = embeds.to(backbone_dtype)
+
+        outputs = self.backbone(inputs_embeds=embeds, use_cache=False)
+        hidden = outputs.last_hidden_state.float()
+
+        # Spatial policy uses ALL hidden states
+        policy_logits = self.policy_head(hidden)  # (B, VOCAB_SIZE)
+
+        # Value uses global token
+        global_hidden = hidden[:, 0, :]
+        value_logits = self.value_head(global_hidden)
+
+        result = {"policy_logits": policy_logits, "value_logits": value_logits}
+
+        device = board_input["piece_ids"].device if isinstance(board_input, dict) else board_input.device
+        total_loss = torch.tensor(0.0, device=device)
+        if move_targets is not None:
+            policy_loss = F.cross_entropy(policy_logits, move_targets)
+            result["policy_loss"] = policy_loss
+            total_loss = total_loss + policy_loss
+        if value_targets is not None:
+            value_loss = F.cross_entropy(value_logits, value_targets)
+            result["value_loss"] = value_loss
+            total_loss = total_loss + 0.5 * value_loss
+        result["loss"] = total_loss
+        return result
+
+    @torch.no_grad()
+    def predict_move(self, board: chess.Board):
+        self.eval()
+        device = next(self.parameters()).device
+        board_input = self.encoder.prepare_input(board, device)
+        mask = legal_move_mask(board).to(device)
+        result = self.forward(board_input)
+        logits = result["policy_logits"][0]
+        logits[~mask] = float("-inf")
+        probs = F.softmax(logits, dim=-1)
+        best_idx = probs.argmax().item()
+        return index_to_move(best_idx), probs
+
+    def trainable_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# === HF Dataset (copied from exp013/exp018) ===
+
+def build_old_move_mapping():
+    PROMO_TYPES = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+    def inside(idx, f_from): return 0 <= idx < 64 and abs((idx % 8) - f_from) <= 2
+    ucis = set()
+    for f in range(64):
+        ff = f % 8
+        for d in (+8, -8, +1, -1):
+            t = f + d
+            while inside(t, ff): ucis.add(chess.Move(f, t).uci()); t += d
+        for d in (+9, -9, +7, -7):
+            t = f + d
+            while inside(t, ff): ucis.add(chess.Move(f, t).uci()); t += d
+        for off in (+17, +15, +10, +6, -6, -10, -15, -17):
+            t = f + off
+            if inside(t, ff): ucis.add(chess.Move(f, t).uci())
+    for f in range(64):
+        file_, rank = f % 8, f // 8
+        if rank == 6:
+            for df in (-9, -8, -7):
+                t = f + df
+                if 0 <= t < 64 and abs((t % 8) - file_) <= 1:
+                    for p in PROMO_TYPES: ucis.add(chess.Move(f, t, promotion=p).uci())
+        if rank == 1:
+            for df in (+9, +8, +7):
+                t = f + df
+                if 0 <= t < 64 and abs((t % 8) - file_) <= 1:
+                    for p in PROMO_TYPES: ucis.add(chess.Move(f, t, promotion=p).uci())
+    return sorted(ucis)
+
+_PIECE2CHESS = {
+    1: (chess.PAWN, chess.WHITE), 2: (chess.KNIGHT, chess.WHITE),
+    3: (chess.BISHOP, chess.WHITE), 4: (chess.ROOK, chess.WHITE),
+    5: (chess.QUEEN, chess.WHITE), 6: (chess.KING, chess.WHITE),
+    7: (chess.PAWN, chess.BLACK), 8: (chess.KNIGHT, chess.BLACK),
+    9: (chess.BISHOP, chess.BLACK), 10: (chess.ROOK, chess.BLACK),
+    11: (chess.QUEEN, chess.BLACK), 12: (chess.KING, chess.BLACK),
+}
+
+def hf_sample_to_board(board_flat, turn_raw):
+    board = chess.Board(fen=None)
+    board.clear()
+    for idx in range(64):
+        piece_val = board_flat[idx]
+        if piece_val > 0:
+            row = idx // 8; col = idx % 8
+            rank = 7 - row; sq = rank * 8 + col
+            pt, color = _PIECE2CHESS[piece_val]
+            board.set_piece_at(sq, chess.Piece(pt, color))
+    board.turn = bool(turn_raw)
+    return board
+
+def prepare_hf_data(dataset, old_sorted_uci, n, offset=0):
+    data, skipped = [], 0
+    for i in range(offset, min(offset + n * 2, len(dataset))):
+        if len(data) >= n: break
+        s = dataset[i]
+        old_uci = old_sorted_uci[s["move_id"]]
+        if old_uci not in UCI_TO_IDX: skipped += 1; continue
+        try:
+            board = hf_sample_to_board(s["board"], s["turn"])
+            move = chess.Move.from_uci(old_uci)
+        except ValueError: skipped += 1; continue
+        if move not in board.legal_moves: skipped += 1; continue
+        winner = s["winner"]
+        if winner == 0: vt = 1
+        elif (winner == 1 and board.turn == chess.WHITE) or \
+             (winner == 2 and board.turn == chess.BLACK): vt = 2
+        else: vt = 0
+        data.append({"board": board, "move": move, "value_target": vt})
+    print(f"  Prepared {len(data)} samples (skipped {skipped})")
+    return data
+
+
+# === Training Utils ===
+
+def make_batches(data, batch_size, device):
+    random.shuffle(data)
+    batches = []
+    for i in range(0, len(data), batch_size):
+        chunk = data[i:i + batch_size]
+        boards = [d["board"] for d in chunk]
+        batch_input = batch_boards_to_token_ids(boards, device)
+        move_targets = torch.tensor([move_to_index(d["move"]) for d in chunk], dtype=torch.long, device=device)
+        value_targets = torch.tensor([d["value_target"] for d in chunk], dtype=torch.long, device=device)
+        batches.append((batch_input, move_targets, value_targets))
+    return batches
+
+
+def evaluate_accuracy(model, eval_data, device, n=None, batch_size=64):
+    model.eval()
+    subset = eval_data[:n] if n else eval_data
+    correct = top3_correct = total = 0
+    with torch.no_grad():
+        for i in range(0, len(subset), batch_size):
+            chunk = subset[i:i + batch_size]
+            boards = [d["board"] for d in chunk]
+            targets = [move_to_index(d["move"]) for d in chunk]
+            batch_input = batch_boards_to_token_ids(boards, device)
+            result = model(batch_input)
+            logits = result["policy_logits"]
+            for j, board in enumerate(boards):
+                mask = legal_move_mask(board).to(device)
+                logits[j, ~mask] = float("-inf")
+            preds = logits.argmax(dim=-1).cpu().tolist()
+            top3s = logits.topk(3, dim=-1).indices.cpu().tolist()
+            for j, target_idx in enumerate(targets):
+                total += 1
+                if preds[j] == target_idx: correct += 1
+                if target_idx in top3s[j]: top3_correct += 1
+    return {
+        "accuracy": correct / max(total, 1),
+        "top3_accuracy": top3_correct / max(total, 1),
+        "total": total,
+    }
+
+
+def play_game_vs_stockfish(model, sf_depth, model_color, device, max_moves=100):
+    from stockfish import Stockfish
+    sf = Stockfish(path=STOCKFISH_PATH, depth=sf_depth, parameters={"Threads": 2, "Hash": 64})
+    board = chess.Board()
+    model.eval()
+    while not board.is_game_over() and board.fullmove_number <= max_moves:
+        if board.turn == model_color:
+            pred, _ = model.predict_move(board)
+            if pred not in board.legal_moves:
+                pred = random.choice(list(board.legal_moves))
+            board.push(pred)
+        else:
+            sf.set_fen_position(board.fen())
+            sf_uci = sf.get_best_move()
+            if sf_uci is None: break
+            board.push(chess.Move.from_uci(sf_uci))
+    result = board.result()
+    winner = "white" if result == "1-0" else "black" if result == "0-1" else "draw"
+    model_result = (
+        "win" if (winner == "white" and model_color == chess.WHITE) or
+                 (winner == "black" and model_color == chess.BLACK)
+        else "loss" if winner != "draw" else "draw"
+    )
+    term = board.outcome().termination.name if board.outcome() else "max_moves"
+    return {
+        "model_color": "white" if model_color else "black",
+        "result": result, "model_result": model_result,
+        "moves": board.fullmove_number, "termination": term,
+    }
+
+
+def train_and_evaluate(label, model, train_data, eval_data, device):
+    """Train a model variant and return history."""
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(params, lr=LR, weight_decay=0.01)
+    total_steps = EPOCHS * (len(train_data) // BATCH_SIZE + 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    pre = evaluate_accuracy(model, eval_data, device, n=200)
+    print(f"  [{label}] Pre-train: acc={pre['accuracy']:.1%}")
+
+    history = []
+    t0 = time.time()
+    for epoch in range(EPOCHS):
+        model.train()
+        batches = make_batches(train_data, BATCH_SIZE, device)
+        ep_loss = steps = 0
+        for batch_input, move_targets, value_targets in batches:
+            optimizer.zero_grad()
+            result = model(batch_input, move_targets=move_targets, value_targets=value_targets)
+            result["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            optimizer.step()
+            scheduler.step()
+            ep_loss += result["loss"].item()
+            steps += 1
+        avg_loss = ep_loss / max(steps, 1)
+        ev = evaluate_accuracy(model, eval_data, device, n=200)
+        elapsed = time.time() - t0
+        history.append({**ev, "loss": avg_loss, "epoch": epoch + 1})
+        print(f"  [{label}] Epoch {epoch+1}/{EPOCHS}: loss={avg_loss:.4f} "
+              f"acc={ev['accuracy']:.1%} top3={ev['top3_accuracy']:.1%} [{elapsed:.0f}s]")
+
+    final = evaluate_accuracy(model, eval_data, device)
+    return history, final
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    t0 = time.time()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # --- Load data ---
+    print("\n[1/5] Loading HuggingFace dataset...")
+    from datasets import load_dataset
+    ds = load_dataset("avewright/chess-dataset-production-1968", split="train")
+    old_sorted_uci = build_old_move_mapping()
+    print(f"  Dataset: {len(ds):,} samples")
+
+    eval_data = prepare_hf_data(ds, old_sorted_uci, NUM_EVAL, offset=len(ds) - NUM_EVAL * 3)
+    train_data = prepare_hf_data(ds, old_sorted_uci, NUM_TRAIN, offset=0)
+
+    # --- Variant A: Standard head (baseline) ---
+    print(f"\n{'='*60}")
+    print(f" [2/5] BASELINE: Standard MLP head")
+    print(f"{'='*60}")
+
+    cfg = Config()
+    full_model_a, _ = load_base_model(cfg)
+    encoder_a = LearnedBoardEncoder(embed_dim=ENCODER_DIM)
+    model_a = ChessModel(full_model_a, encoder=encoder_a, freeze_backbone=True).to(device)
+    print(f"  Trainable: {model_a.trainable_params():,}")
+
+    history_a, final_a = train_and_evaluate("Standard", model_a, train_data, eval_data, device)
+    best_a = max(h["accuracy"] for h in history_a)
+    print(f"  Best: {best_a:.1%}  Final: {final_a['accuracy']:.1%}")
+
+    del model_a, encoder_a, full_model_a
+    torch.cuda.empty_cache()
+
+    # --- Variant B: Spatial head ---
+    print(f"\n{'='*60}")
+    print(f" [3/5] SPATIAL: Per-square bilinear head")
+    print(f"{'='*60}")
+
+    torch.manual_seed(SEED)
+    full_model_b, _ = load_base_model(cfg)
+    encoder_b = LearnedBoardEncoder(embed_dim=ENCODER_DIM)
+    model_b = SpatialChessModel(full_model_b, encoder=encoder_b, freeze_backbone=True).to(device)
+    print(f"  Trainable: {model_b.trainable_params():,}")
+
+    history_b, final_b = train_and_evaluate("Spatial", model_b, train_data, eval_data, device)
+    best_b = max(h["accuracy"] for h in history_b)
+    print(f"  Best: {best_b:.1%}  Final: {final_b['accuracy']:.1%}")
+
+    # --- Compare ---
+    print(f"\n{'='*60}")
+    print(f" [4/5] COMPARISON")
+    print(f"{'='*60}")
+
+    diff = best_b - best_a
+    winner = "Spatial" if diff > 0.005 else "Standard" if diff < -0.005 else "TIE"
+    print(f"  Standard: best={best_a:.1%}  final={final_a['accuracy']:.1%}  top3={final_a['top3_accuracy']:.1%}")
+    print(f"  Spatial:  best={best_b:.1%}  final={final_b['accuracy']:.1%}  top3={final_b['top3_accuracy']:.1%}")
+    print(f"  Winner: {winner} (delta: {diff:+.1%})")
+
+    # --- Play games with winning model ---
+    print(f"\n{'='*60}")
+    print(f" [5/5] Playing {NUM_GAMES} games (Spatial) vs SF d{GAME_SF_DEPTH}")
+    print(f"{'='*60}")
+
+    game_results = []
+    for g in range(NUM_GAMES):
+        color = chess.WHITE if g % 2 == 0 else chess.BLACK
+        r = play_game_vs_stockfish(model_b, GAME_SF_DEPTH, color, device)
+        game_results.append(r)
+        sym = {"win": "W", "loss": "L", "draw": "D"}[r["model_result"]]
+        print(f"  Game {g+1}: {r['model_color']} {sym} in {r['moves']} moves ({r['termination']})")
+
+    wins = sum(1 for r in game_results if r["model_result"] == "win")
+    draws = sum(1 for r in game_results if r["model_result"] == "draw")
+    losses = sum(1 for r in game_results if r["model_result"] == "loss")
+
+    # --- Save ---
+    total_time = time.time() - t0
+    results = {
+        "experiment": "exp019_spatial_head",
+        "hypothesis": "Spatial bilinear head outperforms single-token MLP head",
+        "primary_metric": "top-1 accuracy",
+        "seed": SEED,
+        "data": {"train": len(train_data), "eval": len(eval_data)},
+        "standard": {
+            "trainable": model_a.trainable_params() if hasattr(model_a, 'trainable_params') else "freed",
+            "best_acc": best_a, "final": final_a, "history": history_a,
+        },
+        "spatial": {
+            "trainable": model_b.trainable_params(),
+            "best_acc": best_b, "final": final_b, "history": history_b,
+        },
+        "comparison": {"winner": winner, "delta": diff},
+        "games": game_results,
+        "game_score": {"wins": wins, "draws": draws, "losses": losses},
+        "timing": {"total_s": total_time},
+    }
+    with open(OUTPUT_DIR / "results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f" SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Standard: {best_a:.1%} best / {final_a['accuracy']:.1%} final")
+    print(f"  Spatial:  {best_b:.1%} best / {final_b['accuracy']:.1%} final")
+    print(f"  Delta: {diff:+.1%} ({winner})")
+    print(f"  Spatial vs SF d{GAME_SF_DEPTH}: W{wins}/D{draws}/L{losses}")
+    print(f"  Time: {total_time:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,68 @@
+{
+  "experiment": "exp014_full_hf_1epoch",
+  "hypothesis": "Single epoch over 475K positions outperforms 3 epochs on 50K",
+  "data": {
+    "source": "avewright/chess-dataset-production-1968",
+    "train_positions": 461632,
+    "eval": 500,
+    "train_steps": 7213
+  },
+  "training": {
+    "epochs": 1,
+    "batch_size": 64,
+    "lr": 0.001
+  },
+  "pre_eval": {
+    "accuracy": 0.025,
+    "top3_accuracy": 0.17,
+    "total": 200
+  },
+  "final_eval": {
+    "accuracy": 0.184,
+    "top3_accuracy": 0.394,
+    "total": 500
+  },
+  "avg_policy_loss": 4.205001479459176,
+  "avg_value_loss": 0.8242787433661387,
+  "games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 29,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 19,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 27,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 15,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "game_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 4,
+    "total": 4
+  },
+  "timing": {
+    "train_s": 3871.798124551773,
+    "total_s": 3886.3982615470886,
+    "pos_per_s": 119.22935678714958
+  }
+}
