@@ -589,3 +589,41 @@ The path to better accuracy is simply **more gradient updates** — either:
 1. Train 8L/512d for 10 epochs on 460K data (most direct path to improvement — exp024 loss was 2.33 at ep3, should reach ~2.0 at ep10). This exceeds the 10-min budget but is the highest-value experiment.
 2. Alternative: depth scaling on 50K first (8L vs 12L) as a quick signal before committing to expensive full-data runs
 3. Alternative: try fundamentally different approach — self-play / reinforcement loop instead of supervised learning
+
+### Session 9 (cont): Depth scaling experiment (2026-03-20)
+
+**exp030 result: TIE (-0.6pp)**
+- 2-way A/B: 8L/512d (26.1M params) vs 12L/512d (38.7M params) — 50K data, 5 epochs
+- 8L: 38.6% best, loss 2.33
+- 12L: 38.0% best, loss 2.34
+- Depth delta: -0.6pp — within noise
+- 12L is 26% slower per epoch (328s vs 260s)
+- Games vs SF d3: W0/D1/L5 (8L got one fivefold-repetition draw as black)
+
+**Why depth doesn't help at 50K:**
+1. With only 50K positions and 26M base params, the model is already data-starved
+2. Adding 48% more params (12M extra) only adds more parameters to overfit with
+3. The 12L model's loss curve tracks 8L nearly exactly — more layers aren't learning different features
+4. This matches the "all 50K ablations are TIE" pattern: the bottleneck is DATA, not architecture
+
+**Updated cumulative results:**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | 10 epochs |
+| exp024 | Chess Transformer | 460K | 48.7% | 73.9% | W0/D2/L6 | BEST |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+| exp029 | data diversity | matched 200K | 37.4% | 65.4% | W0/D0/L6 | TIE |
+| exp030 | 12L depth | 50K | 38.0% | 65.8% | W0/D1/L5 | TIE |
+
+**Definitive conclusion on 50K ablations:**
+Five consecutive experiments (exp026-030) testing different axes (attention bias, label smoothing, data diversity, depth) have ALL produced TIEs at 50K data. The 50K ablation regime is exhausted. Every intervention looks flat because the model is severely data-starved.
+
+**Path forward — must break out of 50K regime:**
+1. **Accept longer experiments**: Train on full 460K for more epochs. exp024's loss was still declining at ep3 (2.33). Even 1 more epoch could push past 50%.
+2. **Self-play reinforcement loop**: Use the strongest model (exp024, 48.7%) as a starting point for REINFORCE/policy gradient from self-play games. This generates unlimited training data.
+3. **Generate more labeled data**: Use Stockfish to label positions from the HF dataset with best moves, increasing label quality.
+4. **Stop doing 50K ablations entirely.

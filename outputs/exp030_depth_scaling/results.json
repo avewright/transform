@@ -1,0 +1,186 @@
+{
+  "experiment": "exp030_depth_scaling",
+  "hypothesis": "12L chess transformer > 8L at 50K data (more multi-hop reasoning capacity)",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "data": {
+    "train": 50000,
+    "eval": 500
+  },
+  "model": {
+    "type": "chess_transformer",
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256
+  },
+  "training": {
+    "epochs": 5,
+    "batch_size": 128,
+    "lr": 0.0003,
+    "warmup_steps": 200,
+    "schedule": "cosine"
+  },
+  "variants": {
+    "8L": {
+      "name": "8L",
+      "num_layers": 8,
+      "trainable": 26136580,
+      "best_acc": 0.386,
+      "final": {
+        "accuracy": 0.386,
+        "top3_accuracy": 0.654,
+        "total": 500,
+        "loss": 2.3275169823175808,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.292,
+          "top3_accuracy": 0.516,
+          "total": 500,
+          "loss": 4.032351640179334,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.342,
+          "top3_accuracy": 0.61,
+          "total": 500,
+          "loss": 3.0005952031411174,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.348,
+          "top3_accuracy": 0.62,
+          "total": 500,
+          "loss": 2.712640228783688,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.372,
+          "top3_accuracy": 0.634,
+          "total": 500,
+          "loss": 2.4857295059487035,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.386,
+          "top3_accuracy": 0.654,
+          "total": 500,
+          "loss": 2.3275169823175808,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1303.3355526924133
+    },
+    "12L": {
+      "name": "12L",
+      "num_layers": 12,
+      "trainable": 38746116,
+      "best_acc": 0.38,
+      "final": {
+        "accuracy": 0.38,
+        "top3_accuracy": 0.658,
+        "total": 500,
+        "loss": 2.3350866633607907,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.288,
+          "top3_accuracy": 0.54,
+          "total": 500,
+          "loss": 4.051725352816569,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.324,
+          "top3_accuracy": 0.572,
+          "total": 500,
+          "loss": 3.0284752303072255,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.336,
+          "top3_accuracy": 0.628,
+          "total": 500,
+          "loss": 2.723203459664074,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.374,
+          "top3_accuracy": 0.638,
+          "total": 500,
+          "loss": 2.500920455474073,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.38,
+          "top3_accuracy": 0.658,
+          "total": 500,
+          "loss": 2.3350866633607907,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1640.805029630661
+    }
+  },
+  "best_variant": "8L",
+  "depth_delta": -0.006,
+  "games": {
+    "model_used": "8L",
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 21,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 36,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1/2-1/2",
+        "model_result": "draw",
+        "moves": 32,
+        "termination": "FIVEFOLD_REPETITION"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 25,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 1,
+      "losses": 5
+    }
+  },
+  "timing": {
+    "total_s": 2975.3648266792297
+  },
+  "device": "cuda",
+  "command": "python experiments/exp030_depth_scaling.py"
+}
