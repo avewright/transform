@@ -478,3 +478,39 @@ This conclusively answers the action-value question at this scale: AV auxiliary 
 2. If accuracy > 45%, test with 1-ply search for game play
 3. Consider spatial head + LoRA combination
 4. The spatial head should now be the default for all future experiments
+
+### Session 7: Relative position attention bias (2026-03-20)
+
+**exp026 result: TIE (slight regression)**
+- Hypothesis: Learned per-head relative position bias (rank_diff, file_diff) improves accuracy
+- A/B comparison on 50K HF game data, 5 epochs, same custom transformer (8L/512d/8h)
+- Baseline: 37.8% best, Rel bias: 37.0% best → **-0.8pp, TIE**
+- Bias adds only 4,944 params (negligible)
+- Both models had identical loss curves (3.98→2.29)
+- Games vs SF d3: W0/D0/L6
+
+**First attempt failed** — passing bias as `src_mask` to `nn.TransformerEncoder` collapsed training to 0.8%. Fixed by implementing custom transformer blocks (`MultiHeadAttentionWithBias`) that properly add the bias inside the QK^T computation.
+
+**Why it didn't help:**
+1. The absolute square positional embeddings (learned, 64 positions) likely already capture rank/file geometry
+2. At 50K data, the model may not have enough signal for the bias to learn useful patterns
+3. The bias is shared across all layers — per-layer bias might work differently
+4. Chess relationships are piece-dependent (rook cares about rank/file, bishop about diagonals) — a single bias table can't capture this
+
+**Conclusion:** Deprioritize relative position bias. The absolute embeddings are sufficient at this scale.
+
+**Updated cumulative results:**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 |
+|------------|-------------|------|----------|------|----------------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — |
+| exp020 | Qwen3+spatial | 200K | 36.5% | — | — |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 |
+| exp024 | Chess Transformer | 460K | 48.7% | 73.9% | W0/D2/L6 |
+| exp026 | Chess Transformer +rel_bias | 50K | 37.0% | 66.8% | — |
+
+**Next hypothesis to test:** The chess transformer at 50K gets ~38% (custom blocks) vs exp023's 40.5% (nn.TransformerEncoder). The custom blocks might slightly underperform PyTorch's fused implementation. Two immediate options:
+1. **Continue training exp024** checkpoint for more epochs (loss still declining at 2.33)
+2. **Deeper model** — try 12L or 16L at 460K data to see if depth helps
+3. **Label smoothing / soft targets** — the current hard-label CE may be suboptimal for positions where multiple moves are reasonable

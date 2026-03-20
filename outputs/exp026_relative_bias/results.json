@@ -1,0 +1,184 @@
+{
+  "experiment": "exp026_relative_bias",
+  "hypothesis": "Relative position attention bias improves chess accuracy",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "data": {
+    "train": 50000,
+    "eval": 500
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8
+  },
+  "training": {
+    "epochs": 5,
+    "batch_size": 128,
+    "lr": 0.0003,
+    "warmup_steps": 200,
+    "schedule": "cosine"
+  },
+  "results": {
+    "baseline": {
+      "name": "baseline",
+      "trainable": 26136580,
+      "best_acc": 0.378,
+      "final": {
+        "accuracy": 0.378,
+        "top3_accuracy": 0.644,
+        "total": 500,
+        "loss": 2.295128543663513,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.278,
+          "top3_accuracy": 0.538,
+          "total": 500,
+          "loss": 3.979610347381943,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.336,
+          "top3_accuracy": 0.606,
+          "total": 500,
+          "loss": 2.97594378000635,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.354,
+          "top3_accuracy": 0.63,
+          "total": 500,
+          "loss": 2.691881242005721,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.37,
+          "top3_accuracy": 0.656,
+          "total": 500,
+          "loss": 2.4616055647125634,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.378,
+          "top3_accuracy": 0.644,
+          "total": 500,
+          "loss": 2.295128543663513,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1270.6447105407715
+    },
+    "rel_bias": {
+      "name": "rel_bias",
+      "trainable": 26141524,
+      "best_acc": 0.37,
+      "final": {
+        "accuracy": 0.366,
+        "top3_accuracy": 0.668,
+        "total": 500,
+        "loss": 2.2925168416079353,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.306,
+          "top3_accuracy": 0.518,
+          "total": 500,
+          "loss": 3.997116332773662,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.336,
+          "top3_accuracy": 0.586,
+          "total": 500,
+          "loss": 2.979970876518113,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.352,
+          "top3_accuracy": 0.61,
+          "total": 500,
+          "loss": 2.688442085710023,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.37,
+          "top3_accuracy": 0.656,
+          "total": 500,
+          "loss": 2.4566751581323727,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.366,
+          "top3_accuracy": 0.668,
+          "total": 500,
+          "loss": 2.2925168416079353,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1271.3927824497223
+    },
+    "delta_pp": -0.8,
+    "exp023_ref": 0.405
+  },
+  "games": {
+    "model_used": "baseline",
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 42,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 37,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 32,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 40,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 52,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 6
+    }
+  },
+  "timing": {
+    "total_s": 2556.8072452545166
+  },
+  "device": "cuda",
+  "command": "python experiments/exp026_relative_bias.py"
+}

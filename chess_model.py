@@ -268,10 +268,11 @@ class ChessModel(nn.Module):
 
         # Pass through Qwen backbone
         outputs = self.backbone(inputs_embeds=embeds, use_cache=False)
-        hidden = outputs.last_hidden_state.float()   # (B, 65, hidden_size) back to fp32
+        hidden = outputs.last_hidden_state.float()   # (B, N, hidden_size) back to fp32
 
-        # Use first token (position 0) for policy and value
-        global_hidden = hidden[:, 0, :]              # (B, hidden_size)
+        # Use last token for policy and value — in causal attention,
+        # only the last token has attended to all previous tokens
+        global_hidden = hidden[:, -1, :]             # (B, hidden_size)
 
         # Policy
         policy_logits = self.policy_head(global_hidden)  # (B, VOCAB_SIZE)
