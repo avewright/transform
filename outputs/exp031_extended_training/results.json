@@ -1,0 +1,153 @@
+{
+  "experiment": "exp031_extended_training",
+  "hypothesis": "6 epochs on 460K data > 3 epochs (exp024, loss still declining at 2.33)",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "data": {
+    "train": 461574,
+    "eval": 1000
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256,
+    "trainable": 26136580
+  },
+  "training": {
+    "epochs": 6,
+    "batch_size": 128,
+    "accum_steps": 2,
+    "effective_batch": 256,
+    "lr": 0.0003,
+    "warmup_steps": 500,
+    "schedule": "cosine"
+  },
+  "results": {
+    "best_acc": 0.512,
+    "final": {
+      "accuracy": 0.512,
+      "top3_accuracy": 0.762,
+      "total": 1000
+    },
+    "history": [
+      {
+        "accuracy": 0.437,
+        "top3_accuracy": 0.675,
+        "total": 1000,
+        "loss": 2.9701,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.464,
+        "top3_accuracy": 0.711,
+        "total": 1000,
+        "loss": 2.3947,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.488,
+        "top3_accuracy": 0.735,
+        "total": 1000,
+        "loss": 2.2787,
+        "epoch": 3
+      },
+      {
+        "accuracy": 0.489,
+        "top3_accuracy": 0.751,
+        "total": 1000,
+        "loss": 2.1903,
+        "epoch": 4
+      },
+      {
+        "accuracy": 0.503,
+        "top3_accuracy": 0.76,
+        "total": 1000,
+        "loss": 2.1128,
+        "epoch": 5
+      },
+      {
+        "accuracy": 0.512,
+        "top3_accuracy": 0.762,
+        "total": 1000,
+        "loss": 2.06,
+        "epoch": 6
+      }
+    ]
+  },
+  "comparison": {
+    "exp024_3ep": 0.487,
+    "delta": 0.025
+  },
+  "games": {
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 27,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 64,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 36,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 24,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "1/2-1/2",
+        "model_result": "draw",
+        "moves": 33,
+        "termination": "FIVEFOLD_REPETITION"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 32,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 59,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 1,
+      "losses": 7
+    }
+  },
+  "timing": {
+    "total_s": 14363.574330091476
+  },
+  "device": "cuda",
+  "command": "python experiments/exp031_extended_training.py"
+}

@@ -626,4 +626,49 @@ Five consecutive experiments (exp026-030) testing different axes (attention bias
 1. **Accept longer experiments**: Train on full 460K for more epochs. exp024's loss was still declining at ep3 (2.33). Even 1 more epoch could push past 50%.
 2. **Self-play reinforcement loop**: Use the strongest model (exp024, 48.7%) as a starting point for REINFORCE/policy gradient from self-play games. This generates unlimited training data.
 3. **Generate more labeled data**: Use Stockfish to label positions from the HF dataset with best moves, increasing label quality.
-4. **Stop doing 50K ablations entirely.
+4. **Stop doing 50K ablations entirely.**
+
+### Session 9 (cont): Extended training BREAKTHROUGH (2026-03-20)
+
+**exp031 result: NEW BEST — 51.2% accuracy (+2.5pp over exp024)**
+
+Training on 460K data for 6 epochs (vs exp024's 3 epochs):
+- Epoch 1: 43.7%, loss 2.97
+- Epoch 2: 46.4%, loss 2.39
+- Epoch 3: 48.8%, loss 2.28 (matches exp024's 48.7%)
+- Epoch 4: 48.9%, loss 2.19 (marginal gain — LR declining fast)
+- Epoch 5: 50.3%, loss 2.11 (breaks 50% for the first time!)
+- Epoch 6: 51.2%, loss 2.06 (still declining at epoch end!)
+
+Games vs SF d3: W0/D1/L7 (1 fivefold repetition draw as white in 33mv)
+Total time: 14,364s (~4 hours)
+
+**Why this works:**
+1. Epochs 1-3 match exp024 almost exactly → same architecture/data → reproducible
+2. Epochs 4-6 continue to improve because loss hasn't plateaued
+3. The cosine LR schedule over 6 epochs decays more gradually than 3 epochs, giving more training time at useful learning rates
+4. Loss 2.06 is STILL declining → even more training could help
+
+**Loss is NOT converged! Accuracy trajectory suggests ~52-53% at 10 epochs.**
+
+**Updated cumulative results (ALL experiments):**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | 10 epochs |
+| exp024 | Chess Transformer | 460K×3ep | 48.7% | 73.9% | W0/D2/L6 | prev best |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+| exp029 | data diversity | matched 200K | 37.4% | 65.4% | W0/D0/L6 | TIE |
+| exp030 | 12L depth | 50K | 38.0% | 65.8% | W0/D1/L5 | TIE |
+| **exp031** | **Chess Transformer** | **460K×6ep** | **51.2%** | **76.2%** | **W0/D1/L7** | **NEW BEST** |
+
+**Key milestone:** First model to break 50% accuracy. The improvement path is clear: more training epochs on the full data.
+
+**Next priorities:**
+1. **Train even longer** — 10 epochs on 460K data. Loss was still 2.06 and declining. Extrapolating the curve: ~53% at 10ep.
+2. **Save checkpoint for self-play** — the 51.2% model is strong enough to bootstrap self-play training
+3. **Try larger model on full data** — if 8L underfits at 460K×6ep, 12L might help here (unlike at 50K where data was bottleneck)
+4. **Improve data quality** — Stockfish-labeled positions instead of game-outcome labels
