@@ -1,0 +1,16 @@
+{
+  "experiment": "exp_av_comparison_v2",
+  "command": "experiments/exp_av_comparison_v2.py",
+  "seed": 42,
+  "data_path": "data/sf_labels_5k_d8.jsonl",
+  "epochs": 10,
+  "batch_size": 32,
+  "lr": 0.001,
+  "encoder_dim": 256,
+  "eval_frac": 0.1,
+  "device": "cuda",
+  "torch_version": "2.4.1+cu124",
+  "cuda_available": true,
+  "gpu": "NVIDIA RTX A4000",
+  "gpu_memory_mb": 16101
+}

@@ -1,0 +1,116 @@
+{
+  "config": {
+    "experiment": "exp_av_real_games",
+    "hypothesis": "AV training helps on real game positions where data quality is not the bottleneck",
+    "primary_metric": "top-1 accuracy on SF-labeled HF game positions",
+    "command": "experiments/exp_av_real_games.py",
+    "seed": 42,
+    "num_positions": 3000,
+    "sf_depth": 8,
+    "epochs": 5,
+    "batch_size": 32,
+    "lr": 0.001,
+    "eval_size": 500
+  },
+  "data": {
+    "train": 3000,
+    "eval": 500,
+    "avg_legal": 30.0,
+    "source": "HF game-play + SF all-move labels"
+  },
+  "variant_a": {
+    "best": 0.236,
+    "final": {
+      "accuracy": 0.222,
+      "top3_accuracy": 0.472,
+      "total": 500
+    },
+    "history": [
+      {
+        "accuracy": 0.23,
+        "top3_accuracy": 0.488,
+        "total": 500,
+        "loss": 5.526316954734478,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.228,
+        "top3_accuracy": 0.476,
+        "total": 500,
+        "loss": 4.554028285310624,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.236,
+        "top3_accuracy": 0.45,
+        "total": 500,
+        "loss": 4.419193871477817,
+        "epoch": 3
+      },
+      {
+        "accuracy": 0.23,
+        "top3_accuracy": 0.468,
+        "total": 500,
+        "loss": 4.372445740598313,
+        "epoch": 4
+      },
+      {
+        "accuracy": 0.222,
+        "top3_accuracy": 0.472,
+        "total": 500,
+        "loss": 4.338047844298343,
+        "epoch": 5
+      }
+    ]
+  },
+  "variant_b": {
+    "best": 0.234,
+    "final": {
+      "accuracy": 0.232,
+      "top3_accuracy": 0.476,
+      "total": 500
+    },
+    "history": [
+      {
+        "accuracy": 0.234,
+        "top3_accuracy": 0.488,
+        "total": 500,
+        "loss": 5.5833951818182115,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.234,
+        "top3_accuracy": 0.474,
+        "total": 500,
+        "loss": 4.57183752415028,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.232,
+        "top3_accuracy": 0.472,
+        "total": 500,
+        "loss": 4.4666611970739165,
+        "epoch": 3
+      },
+      {
+        "accuracy": 0.232,
+        "top3_accuracy": 0.476,
+        "total": 500,
+        "loss": 4.406990129896935,
+        "epoch": 4
+      },
+      {
+        "accuracy": 0.232,
+        "top3_accuracy": 0.476,
+        "total": 500,
+        "loss": 4.378682661563792,
+        "epoch": 5
+      }
+    ]
+  },
+  "comparison": {
+    "winner": "TIE",
+    "delta": -0.002
+  },
+  "total_time_s": 608.9
+}

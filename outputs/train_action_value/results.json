@@ -1,0 +1,111 @@
+{
+  "data_path": "data/sf_labels_5k_d8.jsonl",
+  "train_size": 4750,
+  "eval_size": 250,
+  "avg_legal_moves": 30.8,
+  "total_move_evals": 154035,
+  "phases": {
+    "middlegame": 3146,
+    "opening": 1854
+  },
+  "epochs": 5,
+  "batch_size": 32,
+  "lr": 0.001,
+  "trainable_params": 14131715,
+  "pre_eval": {
+    "accuracy": 0.03,
+    "top3_accuracy": 0.13,
+    "total": 200
+  },
+  "final_eval": {
+    "accuracy": 0.096,
+    "top3_accuracy": 0.236,
+    "total": 250
+  },
+  "best_accuracy": 0.096,
+  "best_top3": 0.252,
+  "history": [
+    {
+      "accuracy": 0.084,
+      "top3_accuracy": 0.22,
+      "total": 250,
+      "av_loss": 0.15584633679397955,
+      "p_loss": 7.264515947175506,
+      "v_loss": 1.0267508441969853,
+      "epoch": 1
+    },
+    {
+      "accuracy": 0.06,
+      "top3_accuracy": 0.22,
+      "total": 250,
+      "av_loss": 0.14334061766830866,
+      "p_loss": 6.122232001899873,
+      "v_loss": 0.9365198660216876,
+      "epoch": 2
+    },
+    {
+      "accuracy": 0.088,
+      "top3_accuracy": 0.252,
+      "total": 250,
+      "av_loss": 0.140143812802814,
+      "p_loss": 5.986334855124454,
+      "v_loss": 0.9281935659831002,
+      "epoch": 3
+    },
+    {
+      "accuracy": 0.096,
+      "top3_accuracy": 0.24,
+      "total": 250,
+      "av_loss": 0.13816032943709586,
+      "p_loss": 5.9283255666694386,
+      "v_loss": 0.924744267591694,
+      "epoch": 4
+    },
+    {
+      "accuracy": 0.096,
+      "top3_accuracy": 0.236,
+      "total": 250,
+      "av_loss": 0.13728308632669833,
+      "p_loss": 5.898285987393168,
+      "v_loss": 0.9230616948748595,
+      "epoch": 5
+    }
+  ],
+  "games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 20,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 15,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 26,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 16,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "game_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 4,
+    "score": 0.0
+  },
+  "total_time_s": 236.4
+}

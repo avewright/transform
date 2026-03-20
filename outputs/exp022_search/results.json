@@ -1,0 +1,183 @@
+{
+  "experiment": "exp022_search",
+  "hypothesis": "SF-trained value head + search improves gameplay",
+  "seed": 42,
+  "value_training": {
+    "data": "data/sf_labels_10k_d8.jsonl",
+    "train_n": 9000,
+    "eval_n": 1000,
+    "epochs": 5
+  },
+  "game_results": {
+    "policy-only": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 43,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 79,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 33,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 24,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 26,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 31,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 27,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 28,
+          "termination": "CHECKMATE"
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 0,
+        "losses": 8
+      }
+    },
+    "depth-1": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 49,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 25,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 56,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 23,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 52,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 22,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 9,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 19,
+          "termination": "CHECKMATE"
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 0,
+        "losses": 8
+      }
+    },
+    "depth-2": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 49,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 28,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 21,
+          "termination": "CHECKMATE"
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 24,
+          "termination": "CHECKMATE"
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 0,
+        "losses": 4
+      }
+    }
+  },
+  "timing": {
+    "total_s": 493.70113730430603
+  }
+}

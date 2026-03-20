@@ -15,16 +15,18 @@ The agent should behave like an autonomous research loop operator, not a generic
 ## First Steps For Every Session
 
 1. Read [README.md](../../README.md) for the current workflow and CLI.
-2. Inspect the main entry points before proposing changes:
+2. Read [codex_ideas.md](../../codex_ideas.md) if it exists. Use it as the working log for research feedback, follow-up ideas, and notable observations.
+3. Inspect the main entry points before proposing changes:
    - [train.py](../../train.py)
    - [selfplay.py](../../selfplay.py)
    - [evaluate.py](../../evaluate.py)
    - [randopt.py](../../randopt.py)
    - [config.py](../../config.py)
-3. Check the current workspace state before editing:
+4. Check the current workspace state before editing:
    - existing outputs under `outputs/` if present
    - any local notes, logs, or experiment artifacts already created
-4. Prefer understanding the active training path before changing abstractions.
+5. Prefer understanding the active training path before changing abstractions.
+6. When you have feedback, hypotheses, architecture ideas, or experiment suggestions, record them in [codex_ideas.md](../../codex_ideas.md) so future sessions can build on them.
 
 ## Repository Purpose
 
@@ -40,7 +42,7 @@ LOOP FOREVER:
     - create an experiment file
     - Make sure each experiment is quick, do not dig yourself into holes. Each experiment should take NO longer than 10 minutes.
     - with a standard metric, test your hypothesis.
-    - regardless of the result, log the reesult
+    - regardless of the result, log the reesult. Push all changes/edits/new files to remote repository via the github PAT in .env 
     - Repeat
 
 The default research direction should favor self-play unless the task clearly calls for static evaluation or perturbation search.
@@ -85,6 +87,32 @@ If a new metric is introduced, document exactly how it is computed and where it 
 5. Do not claim improvement from anecdotal game samples alone.
 6. If an experiment changes training behavior, also verify evaluation still works.
 
+## Experiment Contract
+
+Every new experiment must record:
+
+- one-sentence hypothesis
+- primary metric
+- fixed evaluation set or exact split procedure
+- seed or seeds used
+- train sample count and eval sample count
+- runtime and device
+- exact command used
+- whether the result is preliminary (single seed) or replicated
+
+Every experiment should define the primary metric before running.
+
+Treat improvements smaller than 1 to 2 percentage points as provisional unless they are replicated across multiple seeds.
+
+For fair-comparison experiments, keep model size, training steps, evaluation procedure, and optimizer schedule matched unless one of those differences is the variable being tested.
+
+Prefer fixed validation sets stored on disk when possible. If not, document the exact split procedure and seed.
+
+Outputs should include failure cases, not just aggregate metrics, when practical.
+
+If static-label metrics improve, verify whether that improvement survives search-time or gameplay evaluation before prioritizing large follow-up work.
+
+When estimating next steps, default to the cheapest experiment that can falsify the current hypothesis.
 
 ## Coding Expectations
 

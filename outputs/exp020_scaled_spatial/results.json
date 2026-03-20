@@ -1,0 +1,125 @@
+{
+  "experiment": "exp020_scaled_spatial",
+  "hypothesis": "Spatial head scales with more data and epochs beyond 36.5%",
+  "primary_metric": "top-1 accuracy",
+  "seed": 42,
+  "data": {
+    "train": 200000,
+    "eval": 500
+  },
+  "model": {
+    "trainable": 1538052,
+    "head_type": "spatial"
+  },
+  "training": {
+    "epochs": 5,
+    "batch_size": 64,
+    "lr": 0.001
+  },
+  "results": {
+    "pre_train": {
+      "accuracy": 0.005,
+      "top3_accuracy": 0.11,
+      "total": 200
+    },
+    "best_acc": 0.365,
+    "final": {
+      "accuracy": 0.356,
+      "top3_accuracy": 0.632,
+      "total": 500
+    },
+    "history": [
+      {
+        "accuracy": 0.32,
+        "top3_accuracy": 0.54,
+        "total": 200,
+        "loss": 3.126699892654419,
+        "epoch": 1
+      },
+      {
+        "accuracy": 0.3,
+        "top3_accuracy": 0.59,
+        "total": 200,
+        "loss": 2.695233483581543,
+        "epoch": 2
+      },
+      {
+        "accuracy": 0.365,
+        "top3_accuracy": 0.645,
+        "total": 200,
+        "loss": 2.5413604612731935,
+        "epoch": 3
+      },
+      {
+        "accuracy": 0.355,
+        "top3_accuracy": 0.63,
+        "total": 200,
+        "loss": 2.420335242347717,
+        "epoch": 4
+      },
+      {
+        "accuracy": 0.365,
+        "top3_accuracy": 0.635,
+        "total": 200,
+        "loss": 2.327427975692749,
+        "epoch": 5
+      }
+    ],
+    "prior_best": {
+      "exp019_spatial_50k": 0.365,
+      "exp013_standard_50k": 0.25
+    }
+  },
+  "games": [
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 30,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 33,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 33,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 30,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "white",
+      "result": "0-1",
+      "model_result": "loss",
+      "moves": 28,
+      "termination": "CHECKMATE"
+    },
+    {
+      "model_color": "black",
+      "result": "1-0",
+      "model_result": "loss",
+      "moves": 23,
+      "termination": "CHECKMATE"
+    }
+  ],
+  "game_score": {
+    "wins": 0,
+    "draws": 0,
+    "losses": 6
+  },
+  "timing": {
+    "total_s": 10425.110858917236
+  }
+}
