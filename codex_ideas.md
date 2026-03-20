@@ -514,3 +514,39 @@ This conclusively answers the action-value question at this scale: AV auxiliary 
 1. **Continue training exp024** checkpoint for more epochs (loss still declining at 2.33)
 2. **Deeper model** — try 12L or 16L at 460K data to see if depth helps
 3. **Label smoothing / soft targets** — the current hard-label CE may be suboptimal for positions where multiple moves are reasonable
+
+### Session 8: Label smoothing experiment (2026-03-20)
+
+**exp028 result: TIE (+0.4pp, within noise)**
+- 3-way A/B/C: ε=0.0 (hard CE), ε=0.1, ε=0.2 on 50K data, 5 epochs
+- ε=0.0: 38.6%, ε=0.1: 39.0%, ε=0.2: 38.8%
+- Delta: +0.4pp for ε=0.1 — too small to be meaningful at N=500 eval
+- All variants still improving at epoch 5, loss not converged
+- ε=0.1 had better top3 (67.2%) than ε=0.0 (65.4%) — label smoothing may help ranking
+- Games vs SF d3: W0/D0/L6 (no improvement in gameplay)
+
+**Why label smoothing is neutral here:**
+1. +0.4pp is well within eval noise on 500 samples
+2. The model is still data-starved at 50K — the bottleneck is data/capacity, not overconfidence
+3. Label smoothing helps most when the model is near convergence — here loss is still declining steeply
+4. Uniform smoothing over all 5504 moves is crude — most of that mass goes to terrible moves
+
+**Conclusion:** Label smoothing is provisionally neutral. Could revisit at larger scale where overfitting becomes a real concern. Not worth pursuing now.
+
+**Updated cumulative results:**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | |
+| exp024 | Chess Transformer | 460K | 48.7% | 73.9% | W0/D2/L6 | BEST |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+
+**Pattern emerging:** At 50K data, nothing beats the baseline architecture. The only proven lever is **scaling data** (50K→460K gave +8pp). Architecture tweaks (relative bias, label smoothing) are neutral at this scale.
+
+**Next steps — focus on data scaling and training efficiency:**
+1. The biggest untapped gain: train the current 8L/512d model for MORE epochs on 460K data (loss was 2.33 and still declining at ep3)
+2. Or try deeper model (12L) on full data — more capacity for more data
+3. Deprioritize 50K ablations — the model is data-starved, making all interventions look flat

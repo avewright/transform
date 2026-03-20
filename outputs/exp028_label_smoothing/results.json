@@ -1,0 +1,237 @@
+{
+  "experiment": "exp028_label_smoothing",
+  "hypothesis": "Label smoothing improves chess accuracy by reducing overconfidence",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "data": {
+    "train": 50000,
+    "eval": 500
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8
+  },
+  "training": {
+    "epochs": 5,
+    "batch_size": 128,
+    "lr": 0.0003,
+    "warmup_steps": 200,
+    "schedule": "cosine"
+  },
+  "results": {
+    "eps_0.0": {
+      "name": "eps_0.0",
+      "epsilon": 0.0,
+      "trainable": 26136580,
+      "best_acc": 0.386,
+      "final": {
+        "accuracy": 0.386,
+        "top3_accuracy": 0.654,
+        "total": 500,
+        "loss": 2.3275169823175808,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.292,
+          "top3_accuracy": 0.516,
+          "total": 500,
+          "loss": 4.032351640179334,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.342,
+          "top3_accuracy": 0.61,
+          "total": 500,
+          "loss": 3.0005952031411174,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.348,
+          "top3_accuracy": 0.62,
+          "total": 500,
+          "loss": 2.712640228783688,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.372,
+          "top3_accuracy": 0.634,
+          "total": 500,
+          "loss": 2.4857295059487035,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.386,
+          "top3_accuracy": 0.654,
+          "total": 500,
+          "loss": 2.3275169823175808,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1304.4697721004486
+    },
+    "eps_0.1": {
+      "name": "eps_0.1",
+      "epsilon": 0.1,
+      "trainable": 26136580,
+      "best_acc": 0.39,
+      "final": {
+        "accuracy": 0.39,
+        "top3_accuracy": 0.672,
+        "total": 500,
+        "loss": 3.3398893269736445,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.286,
+          "top3_accuracy": 0.516,
+          "total": 500,
+          "loss": 4.835914130710885,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.332,
+          "top3_accuracy": 0.574,
+          "total": 500,
+          "loss": 3.9369009961862393,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.36,
+          "top3_accuracy": 0.63,
+          "total": 500,
+          "loss": 3.6843435441136667,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.39,
+          "top3_accuracy": 0.646,
+          "total": 500,
+          "loss": 3.4824757008906215,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.39,
+          "top3_accuracy": 0.672,
+          "total": 500,
+          "loss": 3.3398893269736445,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1303.6499288082123
+    },
+    "eps_0.2": {
+      "name": "eps_0.2",
+      "epsilon": 0.2,
+      "trainable": 26136580,
+      "best_acc": 0.388,
+      "final": {
+        "accuracy": 0.388,
+        "top3_accuracy": 0.664,
+        "total": 500,
+        "loss": 4.194965996095896,
+        "epoch": 5
+      },
+      "history": [
+        {
+          "accuracy": 0.306,
+          "top3_accuracy": 0.544,
+          "total": 500,
+          "loss": 5.507760569872453,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.318,
+          "top3_accuracy": 0.592,
+          "total": 500,
+          "loss": 4.71134356037735,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.366,
+          "top3_accuracy": 0.64,
+          "total": 500,
+          "loss": 4.494325936602815,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.378,
+          "top3_accuracy": 0.658,
+          "total": 500,
+          "loss": 4.319198341320847,
+          "epoch": 4
+        },
+        {
+          "accuracy": 0.388,
+          "top3_accuracy": 0.664,
+          "total": 500,
+          "loss": 4.194965996095896,
+          "epoch": 5
+        }
+      ],
+      "time_s": 1301.8601360321045
+    }
+  },
+  "best_variant": "eps_0.1",
+  "baseline_acc": 0.386,
+  "games": {
+    "model_used": "eps_0.1",
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 67,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 31,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 29,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 20,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 33,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 50,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 6
+    }
+  },
+  "timing": {
+    "total_s": 3928.8422610759735
+  },
+  "device": "cuda",
+  "command": "python experiments/exp028_label_smoothing.py"
+}
