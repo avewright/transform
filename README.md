@@ -34,12 +34,15 @@ Policy Head  Value Head
 | exp009 | 500 self-distilled | 46% (learned) vs 50% (CNN) | Learned encoder matches CNN with 21x fewer params |
 | exp010 | 500 self-distilled | 48% (all variants) | Unfreezing backbone doesn't help — data is bottleneck |
 | exp012b | 5000 Stockfish d10 | 14.2% (top3: 31%) | Stockfish labels are harder. Gets checkmated by SF d3 |
-| exp013 | 50K game-play (HF) | 25.0% (top3: 45%) | 10x data from HF dataset. Noisier labels but higher accuracy |
-| exp015 | 3K game-play (HF) | 25.3% (top3: 51%) | **Pooling fix**: last-token beats first-token by +4.7% (causal attention) |
+| exp_av_v2 | 5K random + SF all-move | 8.8% (top3: 21.8%) | AV vs policy CE = TIE on random positions |
+| exp_av_real | 3K HF games + SF all-move | 23.6% (top3: 48.8%) | AV vs policy = TIE; real games >>  random positions |
+| exp013 | 50K HF game-play | 25.0% (top3: 45%) | Policy CE, best result so far |
 
 100% legal move rate throughout (via legal-move masking).
 
-**Next milestone:** Combine HF data volume with Stockfish labeling — re-label 50K+ positions with Stockfish for cleaner targets.
+**Key finding:** Position quality (real games vs random play) matters far more than loss function design (policy CE vs action-value Q). Real game positions give ~23% accuracy at 3K while random positions give ~9% at 5K.
+
+**Next milestone:** Scale real-game Stockfish-labeled positions to 50K+ and test soft-target/KL formulations.
 
 ## Setup
 
@@ -83,7 +86,7 @@ python train.py selfplay --generations 10 --games 4
 ├── attnres.py              # Block Attention Residuals
 ├── train.py                # CLI entry point (selfplay / randopt modes)
 ├── setup.sh                # RunPod / Linux GPU setup
-├── experiments/            # Individual experiment scripts
+├── experiments/            # Individual experiment scripts (exp001-017)
 └── .github/instructions/   # Agent instructions
 ```
 
@@ -99,18 +102,19 @@ python train.py selfplay --generations 10 --games 4
 - **exp010**: Unfreezing backbone doesn't help — data volume is the bottleneck
 - **exp012b**: Stockfish depth-10 labels. 5K positions → 14.2% accuracy, top3 31%. Needs more data + compute
 
-### Phase 3: Data scaling (exp013+)
-- **exp013**: 50K game-play positions from HF dataset (`avewright/chess-dataset-production-1968`). 25.0% accuracy, top3 45%. Data volume > label quality at this scale. Still loses to SF d3.
-
-### Phase 4: Architecture fixes (exp015+)
-- **exp015**: Discovered critical pooling bug — model was using first-token (position 0) output, but Qwen3 uses causal attention so token 0 can only attend to itself. Switched to last-token pooling: +4.7% accuracy, +5.7% top3. Loss keeps dropping (1.5 vs 4.1 plateau). Applied fix to `chess_model.py`.
+### Phase 3: Supervision quality & data scaling (exp_av, exp013)
+- **exp_av_comparison_v2**: Fair A/B on 5K random positions — policy CE vs action-value Q(s,a) = TIE at 8.8%
+- **exp_av_real_games**: Same comparison on 3K real game positions — TIE at 23.4-23.6%
+- **Key insight**: Position quality (real games vs random play) dominates loss function choice. 15pp gap from data source, 0pp from AV signal
+- **exp013**: 50K HF game-play positions with policy CE → 25% accuracy (best result)
 
 ### Next Steps
-1. Re-label 50K+ positions with Stockfish for cleaner targets at scale
-2. Longer training (10+ epochs) — accuracy still rising at epoch 3
-3. Multi-move soft targets from Stockfish
-4. Value head integration for search during game play
-5. **Goal: Beat Stockfish** at progressively higher depth levels
+1. **Scale real-game data to 50K+** with Stockfish best-move labels on HF game positions
+2. **Soft targets**: Test top-k move probabilities or KL divergence instead of hard best-move CE
+3. **Chess-native transformer**: Build small encoder-only model (12-16 layers, 384-768d) trained from scratch on chess tokens
+4. **LoRA fine-tuning (exp015)**: Unfreeze backbone attention via low-rank adaptation — test after data scaling saturates
+5. **MCTS search (exp014)**: Use policy+value heads for tree search — test after value quality improves
+6. **Goal: Beat Stockfish** at progressively higher depth levels
 
 ## References
 

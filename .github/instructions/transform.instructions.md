@@ -42,7 +42,7 @@ LOOP FOREVER:
     - create an experiment file
     - Make sure each experiment is quick, do not dig yourself into holes. Each experiment should take NO longer than 10 minutes.
     - with a standard metric, test your hypothesis.
-    - regardless of the result, log the reesult. Push all changes/edits/new files to remote repository via the github PAT in .env 
+    - regardless of the result, log the reesult. Push all changes/edits/new files to remote repository via the github PAT in .env to avewright/transform
     - Repeat
 
 The default research direction should favor self-play unless the task clearly calls for static evaluation or perturbation search.
