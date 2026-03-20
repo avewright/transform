@@ -368,7 +368,7 @@ This conclusively answers the action-value question at this scale: AV auxiliary 
 | exp021 | Qwen3+spatial+LoRA+search | 50K | 36.5% | — | W0/D0/L6 | LoRA TIE, 1-ply search useless |
 | exp022 | Qwen3+spatial+SF value head+α-β | 10K SF | — | — | W0/D0/L20 (all depths) | 69.8% sign acc but 0 wins |
 | exp023 | **Chess Transformer 8L/512d** | 50K | **40.5%** | **68.5%** | W0/D0/L8 | +4pp over Qwen3+spatial |
-| exp024 | Chess Transformer, full data | ~460K×3ep | **TBD** | TBD | TBD | Running... |
+| exp024 | Chess Transformer, full data | ~460K×3ep | **48.7%** | **73.9%** | **W0/D2/L6** | First draws! Data scales! |
 
 **Key findings:**
 
@@ -395,6 +395,39 @@ This conclusively answers the action-value question at this scale: AV auxiliary 
 **Implication:** The project's original premise — "repurpose a text LLM for chess" — may be fundamentally flawed. A purpose-built chess network, even at 1/25th the parameter count, learns better chess representations because every parameter is optimized for the task. This is consistent with AlphaZero/Leela's approach.
 
 **Next priority:** exp024 scales the chess transformer to the full 460K dataset with 3 epochs. If accuracy climbs to 45%+ and game survival improves, this becomes the new paradigm.
+
+**exp024 RESULT — CONFIRMED: Data scaling works for chess transformer!**
+- 461K positions × 3 epochs → **48.7% accuracy, 73.9% top3**
+- +8.2pp over exp023 (50K) and +12.2pp over Qwen3+spatial
+- **First draws against SF d3!** Two games as white achieved fivefold repetition draws (31mv, 39mv)
+- Games W0/D2/L6 — still losing most games but survival improved dramatically
+- Epoch progression: 43.4% → 46.5% → 48.7% — still climbing at epoch 3
+- Training time: 4812s for 3 epochs (26M params, batch 128×2 accum)
+- Loss: 3.11 → 2.50 → 2.33 (not converged — more epochs or data could help)
+
+**Analysis of game results:**
+- All draws were as white (home advantage from repetition forcing)
+- Losses as black were faster (19-27mv) than losses as white (27-43mv)
+- The model is learning to avoid immediate blunders but still makes strategic errors
+- Draws via repetition suggest the model can maintain its position but not make progress
+
+**Updated cumulative results:**
+
+| Exp | Architecture | Data | Best Acc | Top3 | Games vs SF d3 |
+|-----|-------------|------|----------|------|----------------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — |
+| exp018 | Qwen3+standard+LoRA | 50K | 25.0% | — | — |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — |
+| exp020 | Qwen3+spatial | 200K | 36.5% | — | — |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 |
+| **exp024** | **Chess Transformer** | **460K** | **48.7%** | **73.9%** | **W0/D2/L6** |
+
+**Next directions (ranked by expected impact):**
+1. **More training**: Loss still declining → train more epochs on the same data (5-6ep total)
+2. **Stockfish-labeled data**: Replace game-outcome supervision with SF best-move labels for higher quality targets
+3. **Deeper/wider model**: The 8L/512d may be underfitting at this data volume — try 12L/512d or 8L/768d
+4. **Search integration**: With 48.7% policy accuracy, alpha-beta search with a trained value head might actually help now
+5. **More data**: The HF dataset has 475K. Can we generate more via Stockfish self-play?
 
 ### Concrete next experiment order
 
