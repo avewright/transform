@@ -1,0 +1,184 @@
+{
+  "experiment": "exp029_data_diversity",
+  "hypothesis": "Data diversity > repeated epochs at matched compute budget (200K total examples)",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "eval_size": 500,
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256
+  },
+  "training": {
+    "batch_size": 128,
+    "lr": 0.0003,
+    "warmup_steps": 200,
+    "schedule": "cosine"
+  },
+  "variants": {
+    "50K_x4ep": {
+      "name": "50K_x4ep",
+      "n_train": 50000,
+      "epochs": 4,
+      "total_examples": 200000,
+      "trainable": 26136580,
+      "best_acc": 0.37,
+      "final": {
+        "accuracy": 0.37,
+        "top3_accuracy": 0.636,
+        "total": 500,
+        "loss": 2.4382375256179847,
+        "epoch": 4
+      },
+      "history": [
+        {
+          "accuracy": 0.254,
+          "top3_accuracy": 0.512,
+          "total": 500,
+          "loss": 4.032950364720181,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.334,
+          "top3_accuracy": 0.582,
+          "total": 500,
+          "loss": 2.9835033788705423,
+          "epoch": 2
+        },
+        {
+          "accuracy": 0.35,
+          "top3_accuracy": 0.652,
+          "total": 500,
+          "loss": 2.663027179820458,
+          "epoch": 3
+        },
+        {
+          "accuracy": 0.37,
+          "top3_accuracy": 0.636,
+          "total": 500,
+          "loss": 2.4382375256179847,
+          "epoch": 4
+        }
+      ],
+      "time_s": 1042.6825230121613
+    },
+    "100K_x2ep": {
+      "name": "100K_x2ep",
+      "n_train": 100000,
+      "epochs": 2,
+      "total_examples": 200000,
+      "trainable": 26136580,
+      "best_acc": 0.374,
+      "final": {
+        "accuracy": 0.374,
+        "top3_accuracy": 0.654,
+        "total": 500,
+        "loss": 2.602215706539886,
+        "epoch": 2
+      },
+      "history": [
+        {
+          "accuracy": 0.342,
+          "top3_accuracy": 0.58,
+          "total": 500,
+          "loss": 3.526872028475222,
+          "epoch": 1
+        },
+        {
+          "accuracy": 0.374,
+          "top3_accuracy": 0.654,
+          "total": 500,
+          "loss": 2.602215706539886,
+          "epoch": 2
+        }
+      ],
+      "time_s": 1041.5052881240845
+    },
+    "200K_x1ep": {
+      "name": "200K_x1ep",
+      "n_train": 200000,
+      "epochs": 1,
+      "total_examples": 200000,
+      "trainable": 26136580,
+      "best_acc": 0.364,
+      "final": {
+        "accuracy": 0.364,
+        "top3_accuracy": 0.644,
+        "total": 500,
+        "loss": 3.080182115923344,
+        "epoch": 1
+      },
+      "history": [
+        {
+          "accuracy": 0.364,
+          "top3_accuracy": 0.644,
+          "total": 500,
+          "loss": 3.080182115923344,
+          "epoch": 1
+        }
+      ],
+      "time_s": 1040.722950220108
+    }
+  },
+  "best_variant": "100K_x2ep",
+  "diversity_delta": -0.006,
+  "games": {
+    "model_used": "100K_x2ep",
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 76,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 33,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 39,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 24,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 31,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 25,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 6
+    }
+  },
+  "timing": {
+    "total_s": 3156.9163603782654
+  },
+  "device": "cuda",
+  "command": "python experiments/exp029_data_diversity.py"
+}

@@ -550,3 +550,42 @@ This conclusively answers the action-value question at this scale: AV auxiliary 
 1. The biggest untapped gain: train the current 8L/512d model for MORE epochs on 460K data (loss was 2.33 and still declining at ep3)
 2. Or try deeper model (12L) on full data — more capacity for more data
 3. Deprioritize 50K ablations — the model is data-starved, making all interventions look flat
+
+### Session 9: Data diversity vs epochs experiment (2026-03-20)
+
+**exp029 result: TIE (all within noise)**
+- 3-way matched-compute comparison: each variant sees 200K total training examples
+- 50K×4ep: 37.0% best, loss 2.44
+- 100K×2ep: 37.4% best, loss 2.60
+- 200K×1ep: 36.4% best, loss 3.08
+- Diversity delta (200K×1 - 50K×4): -0.6pp — within noise
+- Games vs SF d3: W0/D0/L6 (no improvement)
+
+**Why diversity ≠ the driver of data scaling gains:**
+1. At matched compute (200K total examples), diversity doesn't help — 50K×4 ≈ 100K×2 ≈ 200K×1
+2. The exp024 gain (50K→460K = +8pp) is actually about **total gradient volume**: 460K×3ep = 1.38M examples vs 50K×10ep = 500K examples
+3. 200K×1ep has a HIGHER loss (3.08) than 50K×4ep (2.44) — the model barely learns from single pass
+4. The sweet spot appears to be ~2 passes minimum to learn well (100K×2ep matched 50K×4ep)
+
+**Critical implication:**
+The path to better accuracy is simply **more gradient updates** — either:
+- More epochs on existing data (cheap, diminishing returns)
+- More unique data with sufficient epochs (expensive but scalable)
+- Or both: bigger dataset × more epochs
+
+**Updated cumulative results:**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | 10 epochs |
+| exp024 | Chess Transformer | 460K | 48.7% | 73.9% | W0/D2/L6 | BEST |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+| exp029 | 50K×4/100K×2/200K×1 | matched 200K | 37.4% | 65.4% | W0/D0/L6 | TIE |
+
+**Next steps — shift to longer training:**
+1. Train 8L/512d for 10 epochs on 460K data (most direct path to improvement — exp024 loss was 2.33 at ep3, should reach ~2.0 at ep10). This exceeds the 10-min budget but is the highest-value experiment.
+2. Alternative: depth scaling on 50K first (8L vs 12L) as a quick signal before committing to expensive full-data runs
+3. Alternative: try fundamentally different approach — self-play / reinforcement loop instead of supervised learning
