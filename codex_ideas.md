@@ -952,3 +952,21 @@ Every approach to push past 51.4% has failed:
 The 51.4% ceiling appears fundamental to this dataset + architecture combination.
 Next direction: try a completely different approach — attention pattern modifications
 or training curriculum changes.
+
+### exp041: KL-Constrained Self-Play (95s)
+- **Hypothesis**: KL penalty (β=0.1) against frozen reference prevents catastrophic
+  forgetting that destroyed exp033 vanilla REINFORCE
+- **Design**: 3 gens × 50 self-play games, temp=0.3, lr=1e-6, REINFORCE + KL(p||p_ref)
+- **Result**: Accuracy preserved at 51.4% across all generations (KL works!)
+- **But**: Self-play signal too weak — only ~2% positions decisive (126-146 per gen)
+  Gen3 had ZERO decisive positions (all draws/timeouts), update skipped
+- **Games**: W0/D2/L6 (slight improvement over exp032 W0/D1/L7, variance)
+- **Conclusion**: KL constraint successfully prevents catastrophic forgetting.
+  But with temp=0.3 the model draws against itself constantly. Need either
+  higher temp (unrealistic positions) or asymmetric play for signal.
+  The fundamental issue remains: self-play provides almost no learning signal
+  when the model is already decent at not losing.
+
+**Updated meta-insight:**
+- KL-constrained RL preserves the model but can't improve it (no signal)
+- Need to pivot to architectural changes per instructions: "attention on attention"
