@@ -778,9 +778,31 @@ Details:
 | exp032 | +continue LR=1e-5 | 460K×10ep | 51.4% | 78.4% | W0/D1/L7 | +0.2pp |
 | exp033 | REINFORCE selfplay | — | 0.8% | 3.2% | W0/D0/L8 | DESTROYED |
 | exp034 | SF distill 50K | 50K SF d8 | 52.9%(SF) | — | W0/D0/L8 | WORSE |
+| exp035 | 90%human+10%SF mix | 460K+50K | 51.8% | — | W0/D0/L8 | +0.4pp marginal |
+
+### exp035: Mixed Human+SF Training (90/10 ratio)
+**Hypothesis:** 90% human + 10% SF data per batch retains human accuracy while improving SF-alignment.
+**Result:** Human acc 51.4% → 51.8% (+0.4pp), SF acc 49.2% → 51.2% (+2.0pp). Games: W0/D0/L8.
+**Verdict:** MARGINAL — slight accuracy gain but lost the draw exp032 had vs SF.
+
+Details:
+- 461K human + 50K SF (d8) mixed training, 2 epochs, LR=3e-5 cosine
+- Epoch 1: human=51.8%, sf=50.8% (both improved)
+- Epoch 2: human=51.6%, sf=51.2% (slight regression on human)
+- Games vs SF d3: W0/D0/L8 (all checkmate, avg 47 moves — worse than exp032's 1 draw)
+- Total time: 5515s (~92 min)
+
+**Analysis:**
+1. The 10% SF mix gently nudged both metrics up but couldn't break through
+2. Two epochs on 460K is essentially just re-training what exp031-032 already learned
+3. The LR=3e-5 was too low for meaningful learning from the SF signal
+4. The model has hit a genuine capacity/data ceiling at ~51% — more of the same data doesn't help
+5. Game play didn't improve because the accuracy gain was too small to affect tactical strength
+
+**Key insight: Accuracy-based approaches are saturated. The model needs SEARCH at inference time to improve game play, not better training.**
 
 **Next priorities:**
-1. **Mixed supervised training** — train on 460K human + 50K SF labels together (weighted mix)
-2. **SF-labeled full dataset** — label all 460K with SF d8 and train from scratch
-3. **Expert iteration** — use model's top-K moves, re-rank with SF, train on best
-4. **Self-play with KL constraint** — REINFORCE but anchored to original policy
+1. **Inference-time search** — 1-ply lookahead with value head (no training needed, purely inference enhancement)
+2. **MCTS** — multi-ply search using policy to guide + value to evaluate
+3. **12L model from scratch** — break capacity ceiling with more depth
+4. **PPO self-play** — proper RL with KL constraint and clipping

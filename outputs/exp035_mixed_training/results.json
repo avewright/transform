@@ -1,0 +1,142 @@
+{
+  "experiment": "exp035_mixed_training",
+  "hypothesis": "90% human + 10% SF mix improves play without forgetting",
+  "primary_metric": "human accuracy + games vs SF d3",
+  "seed": 42,
+  "data": {
+    "human_train": 461574,
+    "sf_train": 50000,
+    "sf_depth": 8,
+    "sf_mix_ratio": 0.1
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256,
+    "trainable": 26136580
+  },
+  "training": {
+    "epochs": 2,
+    "batch_size": 128,
+    "accum_steps": 2,
+    "lr": 3e-05,
+    "warmup_steps": 300
+  },
+  "results": {
+    "baseline_human": {
+      "accuracy": 0.514,
+      "top3_accuracy": 0.784,
+      "total": 1000
+    },
+    "baseline_sf": {
+      "accuracy": 0.492,
+      "top3_accuracy": 0.72,
+      "total": 1000
+    },
+    "final_human": {
+      "accuracy": 0.518,
+      "top3_accuracy": 0.783,
+      "total": 1000
+    },
+    "final_sf": {
+      "accuracy": 0.508,
+      "top3_accuracy": 0.729,
+      "total": 1000
+    },
+    "best_human_acc": 0.518,
+    "history": [
+      {
+        "epoch": 1,
+        "loss": 2.1438,
+        "human_acc": 0.518,
+        "human_top3": 0.783,
+        "sf_acc": 0.508,
+        "sf_top3": 0.729
+      },
+      {
+        "epoch": 2,
+        "loss": 2.1075,
+        "human_acc": 0.516,
+        "human_top3": 0.796,
+        "sf_acc": 0.512,
+        "sf_top3": 0.737
+      }
+    ]
+  },
+  "comparison": {
+    "exp032_acc": 0.514,
+    "human_delta": 0.004
+  },
+  "games": {
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 19,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 25,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 75,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 36,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 71,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 21,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 56,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 77,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 8
+    }
+  },
+  "timing": {
+    "total_s": 5515.423263311386
+  },
+  "device": "cuda",
+  "command": "python experiments/exp035_mixed_training.py"
+}
