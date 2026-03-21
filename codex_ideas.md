@@ -876,7 +876,43 @@ Details:
   No amount of target-engineering (SF, EI, mixed) or search (1-ply) helps.
   Must either scale model (12L+) or scale data to break through.**
 
+### exp039: 12-Layer Model from Scratch — Testing Capacity Ceiling
+
+**Goal:** Train 12L/512d/8h model (38.7M params vs 26.1M for 8L) from scratch on full 460K
+**Training:** 6 epochs, LR=3e-4 with warmup+cosine, batch 128×2
+
+**Results (vs 8L baselines):**
+| Metric | 12L (exp039) | 8L (exp031) | 8L (exp032) |
+|--------|-------------|-------------|-------------|
+| Accuracy | 50.1% | 51.2% | 51.4% |
+| Top3 | 76.7% | 76.2% | 78.4% |
+| Loss | 2.054 | 2.133 | — |
+| Games | W0/D1/L7 | W0/D1/L7 | W0/D1/L7 |
+| Time | 18,037s | ~14,400s | ~7,200s |
+
+Epoch-by-epoch: 43.4% → 46.2% → 47.8% → 48.9% → 49.7% → 50.1%
+(vs 8L: 43.4% → 46.5% → 48.7% at ep 1-3, reaching 51.2% at ep 6)
+
+**Analysis:**
+1. **12L is WORSE than 8L** — capacity is NOT the bottleneck
+2. 12L has consistently LOWER loss but LOWER accuracy = overfitting to training data noise
+3. Extra parameters memorize but don't generalize — classic sign that data quality limits performance
+4. The ceiling is in the DATA (amateur games), not the MODEL (architecture/capacity)
+5. 48% more params + 25% more training time yields 1.1pp LOWER accuracy
+6. **Key insight: Data quality > model capacity for chess move prediction on amateur games**
+
+**Session 10+11 Complete Story:**
+- exp033: REINFORCE self-play → DESTROYED model
+- exp034: Pure SF distill → Mixed result (-9pp human acc)
+- exp035: 90/10 human+SF mix → Marginal (+0.4pp)
+- exp036: 1-ply search with old value head → HURTS
+- exp037: SF-calibrated value head → Search still W0/D0/L8
+- exp038: Expert iteration → Still -1.2pp, W0/D0/L8
+- exp039: 12L model → 50.1% < 8L's 51.2%, capacity NOT the bottleneck
+- **Meta-conclusion: Can't break through with current data. Need higher quality training data
+  (master-level games) or fundamentally different training objective.**
+
 **Next priorities:**
-1. **12L model from scratch** — break capacity ceiling with more depth
-2. **More data** — explore larger datasets if available
-3. **Architectural changes** — different encodings or attention patterns
+1. **Data quality filtering** — filter to higher-ELO games if rating info available
+2. **Data augmentation** — board flipping to double effective data
+3. **Label smoothing / regularization** — help 8L generalize better
