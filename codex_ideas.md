@@ -1034,3 +1034,39 @@ To play STRONG chess, train on STRONG players' moves. The path forward is:
 2. Filter by rating + SF agreement for data quality
 3. Train from scratch on this curated dataset
   Key finding: small dataset (5K) only supports 1 epoch before overfitting.
+
+### exp046: Large-scale Lichess from-scratch training
+- **Goal**: Train our 8L transformer from scratch on 209K positions from 22 top Lichess players (avg ELO 2598)
+- **Data**: Downloaded 209,382 positions from top-50 players across blitz/rapid/classical/bullet
+  - Used Lichess API to fetch top players, then download their games
+  - Cached at outputs/exp046_lichess_large/lichess_2200plus.jsonl (28MB)
+  - Training on ACTUAL player moves (not SF labels)
+  - Train: 207,382, Eval: 2,000
+- **Results**: Strong learning curve across 6 epochs:
+
+| Epoch | Loss | Accuracy | Top-3 |
+|-------|------|----------|-------|
+| 1 | 4.44 | 21.8% | 42.1% |
+| 2 | 3.21 | 27.0% | 50.7% |
+| 3 | 2.79 | 30.3% | 55.7% |
+| 4 | 2.48 | 33.9% | 59.6% |
+| 5 | 2.23 | 36.7% | 61.5% |
+| 6 | 2.08 | 37.1% | 62.0% |
+
+- **exp032 on same Lichess eval**: 23.2% acc, 44.4% top3
+- **Games**: W0/D0/L8 (still loses to SF d3)
+- **Key findings**:
+  1. **37.1% beats exp032's 23.2%** on Lichess data (60% relative improvement)
+  2. But 37.1% < 51.4% on HF data — predicting 2600+ player moves IS harder
+  3. Epoch 5→6 gain was only 0.4% — plateau starting, need MORE DATA
+  4. Loss still decreasing (2.08) — model capacity not saturated
+  5. Despite better move prediction on high-ELO positions, still W0/D0/L8 vs SF
+  6. Only used 22/189 available players — massive room to scale data
+- **Total time**: 6694s (~112 min)
+
+**NEXT STEPS for data engineering path:**
+1. Download from ALL 189 players (currently only 22) → should get ~1.8M positions
+2. Download more games per player (currently 300 max → try 1000+)
+3. Consider mixed training: pretrain on HF data, finetune on Lichess
+4. Add SF filtering: keep only positions where player move agrees with SF top-3
+5. Need to investigate why high move prediction accuracy doesn't translate to game wins
