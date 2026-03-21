@@ -970,3 +970,18 @@ or training curriculum changes.
 **Updated meta-insight:**
 - KL-constrained RL preserves the model but can't improve it (no signal)
 - Need to pivot to architectural changes per instructions: "attention on attention"
+
+### exp042: Layer Attention — attention over transformer layers (1107s)
+- **Hypothesis**: Layer attention over all 8 transformer outputs ("attention on
+  attention") lets the model select best representation layer per-position
+- **Design**: Added LayerAttention module (524K new params). Initialized bias to
+  strongly favor last layer (softmax(5,0,...) ≈ 0.99). Fine-tuned from exp032
+  on 100K subset, 2 epochs, LR=3e-5.
+- **Result**: Baseline DROPPED to 44.5% (random Q/K init disrupted attention).
+  Epoch 1: 50.2%, Epoch 2: 50.1% — partially recovered but below 51.4%.
+  Games: W0/D0/L8.
+- **Root cause**: Despite bias initialization favoring last layer, random Q/K
+  projections added noise that disrupted pretrained representations. Would need
+  zero-init Q/K or identity initialization to preserve baseline.
+- **Lesson**: Architectural additions to pretrained models must preserve exact
+  baseline behavior at initialization. Even small perturbations compound.
