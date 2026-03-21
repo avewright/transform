@@ -1,0 +1,135 @@
+{
+  "experiment": "exp032_continue_training",
+  "hypothesis": "Fine-tuning exp031 (51.2%) with constant LR=1e-5 for 4 more epochs",
+  "primary_metric": "top-1 accuracy (best across epochs)",
+  "seed": 42,
+  "data": {
+    "train": 461574,
+    "eval": 1000
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8
+  },
+  "training": {
+    "additional_epochs": 4,
+    "total_effective_epochs": 10,
+    "batch_size": 128,
+    "accum_steps": 2,
+    "lr": 1e-05,
+    "schedule": "constant"
+  },
+  "baseline": {
+    "exp031_acc": 0.512,
+    "pre_eval": 0.512
+  },
+  "results": {
+    "best_acc": 0.514,
+    "history": [
+      {
+        "accuracy": 0.507,
+        "top3_accuracy": 0.768,
+        "total": 1000,
+        "loss": 2.0404,
+        "epoch": 7
+      },
+      {
+        "accuracy": 0.507,
+        "top3_accuracy": 0.777,
+        "total": 1000,
+        "loss": 2.011,
+        "epoch": 8
+      },
+      {
+        "accuracy": 0.511,
+        "top3_accuracy": 0.785,
+        "total": 1000,
+        "loss": 1.9844,
+        "epoch": 9
+      },
+      {
+        "accuracy": 0.514,
+        "top3_accuracy": 0.784,
+        "total": 1000,
+        "loss": 1.9631,
+        "epoch": 10
+      }
+    ]
+  },
+  "comparison": {
+    "exp031_6ep": 0.512,
+    "delta": 0.002
+  },
+  "games": {
+    "results": [
+      {
+        "model_color": "white",
+        "result": "1/2-1/2",
+        "model_result": "draw",
+        "moves": 51,
+        "termination": "FIVEFOLD_REPETITION"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 56,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 32,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 29,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 74,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 37,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 40,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 31,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 1,
+      "losses": 7
+    }
+  },
+  "timing": {
+    "total_s": 9582.1398665905
+  },
+  "device": "cuda",
+  "command": "python experiments/exp032_continue_training.py"
+}

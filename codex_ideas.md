@@ -667,8 +667,44 @@ Total time: 14,364s (~4 hours)
 
 **Key milestone:** First model to break 50% accuracy. The improvement path is clear: more training epochs on the full data.
 
+### exp032: Continue Training from Checkpoint (LR=1e-5, +4 epochs)
+**Hypothesis:** Fine-tuning exp031's 51.2% model with a low constant LR for 4 more epochs (total 10 effective) will push accuracy further.
+**Result:** 51.4% accuracy (+0.2pp), 78.4% top3 (+2.2pp). Loss 2.06→1.96.
+**Verdict:** MARGINAL — top-1 barely moved, but top-3 gained meaningfully.
+
+Epoch progression (continuing from exp031's epoch 6):
+- Epoch 7: 50.7%, loss 2.01
+- Epoch 8: 50.7%, loss 1.99
+- Epoch 9: 51.1%, loss 1.98
+- Epoch 10: 51.4%, loss 1.96
+
+Games vs SF d3: W0/D1/L7 (1 fivefold repetition draw as white in 51mv)
+Total time: 9582s (~2.7 hours)
+
+**Analysis:**
+1. Top-1 improved only marginally (+0.2pp), but top-3 gained +2.2pp (76.2%→78.4%)
+2. Low LR (1e-5) refines ranking (top-3) more than top-1 prediction
+3. Loss dropped from 2.06→1.96 — still declining, but diminishing returns
+4. 4 additional epochs at 1e-5 don't match the value of the original 6 epochs at 3e-4
+5. The top-1 ceiling (~51%) may reflect data quality rather than model capacity — amateur game labels have inherent noise
+
+**Updated cumulative results (ALL experiments):**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | 10 epochs |
+| exp024 | Chess Transformer | 460K×3ep | 48.7% | 73.9% | W0/D2/L6 | prev best |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+| exp029 | data diversity | matched 200K | 37.4% | 65.4% | W0/D0/L6 | TIE |
+| exp030 | 12L depth | 50K | 38.0% | 65.8% | W0/D1/L5 | TIE |
+| exp031 | Chess Transformer | 460K×6ep | 51.2% | 76.2% | W0/D1/L7 | NEW BEST |
+| **exp032** | **+continue LR=1e-5** | **460K×10ep** | **51.4%** | **78.4%** | **W0/D1/L7** | **+0.2pp marginal** |
+
 **Next priorities:**
-1. **Train even longer** — 10 epochs on 460K data. Loss was still 2.06 and declining. Extrapolating the curve: ~53% at 10ep.
-2. **Save checkpoint for self-play** — the 51.2% model is strong enough to bootstrap self-play training
-3. **Try larger model on full data** — if 8L underfits at 460K×6ep, 12L might help here (unlike at 50K where data was bottleneck)
-4. **Improve data quality** — Stockfish-labeled positions instead of game-outcome labels
+1. **Self-play / expert iteration** — instructions emphasize self-play as default research direction. The 51.4% model is strong enough to bootstrap self-play training.
+2. **Stockfish-labeled data** — replace noisy game-outcome labels with Stockfish best-move labels for higher-quality supervision
+3. **Larger model on full data** — 12L at 460K×6ep (now that data is not the bottleneck)
+4. **MCTS search at inference** — use the value head + policy for tree search during evaluation
