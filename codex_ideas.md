@@ -738,3 +738,49 @@ Details:
 - Or much better: use self-play data as SUPERVISED targets (expert iteration)
 - Pure REINFORCE needs thousands of games per update to reduce variance
 - Consider mixing supervised + RL data (e.g., 90% supervised + 10% self-play)
+
+### exp034: Stockfish Distillation — Fine-tune on SF-labeled positions
+**Hypothesis:** Relabeling 50K positions with SF d8 best moves and fine-tuning will improve play strength.
+**Result:** SF accuracy: 48.8% → 52.9% (+4.1pp), but human accuracy: 51.4% → 42.3% (-9.1pp). Games: W0/D0/L8 (WORSE).
+**Verdict:** MIXED/NEGATIVE — learned SF moves better but lost general chess knowledge.
+
+Details:
+- 50K positions labeled with SF d8 in 185s (270/s, zero skipped)
+- Human-SF move agreement: only 37.4% (humans differ from SF 63% of the time!)
+- Baseline SF accuracy: 48.8% → model already partially knows SF-style moves
+- After 2 epochs: SF acc 52.9%, loss 1.588 (overfit to 50K SF labels)
+- Lost the draw exp032 had vs SF d3; all 8 games lost by checkmate
+- Total time: 745s
+
+**Analysis:**
+1. 50K SF-labeled positions is too few to retrain a model that learned from 460K human positions
+2. The model catastrophically forgot its human-trained policy while learning SF targets
+3. Human-SF agreement of only 37.4% explains the accuracy tradeoff — the targets point in very different directions
+4. Need MUCH more SF-labeled data (200K+) to replace human training entirely
+5. Or: mix human + SF data during training (not replace)
+6. Or: use SF labels as soft targets (KL divergence to SF policy, not hard CE)
+
+**Key insight: Best path forward is likely MIXED training — mostly human data + some SF data.**
+
+**Updated cumulative results (ALL experiments):**
+
+| Experiment | Architecture | Data | Best Acc | Top3 | Games vs SF d3 | Notes |
+|------------|-------------|------|----------|------|----------------|-------|
+| exp013 | Qwen3+standard | 50K | 25.0% | 45.0% | — | |
+| exp019 | Qwen3+spatial | 50K | 36.5% | 61.4% | — | |
+| exp023 | Chess Transformer | 50K | 40.5% | 68.5% | W0/D0/L8 | 10 epochs |
+| exp024 | Chess Transformer | 460K×3ep | 48.7% | 73.9% | W0/D2/L6 | |
+| exp026 | +rel_bias | 50K | 37.0% | 66.8% | — | TIE |
+| exp028 | +label smoothing | 50K | 39.0% | 67.2% | W0/D0/L6 | TIE |
+| exp029 | data diversity | matched 200K | 37.4% | 65.4% | W0/D0/L6 | TIE |
+| exp030 | 12L depth | 50K | 38.0% | 65.8% | W0/D1/L5 | TIE |
+| exp031 | Chess Transformer | 460K×6ep | 51.2% | 76.2% | W0/D1/L7 | BEST |
+| exp032 | +continue LR=1e-5 | 460K×10ep | 51.4% | 78.4% | W0/D1/L7 | +0.2pp |
+| exp033 | REINFORCE selfplay | — | 0.8% | 3.2% | W0/D0/L8 | DESTROYED |
+| exp034 | SF distill 50K | 50K SF d8 | 52.9%(SF) | — | W0/D0/L8 | WORSE |
+
+**Next priorities:**
+1. **Mixed supervised training** — train on 460K human + 50K SF labels together (weighted mix)
+2. **SF-labeled full dataset** — label all 460K with SF d8 and train from scratch
+3. **Expert iteration** — use model's top-K moves, re-rank with SF, train on best
+4. **Self-play with KL constraint** — REINFORCE but anchored to original policy

@@ -1,0 +1,143 @@
+{
+  "experiment": "exp034_stockfish_distill",
+  "hypothesis": "SF-labeled data improves chess play vs human labels",
+  "primary_metric": "SF-label accuracy + games vs SF d3",
+  "seed": 42,
+  "data": {
+    "sf_labeled_train": 50000,
+    "sf_labeled_eval": 1000,
+    "human_labeled_eval": 1000,
+    "sf_depth": 8
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256,
+    "trainable": 26136580
+  },
+  "training": {
+    "epochs": 2,
+    "batch_size": 128,
+    "accum_steps": 2,
+    "lr": 0.0001,
+    "warmup_steps": 200
+  },
+  "results": {
+    "baseline_human": {
+      "accuracy": 0.514,
+      "top3_accuracy": 0.784,
+      "total": 1000
+    },
+    "baseline_sf": {
+      "accuracy": 0.488,
+      "top3_accuracy": 0.707,
+      "total": 1000
+    },
+    "final_human": {
+      "accuracy": 0.423,
+      "top3_accuracy": 0.694,
+      "total": 1000
+    },
+    "final_sf": {
+      "accuracy": 0.529,
+      "top3_accuracy": 0.792,
+      "total": 1000
+    },
+    "history": [
+      {
+        "epoch": 1,
+        "loss": 2.3438,
+        "human_acc": 0.448,
+        "human_top3": 0.708,
+        "sf_acc": 0.518,
+        "sf_top3": 0.777
+      },
+      {
+        "epoch": 2,
+        "loss": 1.588,
+        "human_acc": 0.423,
+        "human_top3": 0.694,
+        "sf_acc": 0.529,
+        "sf_top3": 0.792
+      }
+    ],
+    "best_sf_acc": 0.529
+  },
+  "comparison": {
+    "exp032_human_acc": 0.514,
+    "human_delta": -0.091,
+    "exp032_games": "W0/D1/L7"
+  },
+  "games": {
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 77,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 43,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 40,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 23,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 18,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 92,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 28,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 8
+    }
+  },
+  "timing": {
+    "total_s": 744.7595059871674
+  },
+  "device": "cuda",
+  "command": "python experiments/exp034_stockfish_distill.py"
+}
