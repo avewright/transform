@@ -1,0 +1,588 @@
+{
+  "experiment": "exp033_selfplay_reinforce",
+  "hypothesis": "REINFORCE from self-play improves game strength",
+  "primary_metric": "games vs SF d3 + supervised accuracy",
+  "seed": 42,
+  "config": {
+    "num_generations": 20,
+    "games_per_gen": 30,
+    "temperature": 0.8,
+    "max_game_moves": 100,
+    "policy_lr": 1e-05,
+    "value_lr": 0.0001,
+    "policy_weight": 1.0,
+    "value_weight": 0.5,
+    "entropy_weight": 0.01,
+    "max_batch": 64
+  },
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256,
+    "trainable": 26136580
+  },
+  "results": {
+    "baseline_eval": {
+      "accuracy": 0.514,
+      "top3_accuracy": 0.784,
+      "total": 1000
+    },
+    "final_eval": {
+      "accuracy": 0.008,
+      "top3_accuracy": 0.032,
+      "total": 1000
+    },
+    "acc_delta": -0.506
+  },
+  "selfplay": {
+    "generation_history": [
+      {
+        "generation": 1,
+        "games": {
+          "1-0": 10,
+          "0-1": 13,
+          "1/2-1/2": 7,
+          "total_moves": 3000,
+          "terminations": {
+            "adjudication": 23,
+            "max_moves": 7
+          }
+        },
+        "update": {
+          "policy_loss": 0.19567511044442654,
+          "value_loss": 0.673095628619194,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.3
+      },
+      {
+        "generation": 2,
+        "games": {
+          "1-0": 8,
+          "0-1": 14,
+          "1/2-1/2": 8,
+          "total_moves": 2990,
+          "terminations": {
+            "max_moves": 8,
+            "adjudication": 21,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2990,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.0
+      },
+      {
+        "generation": 3,
+        "games": {
+          "1-0": 13,
+          "0-1": 12,
+          "1/2-1/2": 5,
+          "total_moves": 2835,
+          "terminations": {
+            "max_moves": 5,
+            "adjudication": 22,
+            "checkmate": 3
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2835,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.6
+      },
+      {
+        "generation": 4,
+        "games": {
+          "1-0": 18,
+          "0-1": 8,
+          "1/2-1/2": 4,
+          "total_moves": 3000,
+          "terminations": {
+            "adjudication": 26,
+            "max_moves": 4
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.1
+      },
+      {
+        "generation": 5,
+        "games": {
+          "1-0": 9,
+          "0-1": 11,
+          "1/2-1/2": 10,
+          "total_moves": 3000,
+          "terminations": {
+            "max_moves": 10,
+            "adjudication": 20
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": {
+          "accuracy": 0.008,
+          "top3_accuracy": 0.032,
+          "total": 1000
+        },
+        "time_s": 13.7
+      },
+      {
+        "generation": 6,
+        "games": {
+          "1-0": 10,
+          "0-1": 14,
+          "1/2-1/2": 6,
+          "total_moves": 2995,
+          "terminations": {
+            "adjudication": 23,
+            "max_moves": 6,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2995,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.0
+      },
+      {
+        "generation": 7,
+        "games": {
+          "1-0": 10,
+          "0-1": 13,
+          "1/2-1/2": 7,
+          "total_moves": 2956,
+          "terminations": {
+            "adjudication": 22,
+            "max_moves": 7,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2956,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.9
+      },
+      {
+        "generation": 8,
+        "games": {
+          "1-0": 13,
+          "0-1": 10,
+          "1/2-1/2": 7,
+          "total_moves": 2998,
+          "terminations": {
+            "adjudication": 22,
+            "max_moves": 7,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2998,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.2
+      },
+      {
+        "generation": 9,
+        "games": {
+          "1-0": 6,
+          "0-1": 13,
+          "1/2-1/2": 11,
+          "total_moves": 2914,
+          "terminations": {
+            "adjudication": 18,
+            "max_moves": 11,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2914,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.7
+      },
+      {
+        "generation": 10,
+        "games": {
+          "1-0": 12,
+          "0-1": 9,
+          "1/2-1/2": 9,
+          "total_moves": 3000,
+          "terminations": {
+            "adjudication": 21,
+            "max_moves": 9
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": {
+          "accuracy": 0.008,
+          "top3_accuracy": 0.032,
+          "total": 1000
+        },
+        "time_s": 13.7
+      },
+      {
+        "generation": 11,
+        "games": {
+          "1-0": 9,
+          "0-1": 11,
+          "1/2-1/2": 10,
+          "total_moves": 2988,
+          "terminations": {
+            "max_moves": 10,
+            "adjudication": 19,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2988,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.0
+      },
+      {
+        "generation": 12,
+        "games": {
+          "1-0": 11,
+          "0-1": 12,
+          "1/2-1/2": 7,
+          "total_moves": 2956,
+          "terminations": {
+            "max_moves": 7,
+            "checkmate": 1,
+            "adjudication": 22
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2956,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.9
+      },
+      {
+        "generation": 13,
+        "games": {
+          "1-0": 11,
+          "0-1": 14,
+          "1/2-1/2": 5,
+          "total_moves": 2936,
+          "terminations": {
+            "adjudication": 24,
+            "max_moves": 5,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2936,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.8
+      },
+      {
+        "generation": 14,
+        "games": {
+          "1-0": 14,
+          "0-1": 14,
+          "1/2-1/2": 2,
+          "total_moves": 2923,
+          "terminations": {
+            "adjudication": 26,
+            "max_moves": 2,
+            "checkmate": 2
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2923,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.9
+      },
+      {
+        "generation": 15,
+        "games": {
+          "1-0": 10,
+          "0-1": 17,
+          "1/2-1/2": 3,
+          "total_moves": 2989,
+          "terminations": {
+            "adjudication": 25,
+            "checkmate": 2,
+            "max_moves": 3
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2989,
+          "n_decisive": 256
+        },
+        "eval": {
+          "accuracy": 0.008,
+          "top3_accuracy": 0.032,
+          "total": 1000
+        },
+        "time_s": 13.7
+      },
+      {
+        "generation": 16,
+        "games": {
+          "1-0": 13,
+          "0-1": 11,
+          "1/2-1/2": 6,
+          "total_moves": 2993,
+          "terminations": {
+            "max_moves": 6,
+            "adjudication": 23,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2993,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.0
+      },
+      {
+        "generation": 17,
+        "games": {
+          "1-0": 14,
+          "0-1": 11,
+          "1/2-1/2": 5,
+          "total_moves": 2881,
+          "terminations": {
+            "adjudication": 21,
+            "checkmate": 4,
+            "max_moves": 5
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2881,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 11.6
+      },
+      {
+        "generation": 18,
+        "games": {
+          "1-0": 9,
+          "0-1": 12,
+          "1/2-1/2": 9,
+          "total_moves": 3000,
+          "terminations": {
+            "max_moves": 9,
+            "adjudication": 21
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.3
+      },
+      {
+        "generation": 19,
+        "games": {
+          "1-0": 10,
+          "0-1": 10,
+          "1/2-1/2": 10,
+          "total_moves": 2985,
+          "terminations": {
+            "adjudication": 19,
+            "max_moves": 10,
+            "checkmate": 1
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 2985,
+          "n_decisive": 256
+        },
+        "eval": null,
+        "time_s": 12.0
+      },
+      {
+        "generation": 20,
+        "games": {
+          "1-0": 10,
+          "0-1": 12,
+          "1/2-1/2": 8,
+          "total_moves": 3000,
+          "terminations": {
+            "adjudication": 22,
+            "max_moves": 8
+          }
+        },
+        "update": {
+          "policy_loss": NaN,
+          "value_loss": NaN,
+          "entropy": 0.0,
+          "n_pos": 3000,
+          "n_decisive": 256
+        },
+        "eval": {
+          "accuracy": 0.008,
+          "top3_accuracy": 0.032,
+          "total": 1000
+        },
+        "time_s": 13.7
+      }
+    ],
+    "total_games": 600
+  },
+  "games": {
+    "results": [
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 22,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 39,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 16,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 19,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 15,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 28,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "white",
+        "result": "0-1",
+        "model_result": "loss",
+        "moves": 26,
+        "termination": "CHECKMATE"
+      },
+      {
+        "model_color": "black",
+        "result": "1-0",
+        "model_result": "loss",
+        "moves": 12,
+        "termination": "CHECKMATE"
+      }
+    ],
+    "score": {
+      "wins": 0,
+      "draws": 0,
+      "losses": 8
+    }
+  },
+  "comparison": {
+    "exp032_acc": 0.514,
+    "exp032_games": "W0/D1/L7"
+  },
+  "timing": {
+    "total_s": 266.5544123649597
+  },
+  "device": "cuda",
+  "command": "python experiments/exp033_selfplay_reinforce.py"
+}

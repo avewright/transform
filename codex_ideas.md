@@ -708,3 +708,33 @@ Total time: 9582s (~2.7 hours)
 2. **Stockfish-labeled data** — replace noisy game-outcome labels with Stockfish best-move labels for higher-quality supervision
 3. **Larger model on full data** — 12L at 460K×6ep (now that data is not the bottleneck)
 4. **MCTS search at inference** — use the value head + policy for tree search during evaluation
+
+---
+
+## Session 10: Self-Play & Stockfish Distillation
+
+### exp033: Self-play REINFORCE (FAILED)
+**Hypothesis:** REINFORCE from self-play game outcomes will improve game-playing strength.
+**Result:** CATASTROPHIC FAILURE — accuracy 51.4% → 0.8%. Model completely destroyed.
+**Verdict:** NEGATIVE — pure vanilla REINFORCE is too unstable for fine-tuning.
+
+Details:
+- 20 generations × 30 self-play games = 600 total games
+- Temperature=0.8, max 100 moves, material adjudication (±3 material)
+- Gen 1 had reasonable losses (pl=0.20, vl=0.67) but all subsequent gens were NaN
+- A single REINFORCE update was enough to corrupt all model weights
+- After training: W0/D0/L8 vs SF d3 (all checkmate losses, avg 22 moves)
+- Total time: 267s
+
+**Why it failed:**
+1. Vanilla REINFORCE has catastrophically high variance with game-outcome rewards
+2. No KL constraint to anchor to the original supervised policy → complete forgetting
+3. The advantage normalization didn't help because the gradient magnitude was still huge
+4. NaN propagation after one bad step — once weights corrupt, everything cascades
+5. Self-play with adjudicated outcomes provides noisy labels (most games adjudicated by material, not checkmate)
+
+**Lessons for future self-play:**
+- Need KL penalty or PPO-style clipping to prevent catastrophic forgetting
+- Or much better: use self-play data as SUPERVISED targets (expert iteration)
+- Pure REINFORCE needs thousands of games per update to reduce variance
+- Consider mixing supervised + RL data (e.g., 90% supervised + 10% self-play)
