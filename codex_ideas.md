@@ -821,8 +821,30 @@ Details:
 
 **Key insight: The value head is the weakest link. Fix it with SF evaluations before investing in search.**
 
+### exp037: Fix value head with SF evaluations
+
+**Goal:** Fine-tune ONLY the value head on SF centipawn evaluations → re-test search
+**Data:** 20K positions labeled with SF d8 → cp to WDL targets (>100cp=win, <-100cp=loss, else=draw)
+**Training:** Freeze policy, train ONLY value head (132K params) for 5 epochs, LR=1e-3
+
+**Results:**
+- Value head training: val_acc 82.7% → 84.6% over 5 epochs
+- Distribution heavily skewed: win=13%, draw=78%, loss=9%
+- Old value diagnostic: Starting +0.043, e4 -0.036, Italian -0.077 (bad calibration)
+- New value diagnostic: Starting +0.000, e4 +0.001, Italian +0.069 (well calibrated!)
+- Games: argmax W0/D0/L8, search_top5 W0/D0/L8, search_top10 W0/D0/L8
+- Argmax lost its draw compared to exp036 (game variance, policy unchanged)
+- Total time: 260s
+
+**Analysis:**
+1. Value head successfully calibrated — Starting/e4 near 0.0, Italian slightly positive (correct)
+2. But 84.6% WDL accuracy is mainly predicting "draw" (78% of data is draw)
+3. 1-ply search with even a calibrated value head doesn't distinguish top-5 policy moves
+4. The model's fundamental weakness is at the policy level, not search
+5. Need stronger policy OR deeper search to improve game performance
+6. **Conclusion: Value head fix is necessary but NOT sufficient for search to help**
+
 **Next priorities:**
-1. **Fix value head on SF evals** — fine-tune value head ONLY on SF centipawn evaluations, then re-test search
+1. **Expert iteration with SF** — model proposes top-K moves, SF selects best, train on selections
 2. **12L model from scratch** — break capacity ceiling with more depth
-3. **Expert iteration with SF** — model proposes, SF selects, train on selections
-4. **PPO self-play** — with properly calibrated value head
+3. **PPO self-play** — with properly calibrated value head
