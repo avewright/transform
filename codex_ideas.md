@@ -985,3 +985,17 @@ or training curriculum changes.
   zero-init Q/K or identity initialization to preserve baseline.
 - **Lesson**: Architectural additions to pretrained models must preserve exact
   baseline behavior at initialization. Even small perturbations compound.
+
+### exp043: Centipawn-aware SF Distillation + KL (160s)
+- **Hypothesis**: Optimize for move quality (CPL) not human accuracy. Use SF
+  soft targets (multi-PV top-5) + KL constraint (β=0.5) against reference.
+- **NEW METRIC**: Centipawn loss baseline = 110.9cp, SF match = 45.6%
+- **Design**: 5K positions labeled SF d5 multi-PV=5, soft targets temp=100,
+  KL-constrained distillation, 3 epochs, lr=1e-5
+- **Result**: Epoch 1: 51.9% acc (possible new high?), but CPL=112.8 (worse).
+  Epochs 2-3: degraded to 50.7% (overfitting 5K data). CPL kept worsening.
+  Games: W0/D0/L8 (model selected by CPL = epoch 3, already degraded)
+- **Analysis**: 51.9% is within ±1.6pp noise (1000 eval samples). CPL never
+  improved, suggesting SF soft targets don't translate to better moves.
+  KL constraint works but can't prevent gradual drift over multiple epochs.
+  Key finding: small dataset (5K) only supports 1 epoch before overfitting.
