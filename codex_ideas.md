@@ -844,7 +844,39 @@ Details:
 5. Need stronger policy OR deeper search to improve game performance
 6. **Conclusion: Value head fix is necessary but NOT sufficient for search to help**
 
+### exp038: Expert Iteration — model proposes, SF selects
+
+**Goal:** Train on SF's best move ONLY when it's in the model's top-10 predictions
+**Data:** 50K positions → model top-10 → SF d8 selects → 45,165 training samples
+**Key finding:** SF is in model's top-1 50.7% of the time, in top-10 90.3% of the time!
+**Training:** 461K human + 45K EI at 30% EI ratio, 2 epochs, LR=3e-5
+
+**Results:**
+- Expert iteration stats: 25,350 agreed + 19,815 corrected (positions where SF picks different top-10 move)
+- Human accuracy: 51.4% → 50.9% (ep1) → 50.2% (ep2) — GETTING WORSE
+- Top3 held steady: 78.4% → 78.5% → 78.4%
+- Games: W0/D0/L8 (lost exp032's draw again)
+- Total time: 7105s (~2 hours)
+
+**Analysis:**
+1. Even with model-tractable filtering, SF signal still hurts human accuracy
+2. The 30% EI ratio dilutes human training too much
+3. The model's "errors" vs SF are deeply embedded — not just top-1 vs top-2 ranking issues
+4. Human and SF play are genuinely different strategies, not just noisy versions of each other
+5. **Key insight: Can't improve game-play by changing training targets alone. Must scale the model.**
+
+**Session 10 Meta-Analysis:**
+- exp033: REINFORCE self-play → DESTROYED model (catastrophic forgetting)
+- exp034: Pure SF distill 50K → Mixed (SF acc +4pp, human acc -9pp, games WORSE)
+- exp035: 90% human + 10% SF → Marginal (+0.4pp, games W0/D0/L8)
+- exp036: 1-ply search with old value head → HURTS (lost draw)
+- exp037: Fix value head with SF evals → Calibration works but search still W0/D0/L8
+- exp038: Expert iteration → Still hurts accuracy (-1.2pp), games W0/D0/L8
+- **Conclusion: 8L/512d architecture at 460K data has hit its ceiling at ~51.4% accuracy.
+  No amount of target-engineering (SF, EI, mixed) or search (1-ply) helps.
+  Must either scale model (12L+) or scale data to break through.**
+
 **Next priorities:**
-1. **Expert iteration with SF** — model proposes top-K moves, SF selects best, train on selections
-2. **12L model from scratch** — break capacity ceiling with more depth
-3. **PPO self-play** — with properly calibrated value head
+1. **12L model from scratch** — break capacity ceiling with more depth
+2. **More data** — explore larger datasets if available
+3. **Architectural changes** — different encodings or attention patterns
