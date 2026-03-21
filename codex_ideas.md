@@ -1071,6 +1071,68 @@ To play STRONG chess, train on STRONG players' moves. The path forward is:
 4. Add SF filtering: keep only positions where player move agrees with SF top-3
 5. Need to investigate why high move prediction accuracy doesn't translate to game wins
 
+---
+
+## Experiments Ready to Run (queued)
+
+### exp047: Massive Lichess data + HF pre-training
+- **File**: experiments/exp047_massive_lichess.py
+- **Goal**: Download from ALL 189 top Lichess players (500 games each) → ~600K-1M positions
+- **Two approaches compared**:
+  - A) From scratch on massive Lichess data
+  - B) Pre-train on HF data → fine-tune on Lichess
+- **Status**: Created, not yet run. Data download will take ~15 min, training ~2h
+- **Key question**: Does HF pre-training give a tactical foundation that helps?
+
+### exp048: Synthetic SF-labeled dataset (PRIORITY)
+- **File**: experiments/exp048_sf_synthetic.py
+- **Goal**: Generate 200K random chess positions, label each with SF depth 8 best move
+- **Why**: Unlike human data, EVERY label is the objectively best move
+- **Two approaches**:
+  - A) From scratch on SF data
+  - B) Fine-tune exp032 on SF data
+- **Cross-evaluation**: Tests on SF eval, Lichess eval, AND HF eval sets
+- **Status**: Created, not yet run. SF labeling ~16 min (cached), training ~20 min
+- **Key question**: Does training on perfect SF labels produce better game play?
+
+---
+
+## NEXT SESSION ROADMAP
+
+### Priority 1: Run exp048 (SF synthetic data)
+- This is the most promising experiment — perfectly labeled data at scale
+- Benchmarks at depth 8: ~208 pos/s (best move only), ~144 pos/s (top-3)
+- After first run, data is cached for instant reuse
+- Run: `export PYTHONUNBUFFERED=1 && python experiments/exp048_sf_synthetic.py`
+
+### Priority 2: Run exp047 (massive Lichess)
+- Scale up the promising exp046 results (37.1% → ?) with 5-10x more data
+- Run: `export PYTHONUNBUFFERED=1 && python experiments/exp047_massive_lichess.py`
+
+### Priority 3: Push dataset to HuggingFace
+- HF token is in .env (already configured)
+- After exp048 generates SF-labeled data, push to `avewright/chess-sf-200k` on HF
+- After exp047 downloads Lichess data, push to `avewright/chess-lichess-2200plus` on HF
+- Use `huggingface_hub` Python package for upload
+
+### Priority 4: Mixed training experiment
+- Combine HF data (474K) + Lichess data (~600K) + SF synthetic (200K) = ~1.3M positions
+- Weight SF data higher since labels are perfect
+- This could produce the strongest model yet
+
+### Priority 5: Investigate game play gap
+- Models predict moves well (37-51%) but lose all games vs SF d3
+- Possible causes: no tactical awareness, no lookahead, blunders in critical positions
+- Ideas: temperature tuning, beam search over policy, simple 1-ply search
+
+### Key Environment Notes
+- Must use `export` for env vars (inline env vars denied by policy)
+- `HF_DATASETS_OFFLINE=1` when not downloading from HF
+- GPU: NVIDIA RTX 2000 Ada, 16GB VRAM
+- Stockfish: `stockfish/stockfish/stockfish-ubuntu-x86-64-avx2`
+- Best checkpoint: `outputs/exp032_continue_training/best_checkpoint.pt` (51.4% on HF)
+- Lichess data cache: `outputs/exp046_lichess_large/lichess_2200plus.jsonl` (209K positions, 28MB)
+
 ### exp048: Synthetic SF-labeled dataset
 - **Goal**: Generate 200K random positions, label with SF depth 8 best move, train from scratch + fine-tune
 - **Key insight**: This tests whether PERFECTLY labeled data (SF best move) is better than human moves
