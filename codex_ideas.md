@@ -998,4 +998,39 @@ or training curriculum changes.
 - **Analysis**: 51.9% is within ±1.6pp noise (1000 eval samples). CPL never
   improved, suggesting SF soft targets don't translate to better moves.
   KL constraint works but can't prevent gradual drift over multiple epochs.
+
+### exp044: Hard Example Mining (634s)
+- **Hypothesis**: Train on "near-miss" positions (correct in top-3, not top-1)
+  for maximum accuracy improvement per sample
+- **Mining**: 100K candidates → 50.3% easy (top1), 27.7% hard (top3-not-top1),
+  22.0% impossible (not-top3). Found 27,684 hard examples.
+- **Result**: Accuracy DROPPED to 46.7% → 45.2% → 44.9%!
+  Training on hard examples causes catastrophic forgetting of easy cases.
+  Best model = unchanged baseline (51.4%)
+- **Lesson**: Curriculum learning on hard examples doesn't work when you
+  ONLY train on hard examples. Need to mix easy + hard, not exclude easy.
+
+### exp045: Lichess High-ELO Data Engineering (708s)
+- **KEY DISCOVERY**: Baseline accuracy on Lichess 2860+ ELO data = **21.6%**
+  (vs 51.4% on HF data). Strong players make fundamentally different moves!
+- **Data**: Downloaded 24,854 positions from top Lichess players (Magnus,
+  Zhigalko, Msb2, FairChess, etc). Avg ELO 2860, min 2285, max 3217.
+- **Lichess-only training** (3ep, lr=1e-5): HF 51.4%→50.4%, Lichess 21.6%→20.5%
+  24K positions not enough to learn GM move patterns
+- **Mixed training** (1ep, HF+Lichess): HF preserved 51.4%, Lichess 20.4%
+- **Games**: W0/D0/L8 (Lichess-only model used)
+- **Analysis**: The 21.6% vs 51.4% gap PROVES the model learned mixed-skill
+  patterns, not fundamentally good chess. To play stronger, need:
+  1. MUCH more high-ELO data (100K+ positions)
+  2. Training from scratch on high-ELO data only
+  3. Possibly filtering existing HF data by move quality (SF agreement)
+- **Saved**: 24,854 positions to outputs/exp045_lichess_data/lichess_positions.jsonl
+
+**CRITICAL META-INSIGHT (exp045)**:
+The 51.4% ceiling was never about model capacity or training signal.
+It's about DATA QUALITY. The model accurately predicts average-level human moves.
+To play STRONG chess, train on STRONG players' moves. The path forward is:
+1. Download massive Lichess data (millions of 2200+ games)
+2. Filter by rating + SF agreement for data quality
+3. Train from scratch on this curated dataset
   Key finding: small dataset (5K) only supports 1 epoch before overfitting.
