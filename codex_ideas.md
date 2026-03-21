@@ -916,3 +916,39 @@ Epoch-by-epoch: 43.4% → 46.2% → 47.8% → 48.9% → 49.7% → 50.1%
 1. **Data quality filtering** — filter to higher-ELO games if rating info available
 2. **Data augmentation** — board flipping to double effective data
 3. **Label smoothing / regularization** — help 8L generalize better
+
+### exp040: Board Flip Augmentation + Label Smoothing (Fine-tuned)
+
+**Goal:** Fine-tune exp032 on augmented data (horizontal flip) with label smoothing
+**Data:** 100K positions → 200K augmented (100K real + 100K h-flipped)
+**Training:** Fine-tune from exp032, 2 epochs, LR=1e-5, label_smoothing=0.1
+**Eval:** REAL (non-flipped) positions only
+
+**Results:**
+- Baseline (exp032): 51.4% acc, 78.4% top3
+- Epoch 1: 50.1% (-1.3pp), top3 76.5% (-1.9pp)
+- Epoch 2: 50.5% (-0.9pp), top3 76.4% (-2.0pp)
+- Games: W0/D0/L8 (WORSE than exp032 W0/D1/L7)
+- Best checkpoint retains exp032's 51.4% (never improved)
+
+**Analysis:**
+1. Augmentation with label smoothing HURTS a pre-trained model
+2. The 100K subset is insufficient — model was already trained on 460K×10ep
+3. Label smoothing (ε=0.1) fights the already-learned sharp distributions
+4. The model has already extracted the signal from these positions and their mirrors
+5. **Augmentation doesn't help when the model is already data-saturated**
+
+**Key meta-insight from exp033-040:**
+Every approach to push past 51.4% has failed:
+- Self-play REINFORCE → destroyed model
+- SF distillation → catastrophic forgetting
+- Mixed training → marginal
+- Search → hurts (value head quality)
+- Value head fix → search still doesn't help
+- Expert iteration → hurts accuracy
+- 12L model → worse than 8L (overfitting)
+- Augmentation → hurts pre-trained model
+
+The 51.4% ceiling appears fundamental to this dataset + architecture combination.
+Next direction: try a completely different approach — attention pattern modifications
+or training curriculum changes.
