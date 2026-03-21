@@ -799,10 +799,30 @@ Details:
 4. The model has hit a genuine capacity/data ceiling at ~51% — more of the same data doesn't help
 5. Game play didn't improve because the accuracy gain was too small to affect tactical strength
 
-**Key insight: Accuracy-based approaches are saturated. The model needs SEARCH at inference time to improve game play, not better training.**
+### exp036: Inference-time Search (1-ply lookahead with value head)
+**Hypothesis:** Using the value head to re-rank top-K policy moves via 1-ply lookahead will improve games vs SF.
+**Result:** Search HURTS — argmax W0/D1/L7, search_top5 W0/D0/L8, search_top10 W0/D0/L8.
+**Verdict:** NEGATIVE — the value head actively makes worse move selections.
+
+Details:
+- Three strategies tested: argmax (baseline), top-5 search, top-10 search
+- Argmax replicated exp032's W0/D1/L7 exactly
+- Both search strategies lost the draw and went W0/D0/L8
+- Search changed 189 moves (top-5) and 147 moves (top-10) away from policy picks
+- The value head is mis-calibrated: it recommends worse moves than the policy alone
+- Total time: 34s (very fast, no training)
+
+**Analysis:**
+1. Value head was trained on game outcomes (0=loss, 1=draw, 2=win) which are noisy labels
+2. Game outcome labels don't teach the model to evaluate POSITIONS, only to average outcomes
+3. The value head needs Stockfish-labeled evaluations (centipawn scores) to be accurate
+4. Without a good value head, any form of search (MCTS, AlphaZero-style) will fail
+5. **Must fix the value head before search can help**
+
+**Key insight: The value head is the weakest link. Fix it with SF evaluations before investing in search.**
 
 **Next priorities:**
-1. **Inference-time search** — 1-ply lookahead with value head (no training needed, purely inference enhancement)
-2. **MCTS** — multi-ply search using policy to guide + value to evaluate
-3. **12L model from scratch** — break capacity ceiling with more depth
-4. **PPO self-play** — proper RL with KL constraint and clipping
+1. **Fix value head on SF evals** — fine-tune value head ONLY on SF centipawn evaluations, then re-test search
+2. **12L model from scratch** — break capacity ceiling with more depth
+3. **Expert iteration with SF** — model proposes, SF selects, train on selections
+4. **PPO self-play** — with properly calibrated value head

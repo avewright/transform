@@ -1,0 +1,245 @@
+{
+  "experiment": "exp036_search_inference",
+  "hypothesis": "1-ply value-head search improves game play",
+  "primary_metric": "games vs SF d3 per strategy",
+  "seed": 42,
+  "model": {
+    "type": "chess_transformer",
+    "layers": 8,
+    "hidden": 512,
+    "heads": 8,
+    "encoder_dim": 256
+  },
+  "strategies": {
+    "argmax": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 41,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "black",
+          "result": "1/2-1/2",
+          "model_result": "draw",
+          "moves": 76,
+          "termination": "FIVEFOLD_REPETITION",
+          "search_changed": 0
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 41,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 42,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 35,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 34,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 26,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 39,
+          "termination": "CHECKMATE",
+          "search_changed": 0
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 1,
+        "losses": 7
+      },
+      "total_search_changed": 0
+    },
+    "search_top5": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 18,
+          "termination": "CHECKMATE",
+          "search_changed": 9
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 40,
+          "termination": "CHECKMATE",
+          "search_changed": 29
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 43,
+          "termination": "CHECKMATE",
+          "search_changed": 25
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 43,
+          "termination": "CHECKMATE",
+          "search_changed": 27
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 62,
+          "termination": "CHECKMATE",
+          "search_changed": 42
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 23,
+          "termination": "CHECKMATE",
+          "search_changed": 18
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 24,
+          "termination": "CHECKMATE",
+          "search_changed": 14
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 32,
+          "termination": "CHECKMATE",
+          "search_changed": 25
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 0,
+        "losses": 8
+      },
+      "total_search_changed": 189
+    },
+    "search_top10": {
+      "games": [
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 25,
+          "termination": "CHECKMATE",
+          "search_changed": 17
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 46,
+          "termination": "CHECKMATE",
+          "search_changed": 18
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 42,
+          "termination": "CHECKMATE",
+          "search_changed": 17
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 27,
+          "termination": "CHECKMATE",
+          "search_changed": 18
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 28,
+          "termination": "CHECKMATE",
+          "search_changed": 19
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 11,
+          "termination": "CHECKMATE",
+          "search_changed": 6
+        },
+        {
+          "model_color": "white",
+          "result": "0-1",
+          "model_result": "loss",
+          "moves": 57,
+          "termination": "CHECKMATE",
+          "search_changed": 38
+        },
+        {
+          "model_color": "black",
+          "result": "1-0",
+          "model_result": "loss",
+          "moves": 25,
+          "termination": "CHECKMATE",
+          "search_changed": 14
+        }
+      ],
+      "score": {
+        "wins": 0,
+        "draws": 0,
+        "losses": 8
+      },
+      "total_search_changed": 147
+    }
+  },
+  "comparison": {
+    "exp032_games": "W0/D1/L7"
+  },
+  "timing": {
+    "total_s": 33.78161025047302
+  },
+  "device": "cuda",
+  "command": "python experiments/exp036_search_inference.py"
+}
