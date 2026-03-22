@@ -242,7 +242,9 @@ def train(chess_model, av_head, train_data, eval_data, device, epochs, batch_siz
             embeds = embeds.to(backbone_dtype)
             outputs = chess_model.backbone(inputs_embeds=embeds, use_cache=False)
             hidden = outputs.last_hidden_state.float()
-            global_hidden = hidden[:, 0, :]
+            # Use last token: in causal attention, only the last token has
+            # attended to all previous tokens.  Must match ChessModel.forward().
+            global_hidden = hidden[:, -1, :]
 
             # Policy logits
             policy_logits = chess_model.policy_head(global_hidden)

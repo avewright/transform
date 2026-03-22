@@ -6,10 +6,20 @@ Generates a cached corpus of chess positions with:
   - Best move UCI
   - WDL estimation from eval
   - Game phase bucket (opening/middlegame/endgame)
+  - Source metadata (origin, game_id for leakage-free splits)
+  - Top-k move data with centipawn deltas
 
 Usage:
+  # Random position generation + labeling (legacy):
   python label_positions.py --num 5000 --depth 8 --output data/sf_labels_5k_d8.jsonl
-  python label_positions.py --num 50000 --depth 8 --output data/sf_labels_50k_d8.jsonl --threads 4
+
+  # Lichess JSONL relabeling with game-level split:
+  python label_positions.py --source data/lichess_games.jsonl --depth 8 \
+      --output data/lichess_sf.jsonl --split-by-game
+
+  # Build reproducible shards:
+  python label_positions.py --source data/lichess_games.jsonl --depth 8 \
+      --output data/lichess_sf.jsonl --split-by-game --write-splits
 
 Output format (JSONL, one JSON object per line):
   {
@@ -23,7 +33,9 @@ Output format (JSONL, one JSON object per line):
       ...
     ],
     "wdl": [0.43, 0.14, 0.43],
-    "num_legal": 20
+    "num_legal": 20,
+    "source": "lichess",
+    "game_id": "abc123"
   }
 """
 
@@ -119,10 +131,11 @@ def cp_to_wdl(cp: int, eval_type: str = "cp") -> list[float]:
     return [round(win / total, 4), round(draw / total, 4), round(loss / total, 4)]
 
 
-def label_position(sf, board: chess.Board) -> dict | None:
+def label_position(sf, board: chess.Board,
+                   source: str = "random_play", game_id: str | None = None) -> dict | None:
     """Label one position with Stockfish evals for all legal moves.
 
-    Returns dict with fen, phase, best move, all move values, WDL.
+    Returns dict with fen, phase, best move, all move values, WDL, source metadata.
     """
     fen = board.fen()
     legal_moves = list(board.legal_moves)
@@ -185,6 +198,8 @@ def label_position(sf, board: chess.Board) -> dict | None:
         "move_values": move_values,
         "wdl": cp_to_wdl(best_cp, move_values[0]["type"]),
         "num_legal": len(legal_moves),
+        "source": source,
+        **({"game_id": game_id} if game_id else {}),
     }
 
 
@@ -234,9 +249,13 @@ def label_all(positions: list[chess.Board], depth: int, threads: int,
 def compute_stats(output_path: Path) -> dict:
     """Compute summary statistics for the labeled dataset."""
     phases = {}
+    sources = {}
     total_moves = 0
     cp_values = []
     n = 0
+    seen_fens = set()
+    dup_count = 0
+    game_ids = set()
 
     with open(output_path) as f:
         for line in f:
@@ -246,6 +265,15 @@ def compute_stats(output_path: Path) -> dict:
             total_moves += entry["num_legal"]
             if entry["move_values"][0]["type"] == "cp":
                 cp_values.append(entry["best_cp"])
+            src = entry.get("source", "random_play")
+            sources[src] = sources.get(src, 0) + 1
+            fen_key = entry["fen"].rsplit(" ", 2)[0]  # strip halfmove/fullmove
+            if fen_key in seen_fens:
+                dup_count += 1
+            seen_fens.add(fen_key)
+            gid = entry.get("game_id")
+            if gid:
+                game_ids.add(gid)
 
     avg_moves = total_moves / max(n, 1)
     cp_mean = sum(cp_values) / max(len(cp_values), 1) if cp_values else 0
@@ -253,12 +281,110 @@ def compute_stats(output_path: Path) -> dict:
 
     return {
         "total_positions": n,
+        "unique_fens": len(seen_fens),
+        "duplicate_fens": dup_count,
         "total_move_evals": total_moves,
         "avg_legal_moves": round(avg_moves, 1),
         "phase_distribution": phases,
+        "source_distribution": sources,
+        "unique_games": len(game_ids) if game_ids else None,
         "cp_mean": round(cp_mean, 1),
         "cp_std": round(cp_std, 1),
     }
+
+
+def split_by_game(output_path: Path, seed: int = 42,
+                  train_frac: float = 0.85, val_frac: float = 0.10) -> dict:
+    """Split labeled data by game_id to prevent position leakage.
+
+    Positions from the same game always land in the same split.
+    Falls back to position-level split if no game_id metadata is present.
+
+    Returns dict with split file paths and counts.
+    """
+    rng = random.Random(seed)
+
+    # Group entries by game_id
+    game_entries: dict[str, list[str]] = {}
+    no_game_entries: list[str] = []
+
+    with open(output_path) as f:
+        for line in f:
+            entry = json.loads(line)
+            gid = entry.get("game_id")
+            if gid:
+                game_entries.setdefault(gid, []).append(line)
+            else:
+                no_game_entries.append(line)
+
+    # Shuffle game IDs
+    game_ids = list(game_entries.keys())
+    rng.shuffle(game_ids)
+
+    n_games = len(game_ids)
+    n_train = int(n_games * train_frac)
+    n_val = int(n_games * val_frac)
+
+    train_ids = set(game_ids[:n_train])
+    val_ids = set(game_ids[n_train:n_train + n_val])
+    test_ids = set(game_ids[n_train + n_val:])
+
+    # Also split no-game entries by position (fallback)
+    rng.shuffle(no_game_entries)
+    n_ng = len(no_game_entries)
+    ng_train = int(n_ng * train_frac)
+    ng_val = int(n_ng * val_frac)
+
+    # Write split files
+    base = output_path.with_suffix("")
+    paths = {
+        "train": Path(f"{base}_train.jsonl"),
+        "val": Path(f"{base}_val.jsonl"),
+        "test": Path(f"{base}_test.jsonl"),
+    }
+    counts = {"train": 0, "val": 0, "test": 0}
+
+    for split_name, split_ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
+        with open(paths[split_name], "w") as f:
+            for gid in split_ids:
+                for line in game_entries[gid]:
+                    f.write(line)
+                    counts[split_name] += 1
+
+    # Append no-game entries to their respective splits
+    split_slices = [
+        ("train", no_game_entries[:ng_train]),
+        ("val", no_game_entries[ng_train:ng_train + ng_val]),
+        ("test", no_game_entries[ng_train + ng_val:]),
+    ]
+    for split_name, lines in split_slices:
+        with open(paths[split_name], "a") as f:
+            for line in lines:
+                f.write(line)
+                counts[split_name] += 1
+
+    # Save split metadata
+    meta = {
+        "seed": seed,
+        "train_frac": train_frac,
+        "val_frac": val_frac,
+        "test_frac": round(1.0 - train_frac - val_frac, 4),
+        "total_games": n_games,
+        "total_positions": sum(counts.values()),
+        "counts": counts,
+        "paths": {k: str(v) for k, v in paths.items()},
+        "no_game_id_positions": len(no_game_entries),
+    }
+    meta_path = output_path.with_suffix(".splits.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"  Split by game ({n_games} games):")
+    for k, v in counts.items():
+        print(f"    {k}: {v} positions")
+    print(f"  Metadata: {meta_path}")
+
+    return meta
 
 
 def main():
@@ -269,23 +395,54 @@ def main():
     parser.add_argument("--output", type=str, default="data/sf_labels.jsonl", help="Output JSONL path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't resume")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Path to source JSONL (Lichess, etc.) — skips random generation")
+    parser.add_argument("--split-by-game", action="store_true",
+                        help="After labeling, split train/val/test by game_id")
+    parser.add_argument("--write-splits", action="store_true",
+                        help="Write separate train/val/test JSONL files")
     args = parser.parse_args()
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"=== Stockfish Labeling Pipeline ===")
-    print(f"  Positions: {args.num}")
     print(f"  Depth: {args.depth}")
     print(f"  Threads: {args.threads}")
     print(f"  Output: {output_path}")
     print(f"  Seed: {args.seed}")
+    if args.source:
+        print(f"  Source: {args.source}")
 
-    # Generate positions
-    print(f"\n[1/3] Generating {args.num} diverse positions...")
     t0 = time.time()
-    positions = generate_positions(args.num, seed=args.seed)
-    print(f"  Generated {len(positions)} unique positions in {time.time()-t0:.1f}s")
+
+    if args.source:
+        # Load from external source JSONL (e.g. Lichess games)
+        source_path = Path(args.source)
+        print(f"\n[1/3] Loading positions from {source_path}...")
+        positions = []
+        seen = set()
+        with open(source_path) as f:
+            for line in f:
+                entry = json.loads(line)
+                try:
+                    board = chess.Board(entry["fen"])
+                    key = normalize_fen(board)
+                    if key not in seen and not board.is_game_over() and list(board.legal_moves):
+                        seen.add(key)
+                        positions.append(board.copy())
+                except Exception:
+                    continue
+        if args.num and len(positions) > args.num:
+            random.seed(args.seed)
+            random.shuffle(positions)
+            positions = positions[:args.num]
+        print(f"  Loaded {len(positions)} unique positions (deduped from source)")
+    else:
+        # Generate random positions
+        print(f"\n[1/3] Generating {args.num} diverse positions...")
+        positions = generate_positions(args.num, seed=args.seed)
+        print(f"  Generated {len(positions)} unique positions in {time.time()-t0:.1f}s")
 
     # Label
     print(f"\n[2/3] Labeling with Stockfish depth={args.depth}...")
@@ -303,6 +460,12 @@ def main():
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
     print(f"\nStats saved to {stats_path}")
+
+    # Optional game-level split
+    if args.split_by_game or args.write_splits:
+        print(f"\n[Split] Writing train/val/test splits by game...")
+        split_meta = split_by_game(output_path, seed=args.seed)
+
     print(f"Total time: {time.time()-t0:.0f}s")
 
 

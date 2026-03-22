@@ -98,6 +98,82 @@ Use short dated notes so future sessions can quickly understand prior thinking a
 
 - Store fixed validation sets on disk when possible.
 - Save small failure-case samples with FEN, target move, predicted move, and top-k legal alternatives.
+
+---
+
+## 2026-03-22
+
+### Codex review: data quality dominates architecture tweaks
+
+External review confirmed what the results table already shows: the strongest
+signal is "real positions + stronger labels" — not architecture cleverness.
+The next phase should be: reliable dataset factory → small chess-native model
+family → Qwen backbone only as a transfer baseline.
+
+### Bug fix: pooling inconsistency
+
+**Fixed** a material representation bug. `chess_model.py` ChessModel.forward()
+used `hidden[:, -1, :]` (last token—correct for causal attention) but
+`train_action_value.py` used `hidden[:, 0, :]` (first token—only sees itself
+in causal attention). This means the action-value trainer was training and
+evaluating on different representations. Standardized to `hidden[:, -1, :]`.
+
+Note: many old experiment files (exp013, exp019-022) also used `hidden[:, 0, :]`
+with the causal Qwen backbone. Those are historical and won't be retroactively
+fixed, but the bidirectional ChessTransformer from exp023+ doesn't have this
+issue (all tokens see all tokens in encoder-only attention).
+
+### Architecture V1 spec created
+
+See `ARCHITECTURE_V1.md` for the full spec. Key decisions:
+
+- **Chess-native encoder-only transformer** (bidirectional, not frozen causal LLM)
+- **Factorized SpatialPolicyHead** (from-square × to-square × promotion)
+- **Dedicated CLS token** for consistent global readout
+- **Relative board bias** option for chess geometry
+- **Multi-target value head** (WDL + centipawn bucket)
+- Three sizes: Small (4M), Medium (17M), Large (55M)
+- Qwen backbone kept only as transfer baseline
+
+### Dataset factory upgrades
+
+`label_positions.py` now supports:
+- Source metadata (`source`, `game_id`) in every labeled entry
+- `--source` flag to label positions from external JSONL (e.g. Lichess games)
+- `--split-by-game` and `--write-splits` to produce train/val/test JSONL files
+  split by game_id, preventing position leakage from correlated positions
+- Richer `compute_stats()`: unique FEN count, duplicate count, source
+  distribution, game count
+
+### Experiment discipline: exp050 head comparison
+
+Created `experiments/exp050_head_comparison.py` — the first "fewer, better-controlled"
+experiment. Tests one hypothesis (spatial vs flat head) with:
+- Same data, same model body, same optimizer, same schedule
+- 3 seeds (42, 123, 314) with mean ± std reported
+- Game-level data split to prevent leakage
+- Auto-detects best available data source
+
+### Roadmap (priority order)
+
+1. **[DONE]** Fix pooling inconsistency
+2. **[DONE]** Formalize dataset factory with game-level splits and metadata
+3. **[DONE]** Standardize on chess transformer + spatial/factorized policy head (ARCHITECTURE_V1.md)
+4. **[NEXT]** Run exp050 head comparison as the first controlled experiment
+5. Train with soft Stockfish targets (distribution over legal moves, not only best-move CE)
+6. Build curriculum buckets (opening, tactical, quiet, endgame, zugzwang)
+7. Add hard-example mining and replay
+8. Only then revisit search (MCTS, alpha-beta with learned eval)
+
+### Planned controlled experiments (after exp050)
+
+| ID | Variable | Controlled | Metric |
+|----|----------|------------|--------|
+| exp050 | flat vs spatial head | same data, body, budget, 3 seeds | SF top-1 |
+| exp051 | hard labels vs soft SF distribution | same model, same data | SF top-1 + ranking |
+| exp052 | random positions vs real positions | same model, same pipeline | SF top-1 |
+| exp053 | split-by-position vs split-by-game | same train set, same model | eval acc delta (leakage) |
+| exp054 | relative board bias vs no bias | same everything else | SF top-1 |
 - Treat sub-1 to 2 point wins as provisional unless replicated.
 - When a proxy metric improves, check whether gameplay or search-time quality also improves before scaling the idea up.
 
