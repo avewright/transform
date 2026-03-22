@@ -159,11 +159,39 @@ experiment. Tests one hypothesis (spatial vs flat head) with:
 1. **[DONE]** Fix pooling inconsistency
 2. **[DONE]** Formalize dataset factory with game-level splits and metadata
 3. **[DONE]** Standardize on chess transformer + spatial/factorized policy head (ARCHITECTURE_V1.md)
-4. **[NEXT]** Run exp050 head comparison as the first controlled experiment
-5. Train with soft Stockfish targets (distribution over legal moves, not only best-move CE)
-6. Build curriculum buckets (opening, tactical, quiet, endgame, zugzwang)
-7. Add hard-example mining and replay
-8. Only then revisit search (MCTS, alpha-beta with learned eval)
+4. **[DONE]** Build HF dataset `avewright/chess-positions` with streaming loader
+5. **[NEXT]** Run exp050 head comparison as the first controlled experiment
+6. Train with soft Stockfish targets (distribution over legal moves, not only best-move CE)
+7. Build curriculum buckets (opening, tactical, quiet, endgame, zugzwang)
+8. Add hard-example mining and replay
+9. Only then revisit search (MCTS, alpha-beta with learned eval)
+
+### Dataset v2: multi-source diverse generation (2026-03-22)
+
+Replaced the original 10K random-play-only dataset with 50K positions from
+5 diverse generation sources. Old data had 0% endgame and 100% random_play.
+
+**Generation sources (build_dataset.py):**
+1. **Opening book** (15%): Walk 40+ common ECO opening lines, branch randomly for 0-8 more moves. Produces realistic opening/early-middlegame positions.
+2. **Weighted play** (30%): Random games biased toward captures (4x), center control (2x), and piece development (1.5x). More natural than uniform random.
+3. **Aggressive play** (15%): Games strongly favoring captures (75% capture rate). Creates tactical positions with material imbalances.
+4. **Endgame** (20%): 60% synthetic construction (kings + 1-4 light pieces), 40% trade-down (capture-heavy games until material ≤ 26). Guaranteed endgame coverage.
+5. **Perturbation** (20%): Mutate existing positions — remove a piece (2/3 chance) or swap piece type (1/3). Creates unusual material configurations the model wouldn't see from normal play.
+
+**Key improvements over v1:**
+- 5x more data (50K vs 10K)
+- 6 distinct source types vs 1
+- ~33% each opening/middlegame/endgame vs 0% endgame before
+- Mate positions included (tactical depth)
+- Wider eval distribution: cp_std ~500 vs ~390
+- Removed expensive `gives_check()` from generation (30x faster)
+- Proper source tracking per position (not hardcoded "random_play")
+
+**What makes this efficient for training:**
+- Opening book positions teach the model standard play without wasting budget on random noise
+- Aggressive play creates high-information tactical positions (clear best moves)
+- Perturbation creates the largest diversity per compute — one mutation = infinite new positions from each template
+- Endgame positions are cheapest to label (few pieces → Stockfish is near-instant)
 
 ### Planned controlled experiments (after exp050)
 

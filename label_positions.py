@@ -42,6 +42,7 @@ Output format (JSONL, one JSON object per line):
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -50,7 +51,21 @@ from pathlib import Path
 import chess
 
 
-STOCKFISH_PATH = "stockfish/stockfish/stockfish-ubuntu-x86-64-avx2"
+def _find_stockfish() -> str:
+    """Auto-detect Stockfish binary (Windows or Linux)."""
+    candidates = [
+        "stockfish/stockfish/stockfish-windows-x86-64-avx2.exe",
+        "stockfish/stockfish/stockfish-ubuntu-x86-64-avx2",
+        "stockfish",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return str(Path(c))
+    # Fall back to PATH
+    return "stockfish"
+
+
+STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH") or _find_stockfish()
 
 
 def classify_phase(board: chess.Board) -> str:

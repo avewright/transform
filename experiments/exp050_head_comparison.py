@@ -172,7 +172,26 @@ class ChessTransformer(nn.Module):
 # === Data ===
 
 def load_data_auto():
-    """Load the best available labeled data."""
+    """Load the best available labeled data. Prefers HF dataset, falls back to local JSONL."""
+    # Try HF dataset first
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from hf_data import load_training_set, load_eval_set, dataset_info
+        info = dataset_info()
+        if "train" in info and info["train"]["num_rows"] > 0:
+            print(f"  Loading from HuggingFace (avewright/chess-positions)...")
+            print(f"  HF dataset: {info['train']['num_rows']} train, "
+                  f"{info.get('test', {}).get('num_rows', 0)} test")
+            raw = load_training_set()
+            data = [{"board": d["board"], "move": d["move"],
+                     "game_id": d.get("phase", "") + str(d.get("ply", 0))}
+                    for d in raw]
+            print(f"  Loaded {len(data)} positions from HuggingFace")
+            return data, "hf:avewright/chess-positions"
+    except Exception as e:
+        print(f"  HF dataset not available ({e}), falling back to local files...")
+
+    # Fall back to local JSONL
     for path in [LICHESS_SF_DATA, RANDOM_SF_DATA, SMALL_SF_DATA]:
         if path.exists():
             print(f"  Loading data from {path}...")
