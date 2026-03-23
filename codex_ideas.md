@@ -1753,14 +1753,52 @@ as policy improves. The stronger the policy's top move, the less room for value
 to improve upon it. This suggests we should focus on **policy quality (more data)**
 rather than search refinement at this stage.
 
+### exp061: Soft policy targets (2026-03-23, COMPLETE)
+
+**Hypothesis**: Training with soft targets (CP-weighted distribution over SF top-5
+moves) instead of hard one-hot best-move targets will improve policy quality.
+
+**Design**: softmax(cp_scores / temp=100.0) over valid top-5 SF moves per position.
+KL-divergence loss instead of cross-entropy. Same 247.5K data as exp059.
+
+**Results:**
+
+| Epoch | Accuracy | Top-3 | SF Rank | Value Acc |
+|-------|----------|-------|---------|-----------|
+| 1 | 34.1% | 58.6% | 5.4 | 46.7% |
+| 2 | 41.0% | 65.5% | 4.2 | 46.2% |
+| 3 | 43.2% | 68.5% | 3.8 | 47.8% |
+| 4 | 46.3% | 71.8% | 3.4 | 50.0% |
+| 5 | 47.6% | 73.7% | 3.3 | 50.5% |
+| **6** | **48.1%** | **73.5%** | **3.2** | **50.8%** |
+
+**Comparison vs exp059 (hard targets):**
+- Best accuracy: **48.1%** vs 47.2% — **+0.9pp**
+- Best top-3: **73.7%** vs 69.9% — **+3.8pp**
+- Still improving at epoch 6 (no overfitting, vs exp059 which peaked at ep5)
+- Gameplay: noisy (8 games), inconclusive
+
+**Insight**: Soft targets provide a modest improvement (+0.9pp accuracy, +3.8pp top-3)
+and better regularization (no overfitting). But the gain is small — data scaling
+remains the dominant lever. For exp062, sticking with hard targets for simplicity.
+
+### exp062: Massive data scaling (PLANNED)
+
+**Hypothesis**: 700K+ combined data will significantly beat exp059 (247K → 47.2%).
+
+**Data**: 500K CPU-gen (SF d8) + 200K exp059 (SF d6) + 47.5K HF = ~750K (deduped)
+**Config**: 4 epochs (more data → fewer epochs needed), same Medium model (26M params)
+**Target**: Beat exp031 old architecture ceiling (51.2%)
+
 ### Updated roadmap (2026-03-23 evening):
 
-1. **MORE DATA** — 500K positions generating on CPU (depth 8), ETA ~2 hours.
-   Train exp061 on 700K+ combined = massive accuracy boost expected.
-2. **Policy quality is king** — at 47.2% policy, argmax at d1 (31.2%) is already
+1. **exp061 RUNNING** — soft targets may give edge, results pending (~23:30 UTC)
+2. **CPU data gen RUNNING** — 500K positions (300K done, ~200K remaining)
+3. **exp062 READY** — code written, will run once GPU free + data gen done
+4. **Policy quality is king** — at 47.2% policy, argmax at d1 (31.2%) is already
    strong. More data → better policy → better gameplay directly.
-3. **Search improvements on hold** — value reranking doesn't scale with policy
+5. **Search improvements on hold** — value reranking doesn't scale with policy
    quality. Revisit search only if policy gains plateau.
-4. **The old 460K benchmark should fall** — ChessTransformerV2 at 247.5K already
+6. **The old 460K benchmark should fall** — ChessTransformerV2 at 247.5K already
    matches exp024's 48.7%. At 700K+ it should significantly surpass 51.2%.
 

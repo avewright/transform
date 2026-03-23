@@ -123,46 +123,41 @@ class SpatialPolicyHead(nn.Module):
         to_proj = self.to_proj(to_feats)
         global_proj = self.global_proj(cls_hidden).unsqueeze(1)
         promo_feats = self.promo_embed(self.promo_types)
-        combined = from_proj + to_proj + global_proj + promo_feats
-        return self.score_proj(torch.tanh(combined)).squeeze(-1)
+        combined = from_proj * to_proj + global_proj + promo_feats.unsqueeze(0)
+        return self.score_proj(F.relu(combined)).squeeze(-1)
 
 
 class ChessTransformerV2(nn.Module):
     def __init__(self, encoder_dim=256, hidden_dim=512, num_layers=8,
                  num_heads=8, dropout=0.1, head_dim=256):
         super().__init__()
-        self.encoder = LearnedBoardEncoder(output_dim=encoder_dim)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, encoder_dim) * 0.02)
-        self.turn_embed = nn.Embedding(2, encoder_dim)
-        self.castling_embed = nn.Embedding(16, encoder_dim)
-        self.phase_embed = nn.Embedding(3, encoder_dim)
-        n_tokens = 1 + 3 + 64
-        self.pos_embed = nn.Parameter(torch.randn(1, n_tokens, encoder_dim) * 0.02)
+        self.encoder = LearnedBoardEncoder(embed_dim=encoder_dim)
+        self.input_proj = nn.Linear(encoder_dim, hidden_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, 68, hidden_dim) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=encoder_dim, nhead=num_heads,
-            dim_feedforward=hidden_dim, dropout=dropout,
-            batch_first=True, norm_first=True,
+            d_model=hidden_dim, nhead=num_heads,
+            dim_feedforward=hidden_dim * 4, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(encoder_dim)
-        self.policy_head = SpatialPolicyHead(encoder_dim, n_ctx_tokens=4, head_dim=head_dim)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers,
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.policy_head = SpatialPolicyHead(
+            hidden_dim, n_ctx_tokens=4, head_dim=head_dim,
+        )
         self.value_head = nn.Sequential(
-            nn.Linear(encoder_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Linear(256, 3),
         )
+        self.hidden_dim = hidden_dim
 
-    def forward(self, batch_input):
-        sq = self.encoder(batch_input)
-        bs = sq.size(0)
-        cls = self.cls_token.expand(bs, -1, -1)
-        boards = batch_input["board_tensor"]
-        turn = self.turn_embed(batch_input["turn"].long()).unsqueeze(1)
-        castling = self.castling_embed(batch_input["castling"].long()).unsqueeze(1)
-        phase_raw = batch_input["phase"].long().clamp(0, 2)
-        phase = self.phase_embed(phase_raw).unsqueeze(1)
-        hidden = torch.cat([cls, turn, castling, phase, sq], dim=1)
+    def forward(self, board_input):
+        tokens = self.encoder(board_input)
+        hidden = self.input_proj(tokens)
+        B = hidden.shape[0]
+        cls = self.cls_token.expand(B, -1, -1)
+        hidden = torch.cat([cls, hidden], dim=1)
         hidden = hidden + self.pos_embed
         hidden = self.transformer(hidden)
         hidden = self.norm(hidden)
