@@ -37,12 +37,16 @@ Policy Head  Value Head
 | exp_av_v2 | 5K random + SF all-move | 8.8% (top3: 21.8%) | AV vs policy CE = TIE on random positions |
 | exp_av_real | 3K HF games + SF all-move | 23.6% (top3: 48.8%) | AV vs policy = TIE; real games >>  random positions |
 | exp013 | 50K HF game-play | 25.0% (top3: 45%) | Policy CE, best result so far |
+| exp052 | 47.5K HF diverse | 30.3% ± 0.2% (top3: 52.5%) | **Spatial head wins decisively** vs flat (11.3%). CLS token, 3 seeds, phase-bucketed eval |
 
 100% legal move rate throughout (via legal-move masking).
 
-**Key finding:** Position quality (real games vs random play) matters far more than loss function design (policy CE vs action-value Q). Real game positions give ~23% accuracy at 3K while random positions give ~9% at 5K.
+**Key findings:**
+- Position quality (real games vs random play) matters far more than loss function design
+- Spatial policy head (from×to factored) is **2.7x better** than flat head with **15x fewer params**
+- Phase breakdown: opening 36.6% > middlegame 30.0% > endgame 24.6%
 
-**Next milestone:** Scale real-game Stockfish-labeled positions to 50K+ and test soft-target/KL formulations.
+**Next milestone:** Scale up to Medium model (512d, 8L), train with soft SF targets, evaluate with gameplay.
 
 ## Setup
 

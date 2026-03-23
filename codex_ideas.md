@@ -198,6 +198,84 @@ Replaced the original 10K random-play-only dataset with 50K positions from
 | ID | Variable | Controlled | Metric |
 |----|----------|------------|--------|
 | exp050 | flat vs spatial head | same data, body, budget, 3 seeds | SF top-1 |
+
+---
+
+## 2026-03-23
+
+### exp052: Head comparison v2 — DECISIVE spatial win
+
+**Fixes over exp050:**
+- exp050's "game-level split" was broken: HF dataset has `game_id=""` for all
+  47.5K positions (all generated, no real game IDs). Fixed by using HF pre-split
+  train/test directly.
+- Added learned [CLS] token (dedicated global readout, not turn token)
+- Added phase-bucketed eval (opening/middlegame/endgame)
+- Added entropy + SF-move-rank metrics
+- Saves per-seed model checkpoints
+
+**Results (Small config: 256d, 6L, 8H, 3 epochs, 3 seeds):**
+
+| Variant | Params (head) | Mean acc | Std | Top-3 | Entropy | SF Rank |
+|---------|--------------|----------|-----|-------|---------|---------|
+| flat    | 1,480K       | 11.3%    | 0.2%| 28.9% | 2.34    | 10.9    |
+| spatial |    99K       | 30.3%    | 0.2%| 52.5% | 2.11    | 6.5     |
+
+**Delta: +19.0% (spatial wins decisively)**
+
+Phase breakdown (spatial, s42):
+- Opening: 36.6%
+- Middlegame: 30.0%
+- Endgame: 24.6%
+
+Phase breakdown (flat, s42):
+- Opening: 15.5%
+- Middlegame: 6.5%
+- Endgame: 13.0%
+
+**Key observations:**
+1. Spatial head is **2.7x better** with **15x fewer head parameters** (99K vs 1.5M)
+2. The flat head barely learns — 11% is near-random for positions with ~30 legal moves
+3. Spatial head's endgame weakness (24.6% vs 36.6% opening) may reflect data quality:
+   endgame positions from synthetic constructions are noisier
+4. SF-move rank of 6.5 means the model's top pick is typically SF's 6th-7th choice —
+   not great, but much better than flat's rank 11
+5. Lower entropy for spatial (2.11 vs 2.34) means more confident predictions
+6. All 3 seeds agree tightly (±0.2%) — result is robust
+7. All runs: 44s/epoch flat, 83s/epoch spatial (spatial is 2x slower due to indexed
+   gather ops despite fewer params)
+
+**Conclusion:** Spatial head is confirmed as the right architecture choice.
+Promote it into the chess-native transformer family. The flat head is dead.
+
+### Positional embedding analysis
+
+Checked all model definitions for positional encoding:
+- **ChessModel (Qwen backbone):** double positional — `square_embed` in encoder +
+  Qwen's RoPE in attention. Both work correctly for fixed 67-token sequences.
+- **ChessTransformerV2 (exp052):** learned absolute `pos_embed` (68 tokens =
+  CLS + 67 board). Applied additively before `nn.TransformerEncoder`. Correct.
+- **Old exp023/024/050:** same pattern, 67 tokens with learned `pos_embed`.
+- PyTorch's `nn.TransformerEncoder` does NOT use RoPE — it only uses whatever
+  positional info you inject before the layers. Our learned `pos_embed` is the
+  only positional signal.
+
+**No missing positional encoding found.** But worth testing:
+- RoPE vs learned absolute — RoPE might generalize better to unseen position combos
+- Relative board biases from ARCHITECTURE_V1.md — explicitly encode chess geometry
+
+### Updated roadmap
+
+1. **[DONE]** Fix pooling inconsistency
+2. **[DONE]** Formalize dataset factory
+3. **[DONE]** Standardize on chess transformer + spatial policy head
+4. **[DONE]** Build HF dataset
+5. **[DONE]** exp052: head comparison — spatial wins decisively
+6. **[NEXT]** Scale up: Medium model (512d, 8L) with spatial head, more epochs
+7. Train with soft Stockfish targets (top-k move distribution, not just best move)
+8. Add relative board biases from ARCHITECTURE_V1.md
+9. Evaluate with actual gameplay (not just label accuracy)
+10. Build curriculum buckets and hard-example mining
 | exp051 | hard labels vs soft SF distribution | same model, same data | SF top-1 + ranking |
 | exp052 | random positions vs real positions | same model, same pipeline | SF top-1 |
 | exp053 | split-by-position vs split-by-game | same train set, same model | eval acc delta (leakage) |
