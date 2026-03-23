@@ -39,18 +39,29 @@ Policy Head    Head
 |-----------|-------|------|-----------|-------|-------|
 | exp052 flat | Small 256d/6L | 47.5K HF | 11.3% ± 0.2% | 28.8% | Flat head baseline, 3 seeds |
 | **exp052 spatial** | Small 256d/6L | 47.5K HF | **30.3% ± 0.2%** | 52.5% | Spatial head, CLS token, 3 seeds |
-| **exp053** | Medium 512d/8L | 47.5K HF | **~35%** | ~58% | Scaled spatial, 2 seeds (prelim) |
+| **exp053** | Medium 512d/8L | 47.5K HF | **35.3%** | 58.6% | Scaled spatial, 2 seeds |
+| exp055 | Medium + joint value | 47.5K HF | 35.1% | 58.1% | Value head trained (80% WDL) |
 | exp046 | 8L transformer | 209K Lichess 2200+ | 37.1% | 62.0% | Top-player data from scratch |
 
 100% legal move rate throughout (via legal-move masking).
 
+### Search / Gameplay Results
+
+| Strategy | vs SF d1 | vs SF d2 | vs SF d3 | Notes |
+|----------|----------|----------|----------|-------|
+| Policy argmax | W0/D3/L5 (18.8%) | W0/D0/L8 (0%) | W0/D1/L7 (6.2%) | Baseline |
+| **Value rerank k5** | **W0/D6/L2 (37.5%)** | W0/D1/L7 (6.2%) | W0/D0/L8 (0%) | **Best strategy** |
+| Alpha-beta 2-ply k5 | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) | Uniform but weak |
+
 **Key findings:**
 - Spatial policy head is **2.7x better** than flat head with fewer params
 - Medium model (26M) outperforms Small (6M) by ~5% absolute
-- Position quality (real games vs random play) matters more than loss function
-- Models predict moves well but still lose games vs Stockfish — search is the bottleneck
+- **Value reranking doubles gameplay score** at SF d1 (37.5% vs 18.8%)
+- Jointly-trained WDL value head outperforms SF-calibrated value head for search
+- Deeper search (2-ply) hurts because the value head is too noisy for minimax
+- The bottleneck is now data volume (47.5K is too few for 26M params)
 
-**Active direction:** Joint policy+value training (exp055) + shallow search (exp054) to convert accuracy into gameplay strength.
+**Active direction:** Scale training data to 200K+ positions for the Medium spatial model, then retest search.
 
 ## Setup
 

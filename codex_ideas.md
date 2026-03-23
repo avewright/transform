@@ -1408,3 +1408,219 @@ that arise in actual games. The path forward needs REALISTIC positions with SF l
   - Use Lichess positions (from real games) + SF best-move labels
   - Or use mixed training: some SF-labeled random, some human-move real games
   - The draw in games suggests tactical awareness IS improving from SF training
+
+### exp053: Medium spatial model — new baseline (2026-03-23)
+- **Model**: Medium (512d, 8L, 8H, ~26M params), 2 seeds (42, 123)
+- **Data**: HF avewright/chess-positions, 5 epochs
+- **Results**: Mean accuracy **35.3%**, top3 58.6% (s42); +5pp over Small (exp052)
+  - Opening: 43.5%, Middlegame: 33.9%, Endgame: 28.3%
+  - SF Rank: 5.73 (better than exp052's 6.5)
+- **Confirmed**: Medium model is the new baseline for all downstream experiments
+
+### exp055: Joint policy + value training (2026-03-23)
+- **Hypothesis**: Joint training with WDL value head improves search gameplay
+- **Model**: Same Medium config + value head, value_weight=0.5
+- **Results**: Mean accuracy **35.1%** ±0.03% (TIE with exp053 on policy)
+  - **Value accuracy: 79-80% WDL** — trained and usable for search
+  - Policy accuracy essentially unchanged by joint training (35.1% vs 35.3%)
+  - Value head converged: 73% ep1 → 80% ep5
+- **Conclusion**: Joint training successfully trains a value head without hurting
+  policy accuracy. The value head is now available for search experiments.
+
+### exp056: Internal search policy head (2026-03-23)
+- **Hypothesis**: Iterative 3-step internal-search head > one-shot spatial head
+- **Model**: Medium + search head (3 steps, top-32 candidates, aux_base_weight=0.3)
+  - 27.5M params (vs 26.1M base) — 1.3M extra for search head
+- **Results**: Mean accuracy **35.4%** ±0.28% (TIE with exp053)
+  - base_accuracy ≈ final_accuracy → search steps not improving over base
+  - 10% slower per epoch (276s vs 254s) for no accuracy gain
+- **Conclusion**: Internal search head doesn't help at this scale/data.
+  The base spatial head already captures what the search head tries to learn.
+  Search benefit likely requires actual tree search at inference, not learned search.
+
+### Cumulative results table (latest session):
+
+| Exp | Architecture | Data | Mean Acc | Top3 | Value Acc | Notes |
+|-----|-------------|------|----------|------|-----------|-------|
+| exp052 spatial | Small 256d/6L | 47.5K HF | 30.3% | 52.5% | — | Spatial confirmed |
+| **exp053** | **Medium 512d/8L** | **47.5K HF** | **35.3%** | **58.6%** | — | **New baseline** |
+| exp055 | Medium + joint | 47.5K HF | 35.1% | 58.1% | 80% | Value head trained |
+| exp056 | Medium + search head | 47.5K HF | 35.4% | 58.0% | — | TIE, search redundant |
+
+### Key insight from exp053-056:
+All three medium experiments converge to ~35% accuracy on 47.5K HF data.
+The bottleneck is now DATA VOLUME, not architecture — same pattern as the
+50K ablation plateau from Session 9 (exp026-030 all tied at ~38%).
+The Medium model on 47.5K is data-starved, just like the old 8L was on 50K.
+
+### NEXT PRIORITY: Run exp054 (search baseline)
+The exp055 model has a trained value head (80% WDL accuracy).
+Use it for actual game play with search strategies:
+- Policy argmax (baseline)
+- Value reranking (top-5, top-10)
+- Minimax search if feasible
+This directly tests whether the value head improves GAMEPLAY, not label accuracy.
+
+### exp054: Search baseline — VALUE RERANKING WORKS AT SHALLOW DEPTHS (2026-03-23)
+
+**Checkpoint**: exp055 joint_medium_s42.pt (35% policy acc, 80% WDL value acc)
+**Strategies**: policy_argmax, value_rerank_k5, value_rerank_k10, mcts_50
+**Games**: 8 per strategy per SF depth (4 openings × white+black)
+**Runtime**: 177s
+
+**Results:**
+
+| Strategy | SF d1 | SF d2 | SF d3 |
+|----------|-------|-------|-------|
+| policy_argmax | W0/D3/L5 (18.8%) | W0/D0/L8 (0%) | W0/D1/L7 (6.2%) |
+| **value_rerank_k5** | **W0/D6/L2 (37.5%)** | W0/D1/L7 (6.2%) | W0/D0/L8 (0%) |
+| value_rerank_k10 | W0/D4/L4 (25.0%) | W0/D1/L7 (6.2%) | W0/D0/L8 (0%) |
+| mcts_50 | W0/D3/L5 (18.8%) | W0/D0/L8 (0%) | W0/D1/L7 (6.2%) |
+
+**Key findings:**
+1. **Value reranking k5 DOUBLES the score at SF d1** (37.5% vs 18.8%)
+   - 6 draws out of 8 games! The model SURVIVES against weak Stockfish.
+   - The value head disambiguates among top-5 policy moves effectively.
+2. **k5 > k10** (37.5% vs 25.0% at d1) — narrower candidate set is better.
+   Wider k10 introduces more bad moves that the value head can't reliably reject.
+3. **MCTS 50 sims = policy argmax** — 50 simulations with 1-ply value backup
+   does NOT improve on pure policy. The MCTS exploration overhead isn't worth it
+   with so few simulations.
+4. **All strategies collapse at SF d2+** — the value head helps with move selection
+   but can't compensate for Stockfish's 2-ply advantage in search depth.
+5. **Value reranking SHORTENS games** — k5 averages 60 moves at d1 vs argmax's 79.
+   The value head makes more decisive moves (draws reached faster via repetition).
+6. **No wins** achieved by any strategy — the model can survive but not win.
+
+**Analysis:**
+- The value head (trained jointly in exp055) is genuinely useful for search.
+  It correctly distinguishes better positions among the top policy candidates.
+- But 1-ply search depth is the ceiling for improvement. To beat SF d2+, the model
+  needs either: (a) multi-ply search, or (b) dramatically better policy accuracy.
+- The diminishing returns from k5 → k10 suggest the policy's ranking within top-5
+  is mostly good — the value head just catches occasional bad top-1 picks.
+- MCTS not helping confirms that the bottleneck is EVALUATION QUALITY, not SEARCH TREE SIZE.
+  With only 50 sims and a noisy value function, UCB-based exploration wastes visits.
+
+**Implications for next experiment:**
+1. **Scale data + train longer** — the 47.5K HF dataset is too small for the Medium model.
+   Need to train on the full 460K+ dataset (like exp024/031/032 did for the old architecture).
+2. **Multi-ply search** — implement minimax with alpha-beta pruning using the trained
+   value head. Even 2-ply should significantly improve over 1-ply reranking.
+3. **Better value targets** — currently WDL from game metadata. SF centipawn targets
+   would give more precise positional evaluation.
+4. **Data quality path** — the successful pattern from Sessions 8-10 was: more data on
+   the chess-native transformer yields consistent gains. Apply this to the new baseline.
+
+### exp057: Deep search — 2-ply alpha-beta WITH TRAINED VALUE HEAD (2026-03-23)
+
+**Checkpoint**: exp055 joint_medium_s42.pt (35% policy, 80% WDL value)
+**Strategies**: policy_argmax, value_rerank_k5 (exp054 best), alphabeta_2ply_k5, alphabeta_2ply_k10
+**Runtime**: 216s
+
+**Results:**
+
+| Strategy | SF d1 | SF d2 | SF d3 |
+|----------|-------|-------|-------|
+| policy_argmax | W0/D3/L5 (18.8%) | W0/D0/L8 (0%) | W0/D1/L7 (6.2%) |
+| **value_rerank_k5** | **W0/D6/L2 (37.5%)** | W0/D1/L7 (6.2%) | W0/D0/L8 (0%) |
+| alphabeta_2ply_k5 | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) |
+| alphabeta_2ply_k10 | W0/D3/L5 (18.8%) | W0/D0/L8 (0%) | W0/D0/L8 (0%) |
+
+**Key findings:**
+1. **2-ply HURTS at d1** — alphabeta_2ply_k5 drops from 37.5% to 6.2%!
+   The value head is too noisy for minimax — it amplifies evaluation errors.
+   Games are much shorter (40mv vs 60mv) — overly pessimistic play gets mated.
+2. **2-ply is UNIFORM across depths** — W0/D1/L7 at ALL depths (d1, d2, d3).
+   The minimax structure stabilizes play regardless of opponent strength.
+3. **At d3, 2ply_k5 BEATS rerank_k5** — 6.2% vs 0%. Consistent mediocrity > d1 brilliance.
+4. **Wider search (k10) doesn't help** — more candidates = more noise for the value head.
+5. **1-ply value_rerank_k5 remains king at d1** — 37.5% is the best gameplay result.
+
+**Root cause analysis:**
+- The value head was trained on WDL game-outcome labels, NOT positional evaluations.
+- WDL labels are noisy: a "draw" position could have +2.0 eval or 0.0 eval.
+- 1-ply reranking works because it only needs to distinguish "better vs worse" among
+  5 similar top-policy moves. That's a coarse comparison the WDL head handles.
+- 2-ply minimax needs the value head to accurately compare positions 2 moves apart,
+  which requires much finer-grained evaluation than WDL labels provide.
+
+**CRITICAL INSIGHT**: Deeper search requires BETTER value evaluation, not just more depth.
+The value head needs Stockfish centipawn targets, not game-outcome WDL.
+
+### NEXT: exp058 — SF-calibrated value head → improved search
+- Label ~20K HF positions with Stockfish centipawn evaluations
+- Fine-tune ONLY the value head on cp-to-WDL targets (freeze policy)
+- Retest value_rerank_k5 and alphabeta_2ply at all SF depths
+- If calibrated value head + 2ply beats 1ply, it proves the evaluation hypothesis
+
+### exp058: SF-calibrated value head — COUNTER-INTUITIVE NEGATIVE (2026-03-23)
+
+**Checkpoint**: exp055 joint_medium_s42.pt
+**SF labeling**: 20K positions, depth 5, 1914 pos/s (10s total)
+  - Distribution: 50% winning, 20% equal, 30% losing
+**Value training**: 5 epochs, 132K params only, sign_acc 82-85%
+**Runtime**: 370s
+
+**Results (BASELINE vs CALIBRATED):**
+
+| Strategy | Depth | Baseline (WDL) | Calibrated (SF) | Delta |
+|----------|-------|-----------------|-----------------|-------|
+| policy_argmax | d1 | W0/D3/L5 (18.8%) | W0/D3/L5 (18.8%) | = |
+| value_rerank_k5 | d1 | **W0/D6/L2 (37.5%)** | W0/D3/L5 (18.8%) | **-18.7pp!** |
+| value_rerank_k5 | d2 | W0/D1/L7 (6.2%) | W0/D0/L8 (0%) | -6.2pp |
+| alphabeta_2ply | d1 | W0/D1/L7 (6.2%) | W0/D2/L6 (12.5%) | **+6.3pp** |
+| alphabeta_2ply | d2 | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) | = |
+
+**Key findings:**
+1. **SF calibration DESTROYS 1-ply reranking** — from 37.5% to 18.8% at d1!
+   The jointly-trained WDL head was BETTER for reranking than the SF-calibrated one.
+2. **SF calibration HELPS 2-ply** — from 6.2% to 12.5% at d1.
+   Better positional accuracy helps deeper search, even when it hurts shallow search.
+3. **No strategy combination beats the original WDL value_rerank_k5 at d1 (37.5%).**
+
+**WHY SF calibration hurts 1-ply reranking:**
+- The WDL head was trained jointly with policy on the SAME data distribution.
+  It learned to distinguish "safer vs riskier" among positions the model actually reaches.
+- The SF head was trained on arbitrary position evaluations (centipawn scores).
+  It's more "correct" positionally but doesn't align with the policy's move distribution.
+- For 1-ply reranking, you only need RELATIVE rankings among 5 similar top-policy moves.
+  The WDL head's imprecise but task-aligned signal works better for this.
+- For 2-ply minimax, you need ABSOLUTE position evaluation to compare across depth.
+  The SF head's more calibrated signal helps here even though it's mis-aligned with policy.
+
+**DEEP INSIGHT — value head should match policy distribution, not ground truth:**
+This is the AlphaZero principle: train value and policy TOGETHER on positions the
+agent encounters during self-play. External labels (even from SF) are calibrated
+for a different policy's behavior, creating a distribution mismatch.
+
+### Updated cumulative gameplay results:
+
+| Strategy | SF d1 | SF d2 | SF d3 | Source |
+|----------|-------|-------|-------|--------|
+| policy_argmax | 18.8% | 0% | 6.2% | exp054/057/058 (consistent) |
+| **value_rerank_k5 (WDL)** | **37.5%** | 6.2% | 0% | **exp054/057 — BEST** |
+| value_rerank_k5 (SF) | 18.8% | 0% | 0% | exp058 — WORSE |
+| alphabeta_2ply_k5 (WDL) | 6.2% | 6.2% | 6.2% | exp057 — uniform |
+| alphabeta_2ply_k5 (SF) | 12.5% | 6.2% | 0% | exp058 — slight d1 gain |
+
+### Updated roadmap after search experiments:
+
+1. **Value_rerank_k5 with jointly-trained WDL head is the best search strategy.**
+   Don't replace it. Instead, improve it by improving the underlying model.
+
+2. **MORE DATA is the priority.** The Medium model on 47.5K is data-starved.
+   All architecture/search tweaks have plateaued at ~35% policy accuracy.
+   Need to scale to 200K+ positions for meaningful gains.
+
+3. **Data options (ranked by accessibility):**
+   a. Generate diverse positions + label with SF (fast, unlimited, but synthetic)
+   b. Download Lichess games via API (real positions, needs internet)
+   c. Re-upload a larger version of the HF dataset
+
+4. **Self-play as data source** — use the current model to generate positions,
+   label with SF, train on them. This creates positions from the model's own
+   policy distribution (optimal for the AlphaZero-style insight from exp058).
+
+5. **Search improvements are BLOCKED by value head quality**, which is BLOCKED by
+   data volume. Don't invest more in search until the model is stronger.
