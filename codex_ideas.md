@@ -1709,3 +1709,58 @@ similar positions that reranking requires.
 the old architecture's accuracy at 460K (47.2% vs 48.7%). This confirms the new
 architecture is more data-efficient. With 500K+ data, it should significantly surpass
 the old architecture's ceiling of 51.2%.
+
+### exp060: Fix value head for reranking (2026-03-23)
+
+**Hypothesis**: Fine-tuning ONLY the value head on 47.5K HF positions (real game-outcome
+WDL labels) while keeping the exp059 policy frozen will restore strong reranking gameplay.
+
+**Results:**
+- Value accuracy: 50.2% → **85.6%** (massive improvement)
+- Policy accuracy: 47.2% → 47.2% (unchanged, as expected)
+- Training: 10 epochs × 55s, only 132K params trainable
+
+**Gameplay (UNCHANGED from exp059 — did NOT help):**
+
+| Strategy | SF d1 | SF d2 | SF d3 |
+|----------|-------|-------|-------|
+| policy_argmax | W0/D5/L3 (31.2%) | W0/D1/L7 (6.2%) | W0/D1/L7 (6.2%) |
+| value_rerank_k5 | W0/D2/L6 (12.5%) | W0/D2/L6 (12.5%) | W0/D1/L7 (6.2%) |
+| value_rerank_k10 | W0/D2/L6 (12.5%) | W0/D1/L7 (6.2%) | W0/D2/L6 (12.5%) |
+
+**CRITICAL INSIGHT: Value accuracy ≠ Reranking quality**
+- The value head now correctly classifies 85.6% of positions as W/D/L
+- But reranking requires **relative** ordering among top-policy moves
+- The 5 positions evaluated by reranking are all "after playing one of the top-5
+  policy moves" — they're very similar positions with small quality differences
+- A head that's great at coarse W/D/L classification might be terrible at the
+  fine-grained "which of these 5 similar positions is slightly better" task
+- This is fundamentally different from the exp058 finding (SF calibration hurt
+  reranking). Here even perfect WDL classification doesn't help.
+
+**Why did the OLD exp055 value head rerank well (37.5%) but the NEW one doesn't?**
+Possible explanations:
+1. **Policy quality changed the task**: exp055's policy was weaker (35%), so its
+   top-5 moves had MORE variation in quality → easier for value head to distinguish.
+   exp059's stronger policy (47%) picks 5 moves that are all reasonable → harder
+   to distinguish → value head can't help as much.
+2. **The old model was smaller/simpler** → value head co-adapted with policy during
+   training in a way that was beneficial for reranking.
+3. **8 games is too noisy** — 12.5% vs 37.5% could be noise in such small samples.
+
+**Implication for search**: Value-based reranking may have **diminishing returns**
+as policy improves. The stronger the policy's top move, the less room for value
+to improve upon it. This suggests we should focus on **policy quality (more data)**
+rather than search refinement at this stage.
+
+### Updated roadmap (2026-03-23 evening):
+
+1. **MORE DATA** — 500K positions generating on CPU (depth 8), ETA ~2 hours.
+   Train exp061 on 700K+ combined = massive accuracy boost expected.
+2. **Policy quality is king** — at 47.2% policy, argmax at d1 (31.2%) is already
+   strong. More data → better policy → better gameplay directly.
+3. **Search improvements on hold** — value reranking doesn't scale with policy
+   quality. Revisit search only if policy gains plateau.
+4. **The old 460K benchmark should fall** — ChessTransformerV2 at 247.5K already
+   matches exp024's 48.7%. At 700K+ it should significantly surpass 51.2%.
+
