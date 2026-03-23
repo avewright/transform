@@ -1279,33 +1279,96 @@ To play STRONG chess, train on STRONG players' moves. The path forward is:
 
 ---
 
+## 2026-03-23
+
+### exp052: Controlled head comparison v2 (fixed split, CLS token, richer eval)
+
+- **Data**: HF avewright/chess-positions pre-split train/test (no fake game_id)
+- **Model**: Small (256d, 6L, 8H), 3 seeds (42, 123, 314)
+- **Results**:
+
+| Variant | Mean Acc | Std | s42 | s123 | s314 |
+|---------|----------|-----|-----|------|------|
+| flat | 11.3% | 0.2% | 11.6% | 10.8% | 11.4% |
+| spatial | **30.3%** | 0.2% | 30.6% | 30.0% | 30.2% |
+
+- **Delta**: spatial wins by +19.0% (massive, consistent across all seeds)
+- **Phase breakdown** (spatial s42):
+  - Opening: 29.4% (833 positions)
+  - Endgame: 32.2% (791 positions)
+  - Middlegame: 30.1% (876 positions)
+- **Key finding**: The spatial head is a transformative architectural improvement,
+  not a marginal one. Per-square hidden state access completely dominates flat pooling.
+- Learned CLS token used as global context — cleaner than turn token abuse.
+
+### exp053: Scale spatial to Medium model (running)
+
+- **Model**: Medium (512d, 8L, 8H, 26M params), 2 seeds
+- **Epochs**: 5 (vs 3 in exp052)
+- Seed 42 results: 35.3% top-1, 58.6% top-3 (still improving at epoch 5)
+- Baseline exp052 was 30.3% — Medium is +5% absolute improvement
+
+### Research direction shift: from accuracy to gameplay
+
+Codex review identified the core issue: the repo optimizes for move-label accuracy
+but the actual goal is beating Stockfish. Key insights:
+
+1. **Policy alone can't beat Stockfish** — SF wins by search depth, not move priors
+2. **Value head is defined everywhere but trained nowhere** — huge missed signal
+3. **Search > more head ablations** — policy narrows candidates, value scores leaves
+4. **Soft targets > hard best-move CE** — many positions have multiple near-equivalent moves
+
+### New experiment pipeline (priority order):
+
+1. **exp053** (running) — establish Medium spatial as new baseline
+2. **exp055** — joint policy+value training with WDL targets and soft policy targets
+3. **exp054** — search baseline: top-k policy + value reranking + MCTS vs Stockfish
+4. Evaluate with actual game play at SF depths 1-3
+
+### Architecture decisions locked in:
+
+- **Chess-native encoder-only transformer** (not frozen Qwen backbone)
+- **Spatial policy head** (from×to factorized, not flat 5504-way)
+- **Learned CLS token** (not turn token abuse)
+- **Bidirectional attention** (encoder-only, all tokens see all)
+- Medium config: 512d, 8L, 8H, ~26M params
+
+### Criticisms addressed:
+
+- Fixed data split (HF pre-split, not synthetic game_id)
+- Added phase-bucketed evaluation
+- Added entropy, SF-move rank metrics
+- Save model checkpoints for downstream use
+
+---
+
 ## NEXT SESSION ROADMAP
 
-### Priority 1: Run exp048 (SF synthetic data)
-- This is the most promising experiment — perfectly labeled data at scale
-- Benchmarks at depth 8: ~208 pos/s (best move only), ~144 pos/s (top-3)
-- After first run, data is cached for instant reuse
-- Run: `export PYTHONUNBUFFERED=1 && python experiments/exp048_sf_synthetic.py`
+### Priority 1: Check exp053 results and promote as baseline
+- exp053 should beat exp052's 30.3% — if so, it's the new baseline model
+- Best checkpoint goes into exp054 (search) and exp055 (joint training)
 
-### Priority 2: Run exp047 (massive Lichess)
-- Scale up the promising exp046 results (37.1% → ?) with 5-10x more data
-- Run: `export PYTHONUNBUFFERED=1 && python experiments/exp047_massive_lichess.py`
+### Priority 2: Run exp055 (joint policy + value training)
+- Train value head for real with WDL targets from HF dataset
+- Uses soft Stockfish targets (KL divergence over top-k moves)
+- Joint loss = 0.7*hard_CE + 0.3*soft_KL + 0.5*value_CE
+- Run: `python -u experiments/exp055_joint_policy_value.py`
 
-### Priority 3: Push dataset to HuggingFace
-- HF token is in .env (already configured)
-- After exp048 generates SF-labeled data, push to `avewright/chess-sf-200k` on HF
-- After exp047 downloads Lichess data, push to `avewright/chess-lichess-2200plus` on HF
-- Use `huggingface_hub` Python package for upload
+### Priority 3: Run exp054 (search baseline)
+- Uses exp053 or exp055 checkpoint
+- 4 strategies: policy argmax, value rerank k5, value rerank k10, MCTS 50
+- Plays 8 games at SF depths 1, 2, 3
+- Run: `python -u experiments/exp054_search_baseline.py`
 
-### Priority 4: Mixed training experiment
-- Combine HF data (474K) + Lichess data (~600K) + SF synthetic (200K) = ~1.3M positions
-- Weight SF data higher since labels are perfect
-- This could produce the strongest model yet
+### Priority 4: Iterate on search + value
+- If value is poorly calibrated, try fine-tuning value head on SF centipawn targets
+- If MCTS helps even with untrained value, invest in deeper search
+- Consider alpha-beta with iterative deepening
 
-### Priority 5: Investigate game play gap
-- Models predict moves well (37-51%) but lose all games vs SF d3
-- Possible causes: no tactical awareness, no lookahead, blunders in critical positions
-- Ideas: temperature tuning, beam search over policy, simple 1-ply search
+### Key Insight
+The path to beating Stockfish is NOT more move-label accuracy.
+It's: good policy prior (DONE) + trained value head (exp055) + search (exp054).
+Even a mediocre value head + shallow search should beat policy-only at gameplay.
 
 ### Key Environment Notes
 - Must use `export` for env vars (inline env vars denied by policy)

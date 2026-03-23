@@ -1,52 +1,56 @@
 # Chess-Transformer
 
-Training a chess model by feeding **learned board embeddings** directly into a pretrained LLM backbone (Qwen3-0.6B) via `inputs_embeds`, bypassing text tokenization entirely. The LLM functions as a deep feature mixer over structured chess representations.
+Training a chess engine from scratch using a **chess-native encoder-only transformer** with learned board embeddings, a factorized spatial policy head, and Stockfish-supervised labels. The model learns move priors from positions; search + value head turn priors into gameplay.
 
-## Architecture
+## Current Architecture
 
 ```
 Board State (chess.Board)
         │
-   LearnedBoardEncoder
-        │  piece_embed(7 types) × color_proj(3 linear) + square_embed(64) + context tokens
+   LearnedBoardEncoder (256d)
+        │  piece_embed(7 types) × color_proj(3 linear)
+        │  + square_embed(64) + context tokens (turn, castling, ep)
         │  → 67 tokens × 256d
         ▼
-   Linear Projection (256 → 1024)
+   [CLS] token (learned) prepended → 68 tokens
         │
-   Qwen3-0.6B Backbone (frozen, 28 layers, via inputs_embeds)
+   Linear Projection (256 → 512)
+        │
+   Encoder-Only Transformer (8 layers, 8 heads, bidirectional)
+        │           norm_first=True, GELU, 512d hidden
         │
    ┌────┴────┐
-Policy Head  Value Head
-(→ 5504 moves) (→ W/D/L)
+Spatial       WDL Value
+Policy Head    Head
+(from×to×promo) (→ W/D/L)
 ```
 
 **Key components:**
-- **LearnedBoardEncoder** (`chess_model.py`): Per-square embeddings with color projections + game-state context tokens (turn, castling, en passant). 223K params
+- **LearnedBoardEncoder** (`chess_model.py`): Per-square embeddings with color projections + game-state context tokens. ~223K params
+- **SpatialPolicyHead**: Factorized from-square × to-square × promotion scoring using per-square hidden states + CLS context. ~1M params
 - **Move vocabulary** (`move_vocab.py`): 5504 possible UCI moves with legal-move masking at inference
-- **Board features** (`chess_features.py`): Board → token ID conversion for the learned encoder
-- **ChessModel** (`chess_model.py`): Full model tying encoder → backbone → heads. 7.4M trainable / 603M total
+- **ChessTransformerV2**: Full model (encoder + transformer + heads). ~26M params (Medium config)
 
-## Results So Far
+> **Legacy:** An older Qwen3-0.6B frozen-backbone path exists in `chess_model.py` (ChessModel). The chess-native transformer consistently outperforms it and is the active research direction.
 
-| Experiment | Data | Accuracy | Notes |
-|-----------|------|----------|-------|
-| exp008 | 200 self-distilled | 24% | CNN encoder PoC, 100% legal |
-| exp009 | 500 self-distilled | 46% (learned) vs 50% (CNN) | Learned encoder matches CNN with 21x fewer params |
-| exp010 | 500 self-distilled | 48% (all variants) | Unfreezing backbone doesn't help — data is bottleneck |
-| exp012b | 5000 Stockfish d10 | 14.2% (top3: 31%) | Stockfish labels are harder. Gets checkmated by SF d3 |
-| exp_av_v2 | 5K random + SF all-move | 8.8% (top3: 21.8%) | AV vs policy CE = TIE on random positions |
-| exp_av_real | 3K HF games + SF all-move | 23.6% (top3: 48.8%) | AV vs policy = TIE; real games >>  random positions |
-| exp013 | 50K HF game-play | 25.0% (top3: 45%) | Policy CE, best result so far |
-| exp052 | 47.5K HF diverse | 30.3% ± 0.2% (top3: 52.5%) | **Spatial head wins decisively** vs flat (11.3%). CLS token, 3 seeds, phase-bucketed eval |
+## Results
+
+| Experiment | Model | Data | Top-1 Acc | Top-3 | Notes |
+|-----------|-------|------|-----------|-------|-------|
+| exp052 flat | Small 256d/6L | 47.5K HF | 11.3% ± 0.2% | 28.8% | Flat head baseline, 3 seeds |
+| **exp052 spatial** | Small 256d/6L | 47.5K HF | **30.3% ± 0.2%** | 52.5% | Spatial head, CLS token, 3 seeds |
+| **exp053** | Medium 512d/8L | 47.5K HF | **~35%** | ~58% | Scaled spatial, 2 seeds (prelim) |
+| exp046 | 8L transformer | 209K Lichess 2200+ | 37.1% | 62.0% | Top-player data from scratch |
 
 100% legal move rate throughout (via legal-move masking).
 
 **Key findings:**
-- Position quality (real games vs random play) matters far more than loss function design
-- Spatial policy head (from×to factored) is **2.7x better** than flat head with **15x fewer params**
-- Phase breakdown: opening 36.6% > middlegame 30.0% > endgame 24.6%
+- Spatial policy head is **2.7x better** than flat head with fewer params
+- Medium model (26M) outperforms Small (6M) by ~5% absolute
+- Position quality (real games vs random play) matters more than loss function
+- Models predict moves well but still lose games vs Stockfish — search is the bottleneck
 
-**Next milestone:** Scale up to Medium model (512d, 8L), train with soft SF targets, evaluate with gameplay.
+**Active direction:** Joint policy+value training (exp055) + shallow search (exp054) to convert accuracy into gameplay strength.
 
 ## Setup
 
@@ -67,11 +71,17 @@ pip install stockfish
 ## Quick Start
 
 ```bash
-# Run the Stockfish-supervised training experiment:
-python experiments/exp012b_quick_stockfish.py
+# Train spatial policy model (Small, ~10 min):
+python -u experiments/exp052_head_comparison_v2.py
 
-# Self-play evolution (legacy text mode):
-python train.py selfplay --generations 10 --games 4
+# Train Medium spatial model (~30 min):
+python -u experiments/exp053_scaled_spatial.py
+
+# Joint policy+value training:
+python -u experiments/exp055_joint_policy_value.py
+
+# Search baseline (play games vs Stockfish):
+python -u experiments/exp054_search_baseline.py
 ```
 
 ## Project Structure
@@ -113,12 +123,11 @@ python train.py selfplay --generations 10 --games 4
 - **exp013**: 50K HF game-play positions with policy CE → 25% accuracy (best result)
 
 ### Next Steps
-1. **Scale real-game data to 50K+** with Stockfish best-move labels on HF game positions
-2. **Soft targets**: Test top-k move probabilities or KL divergence instead of hard best-move CE
-3. **Chess-native transformer**: Build small encoder-only model (12-16 layers, 384-768d) trained from scratch on chess tokens
-4. **LoRA fine-tuning (exp015)**: Unfreeze backbone attention via low-rank adaptation — test after data scaling saturates
-5. **MCTS search (exp014)**: Use policy+value heads for tree search — test after value quality improves
-6. **Goal: Beat Stockfish** at progressively higher depth levels
+1. **Train value head jointly** (exp055) — WDL + soft policy targets from Stockfish
+2. **Build search** (exp054) — top-k policy + value reranking + MCTS
+3. **Beat Stockfish depth 1** — first realistic gameplay milestone
+4. **Scale data** — combine HF + Lichess + SF-synthetic for 1M+ diverse positions
+5. **Deeper search** — alpha-beta with iterative deepening once value head is calibrated
 
 ## References
 

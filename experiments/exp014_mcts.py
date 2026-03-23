@@ -47,7 +47,7 @@ from move_vocab import VOCAB_SIZE, UCI_TO_IDX, move_to_index, index_to_move, leg
 from config import Config
 
 # --- Configuration ---
-STOCKFISH_PATH = "stockfish/stockfish/stockfish-windows-x86-64-avx2.exe"
+STOCKFISH_PATH = "stockfish/stockfish/stockfish-ubuntu-x86-64-avx2"
 OUTPUT_DIR = Path("outputs/exp014_mcts")
 POLICY_CACHE = Path("outputs/exp012_stockfish_supervised/labeled_data.json")
 
