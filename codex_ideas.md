@@ -1838,3 +1838,39 @@ better distribution quality, creating a model that beats SF at low node counts.
 4. **The goal is "beat shallow SF"** — not "beat Stockfish overall"
 5. **Data + supervision quality > search complexity** at this stage
 
+### exp064: Latent search — child expansion + attention backup (2026-03-24)
+
+**Hypothesis:** A policy head that expands candidate moves into latent child
+representations and refines them via joint self-attention will outperform
+one-shot spatial scoring (exp063) on the same data and trunk.
+
+**Architecture (extends exp056 internal search head):**
+1. Same 8L/512d trunk as exp063 (shared, unchanged)
+2. Coarse spatial scoring → top-K=8 candidates
+3. **NEW: Latent child expansion** — extract from/to square features from
+   parent trunk output, project through MLP to get child representation.
+   No re-encoding (cheap, fits 8GB VRAM).
+4. **NEW: Joint self-attention** — [candidates; children] attend to each
+   other. Candidates see consequences, children see sibling competition.
+5. Cross-attention to parent board (from exp056)
+6. **NEW: Backup head** — attention-weighted aggregation of child values,
+   approximating soft-max over candidate outcomes.
+7. 5-objective loss: KL(policy) + 0.3*KL(base) + 0.2*avg(KL(steps))
+   + 0.5*KL(value) + 0.3*MSE(backup)
+
+**Key design decisions for 8GB VRAM:**
+- Batch 48 with gradient accumulation 2 (effective 96)
+- K=8 candidates (not 32) — child expansion @ 8 is cheap
+- Child repr = MLP(from_sq_feats || to_sq_feats), NOT full re-encoding
+- ~19M params vs exp063's ~17M (13% overhead in the head)
+
+**What the eval will show (if it works):**
+- `base_accuracy`: coarse spatial accuracy (no search refinement)
+- `accuracy`: after 3 search steps with child awareness
+- `search_delta`: accuracy - base_accuracy (is the search actually helping?)
+- `backup_rerank` game strategy: does internal backup beat external value reranking?
+
+**This is the first experiment where the model can "see consequences" of
+candidate moves inside the forward pass.** If search_delta > 0, the
+architecture is learning to use 1-ply lookahead purely from attention.
+
