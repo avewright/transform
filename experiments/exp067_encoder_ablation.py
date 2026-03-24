@@ -43,15 +43,13 @@ from torch.amp import autocast, GradScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chess_features import (
-    board_to_token_ids, batch_boards_to_token_ids,
-    board_to_fused_token_ids, batch_boards_to_fused_token_ids,
-    NUM_FUSED_TOKENS,
-)
 from chess_model import LearnedBoardEncoder, FusedBoardEncoder
 from move_vocab import (
     VOCAB_SIZE, UCI_TO_IDX, IDX_TO_UCI,
     move_to_index, legal_move_mask, index_to_move,
+)
+from data_loader import (
+    load_training_data, get_batch_input, get_eval_batch_input,
 )
 
 OUTPUT_DIR = Path("outputs/exp067_encoder_ablation")
@@ -73,8 +71,6 @@ ENCODER_DIM = 256
 HEAD_DIM = 256
 
 TRAINING_SEEDS = [42, 123, 314]
-
-PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluations/snapshots/*/data/train-00000-of-00017.parquet"
 
 
 # ── Model ──
@@ -172,196 +168,6 @@ class ChessTransformerAblation(nn.Module):
         }
 
 
-# ── Data loading (pre-tensorized) ──
-
-def cp_to_wdl(cp, mate=None):
-    if mate is not None:
-        return (1.0, 0.0, 0.0) if mate > 0 else (0.0, 0.0, 1.0)
-    if cp is None:
-        return (0.33, 0.34, 0.33)
-    k = 1.0 / 111.7
-    win = 1.0 / (1.0 + math.exp(-k * cp))
-    loss = 1.0 - win
-    draw = max(0.0, 0.5 - abs(win - 0.5)) * 2
-    total = win + draw + loss
-    return (win / total, draw / total, loss / total)
-
-
-def fen_to_phase(fen):
-    """Cheap phase heuristic from piece count."""
-    board_part = fen.split()[0]
-    n = sum(1 for c in board_part if c.isalpha() and c.lower() != 'k')
-    if n >= 14:
-        return "opening"
-    elif n >= 6:
-        return "middlegame"
-    return "endgame"
-
-
-def load_data(n_train, n_eval, min_depth=15, seed=42):
-    """Load and pre-tensorize data from local Lichess parquet shard.
-
-    First n_eval valid positions -> eval (keep Board objects for legal_move_mask).
-    Next n_train valid positions -> train (tensors only, no Board objects).
-    """
-    import glob as globmod
-    import pandas as pd
-    import numpy as np
-
-    parquet_files = globmod.glob(str(Path(__file__).resolve().parent.parent / PARQUET_GLOB))
-    if not parquet_files:
-        raise FileNotFoundError("No parquet file found.")
-
-    parquet_path = parquet_files[0]
-    total_needed = n_train + n_eval
-
-    print(f"  Loading from local parquet: {Path(parquet_path).name}")
-    t0 = time.time()
-
-    df = pd.read_parquet(parquet_path, columns=["fen", "line", "depth", "cp", "mate"])
-    print(f"  Read {len(df):,} rows in {time.time()-t0:.1f}s")
-
-    if "depth" in df.columns:
-        df = df[df["depth"].notna() & (df["depth"] >= min_depth)]
-    df = df[df["line"].notna() & (df["line"].str.len() > 0)]
-    print(f"  After depth/line filter: {len(df):,}")
-
-    rng = np.random.RandomState(seed)
-    df = df.sample(frac=1, random_state=rng).reset_index(drop=True)
-
-    # Phase 1: eval positions (keep boards)
-    # Phase 2: train positions (tensors only)
-    baseline_piece_ids = []
-    baseline_color_ids = []
-    fused_ids_list = []
-    turn_list = []
-    castling_list = []
-    ep_list = []
-    move_idx_list = []
-    wdl_list = []
-    phase_list = []
-    eval_boards = []
-    eval_moves = []
-
-    n_collected = 0
-    t1 = time.time()
-    for row_idx in range(len(df)):
-        if n_collected >= total_needed:
-            break
-        try:
-            row = df.iloc[row_idx]
-            line = row["line"]
-            best_move_uci = line.split()[0]
-            if best_move_uci not in UCI_TO_IDX:
-                continue
-
-            fen = row["fen"]
-            board = chess.Board(fen)
-            move = chess.Move.from_uci(best_move_uci)
-            if move not in board.legal_moves:
-                continue
-
-            cp_val = row["cp"]
-            mate_val = row["mate"]
-            wdl = cp_to_wdl(
-                int(cp_val) if pd.notna(cp_val) else None,
-                int(mate_val) if pd.notna(mate_val) else None,
-            )
-
-            bt = board_to_token_ids(board)
-            baseline_piece_ids.append(bt["piece_ids"])
-            baseline_color_ids.append(bt["color_ids"])
-
-            ft = board_to_fused_token_ids(board)
-            fused_ids_list.append(ft["fused_ids"])
-
-            turn_list.append(bt["turn"])
-            castling_list.append(bt["castling"])
-            ep_list.append(bt["ep_file"])
-            move_idx_list.append(UCI_TO_IDX[best_move_uci])
-            wdl_list.append(wdl)
-            phase_list.append(fen_to_phase(fen))
-
-            # Keep board objects only for eval positions (first n_eval)
-            if n_collected < n_eval:
-                eval_boards.append(board)
-                eval_moves.append(move)
-
-            n_collected += 1
-            if n_collected % 50000 == 0:
-                elapsed = time.time() - t1
-                rate = n_collected / max(elapsed, 0.1)
-                print(f"    {n_collected:,} loaded ({rate:.0f} pos/s)...", flush=True)
-        except Exception:
-            continue
-
-    tok_time = time.time() - t1
-    print(f"  Tokenized {n_collected:,} in {tok_time:.1f}s ({n_collected/max(tok_time,0.1):.0f} pos/s)")
-
-    del df
-    gc.collect()
-
-    # Split: first n_eval -> eval, rest -> train
-    n_eval_actual = min(n_eval, len(eval_boards))
-    n_train_actual = min(n_train, n_collected - n_eval_actual)
-
-    eval_data = []
-    for i in range(n_eval_actual):
-        eval_data.append({
-            "board": eval_boards[i], "move": eval_moves[i],
-            "wdl": wdl_list[i], "phase": phase_list[i],
-        })
-
-    train_slice = slice(n_eval_actual, n_eval_actual + n_train_actual)
-    train_tensors = {
-        "baseline_piece_ids": torch.stack(baseline_piece_ids[train_slice]),
-        "baseline_color_ids": torch.stack(baseline_color_ids[train_slice]),
-        "fused_ids": torch.stack(fused_ids_list[train_slice]),
-        "turn": torch.stack(turn_list[train_slice]),
-        "castling": torch.stack(castling_list[train_slice]),
-        "ep_file": torch.stack(ep_list[train_slice]),
-        "move_idx": torch.tensor(move_idx_list[train_slice], dtype=torch.long),
-        "wdl": torch.tensor(wdl_list[train_slice], dtype=torch.float32),
-    }
-
-    eval_slice = slice(0, n_eval_actual)
-    eval_tensors = {
-        "baseline_piece_ids": torch.stack(baseline_piece_ids[eval_slice]),
-        "baseline_color_ids": torch.stack(baseline_color_ids[eval_slice]),
-        "fused_ids": torch.stack(fused_ids_list[eval_slice]),
-        "turn": torch.stack(turn_list[eval_slice]),
-        "castling": torch.stack(castling_list[eval_slice]),
-        "ep_file": torch.stack(ep_list[eval_slice]),
-    }
-
-    del baseline_piece_ids, baseline_color_ids, fused_ids_list
-    del turn_list, castling_list, ep_list, move_idx_list, wdl_list
-    del eval_boards, eval_moves
-    gc.collect()
-
-    print(f"  Train: {n_train_actual:,}, Eval: {n_eval_actual:,}")
-    return train_tensors, eval_data, eval_tensors
-
-
-def get_batch_input(train_tensors, indices, encoder_type, device):
-    """Extract a batch from pre-tensorized data for the given encoder type."""
-    if encoder_type == "baseline":
-        return {
-            "piece_ids": train_tensors["baseline_piece_ids"][indices].to(device),
-            "color_ids": train_tensors["baseline_color_ids"][indices].to(device),
-            "turn": train_tensors["turn"][indices].to(device),
-            "castling": train_tensors["castling"][indices].to(device),
-            "ep_file": train_tensors["ep_file"][indices].to(device),
-        }
-    else:  # fused
-        return {
-            "fused_ids": train_tensors["fused_ids"][indices].to(device),
-            "turn": train_tensors["turn"][indices].to(device),
-            "castling": train_tensors["castling"][indices].to(device),
-            "ep_file": train_tensors["ep_file"][indices].to(device),
-        }
-
-
 # ── Training ──
 
 def train_one(encoder_type, train_tensors, eval_data, eval_tensors, device, seed):
@@ -379,7 +185,7 @@ def train_one(encoder_type, train_tensors, eval_data, eval_tensors, device, seed
     print(f"\n  [{encoder_type} seed={seed}] Params: {n_params:,} (encoder: {enc_params:,})")
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-    n_train = train_tensors["fused_ids"].shape[0]
+    n_train = train_tensors["move_idx"].shape[0]
     steps = n_train // BATCH_SIZE
     warmup_steps = max(int(steps * WARMUP_FRAC), 1)
 
@@ -407,7 +213,7 @@ def train_one(encoder_type, train_tensors, eval_data, eval_tensors, device, seed
 
         batch_input = get_batch_input(train_tensors, indices, encoder_type, device)
         targets = train_tensors["move_idx"][indices].to(device)
-        wdl_targets = train_tensors["wdl"][indices].to(device)
+        wdl_targets = train_tensors["wdl"][indices].float().to(device)
 
         with autocast('cuda', dtype=torch.float16):
             result = model(batch_input)
@@ -486,22 +292,7 @@ def evaluate(model, eval_data, eval_tensors, encoder_type, device, batch_size=25
             n = len(chunk)
             idx = slice(i, i + n)
 
-            # Use pre-tensorized eval inputs
-            if encoder_type == "baseline":
-                batch_input = {
-                    "piece_ids": eval_tensors["baseline_piece_ids"][idx].to(device),
-                    "color_ids": eval_tensors["baseline_color_ids"][idx].to(device),
-                    "turn": eval_tensors["turn"][idx].to(device),
-                    "castling": eval_tensors["castling"][idx].to(device),
-                    "ep_file": eval_tensors["ep_file"][idx].to(device),
-                }
-            else:
-                batch_input = {
-                    "fused_ids": eval_tensors["fused_ids"][idx].to(device),
-                    "turn": eval_tensors["turn"][idx].to(device),
-                    "castling": eval_tensors["castling"][idx].to(device),
-                    "ep_file": eval_tensors["ep_file"][idx].to(device),
-                }
+            batch_input = get_eval_batch_input(eval_tensors, idx, encoder_type, device)
 
             with autocast('cuda', dtype=torch.float16):
                 result = model(batch_input)
@@ -576,9 +367,10 @@ def main():
     print(f"  Batch: {BATCH_SIZE}, LR: {LR}")
     print()
 
-    # Load data once — shared across all runs
-    train_tensors, eval_data, eval_tensors = load_data(
-        TRAIN_POSITIONS, EVAL_POSITIONS, min_depth=MIN_DEPTH, seed=SEED,
+    # Load data once — shared across all runs (instant from .pt cache)
+    train_tensors, eval_data, eval_tensors = load_training_data(
+        n_train=TRAIN_POSITIONS, n_eval=EVAL_POSITIONS,
+        encoder_type="both", min_depth=MIN_DEPTH, seed=SEED,
     )
 
     results = []

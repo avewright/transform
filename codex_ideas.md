@@ -1874,3 +1874,32 @@ one-shot spatial scoring (exp063) on the same data and trunk.
 candidate moves inside the forward pass.** If search_delta > 0, the
 architecture is learning to use 1-ply lookahead purely from attention.
 
+---
+
+## 2026-03-24: Infrastructure & strategic notes (exp067–069 series)
+
+### Completed infrastructure
+- **data_loader.py**: Shared 3-tier data pipeline (cache → HF → parquet). Cache loads 502K positions in ~2s vs 30+ min from raw parquet. Encoding-agnostic `board_array[0-12]` supports both fused and baseline tokenizations at load time.
+- **prepare_hf_dataset.py**: One-time upload script for `avewright/chess-positions-lichess-sf` on HuggingFace. Dry-run tested at 3312 pos/s. Upload in progress.
+- **exp067/068/069 refactored** to use shared `data_loader.py` — eliminated ~200 lines of duplicated data loading per experiment.
+- **CURRENT_ARCHITECTURE.md** updated to reflect actual current architecture (learned [CLS] token, FusedBoardEncoder primary, joint policy+value training).
+
+### Bug fixes
+- **exp069 IDX_TO_UCI import**: `_build_move_square_indices()` used `IDX_TO_UCI` without importing it. Fixed.
+- **data_loader tensor shapes**: `turn/castling/ep_file` were stored as `(N,1)` — encoders expect `(B,)`. Fixed by removing `.unsqueeze(-1)`.
+
+### Strategic observations (from user review)
+1. **exp066 is scaffolding, not decision-grade**: Single-seed, single-epoch, mixed param counts. `summary.json` shows `best_accuracy: 0`. Treat as preliminary scouting only.
+2. **exp067+ is rigorous**: Three seeds, controlled schedule, shared eval metrics, explicit downstream handoff. This is the mature research loop.
+3. **500K/1-epoch screening risk**: Fine for ranking ideas, but width/depth/bias effects can reshuffle at larger data/training budgets. Use these results as filters, not irreversible architecture commitments.
+4. **Code duplication across exp066–069**: Model definitions, policy heads, and train/eval loops are repeated inline. A shared ablation harness would reduce unintended divergence as the experiment count grows.
+
+### First exp067 result
+- baseline seed=42: acc=15.6%, top3=35.1%, SF rank=62.4, value acc=63.4%, 1116 pos/s (448s)
+- Remaining: baseline seeds 123/314, fused seeds 42/123/314
+
+### Next steps
+- Complete exp067 → launch exp068 → exp069 sequentially
+- Consider extracting a shared `ablation_harness.py` from exp067 model/train/eval code once results are in
+- After 3-experiment results: decide which architecture choices graduate to a larger-data run
+

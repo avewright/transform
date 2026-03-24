@@ -40,12 +40,9 @@ from torch.amp import autocast, GradScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chess_features import board_to_fused_token_ids
 from chess_model import FusedBoardEncoder
-from move_vocab import (
-    VOCAB_SIZE, UCI_TO_IDX, IDX_TO_UCI,
-    move_to_index, legal_move_mask, index_to_move,
-)
+from move_vocab import VOCAB_SIZE, IDX_TO_UCI, move_to_index, legal_move_mask
+from data_loader import load_training_data, get_batch_input, get_eval_batch_input
 
 OUTPUT_DIR = Path("outputs/exp069_data_quality")
 SEED = 42
@@ -65,8 +62,6 @@ ENCODER_DIM = 256
 HEAD_DIM = 256
 
 TRAINING_SEEDS = [42, 123, 314]
-
-PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluations/snapshots/*/data/train-00000-of-00017.parquet"
 
 
 # ── Model (same as exp067 fused variant) ──
@@ -150,211 +145,6 @@ class ChessTransformerFused(nn.Module):
         }
 
 
-# ── Data quality features ──
-
-def compute_sample_weight(cp, n_legal, line):
-    """Compute sample weight from data quality features.
-
-    Returns (weight, features_dict).
-    """
-    is_forced = n_legal <= 1
-
-    # cp_gap: approximate from PV line if it has multiple moves
-    # The parquet `line` field is the PV (sequence of best moves), not top-k.
-    # We only have the best move's CP, not the 2nd best.
-    # Use heuristic: positions with extreme cp (|cp| > 300) are often obvious.
-    cp_gap_heuristic = 0
-    if cp is not None:
-        abs_cp = abs(int(cp))
-        if abs_cp > 500:
-            cp_gap_heuristic = 2  # likely forced/obvious
-        elif abs_cp > 200:
-            cp_gap_heuristic = 1  # probably clear
-        else:
-            cp_gap_heuristic = 0  # contested
-
-    # Weight assignment
-    if is_forced:
-        weight = 0.2  # trivial
-    elif cp_gap_heuristic == 2:
-        weight = 0.6  # obvious position
-    elif cp_gap_heuristic == 1:
-        weight = 1.0  # clear but interesting
-    else:
-        weight = 0.9  # contested — moderate up-weight vs uniform
-
-    features = {
-        "is_forced": is_forced,
-        "n_legal": n_legal,
-        "cp_gap_heuristic": cp_gap_heuristic,
-        "weight": weight,
-    }
-    return weight, features
-
-
-def cp_to_wdl(cp, mate=None):
-    if mate is not None:
-        return (1.0, 0.0, 0.0) if mate > 0 else (0.0, 0.0, 1.0)
-    if cp is None:
-        return (0.33, 0.34, 0.33)
-    k = 1.0 / 111.7
-    win = 1.0 / (1.0 + math.exp(-k * cp))
-    loss = 1.0 - win
-    draw = max(0.0, 0.5 - abs(win - 0.5)) * 2
-    total = win + draw + loss
-    return (win / total, draw / total, loss / total)
-
-
-def fen_to_phase(fen):
-    board_part = fen.split()[0]
-    n = sum(1 for c in board_part if c.isalpha() and c.lower() != 'k')
-    if n >= 14:
-        return "opening"
-    elif n >= 6:
-        return "middlegame"
-    return "endgame"
-
-
-def load_data(n_train, n_eval, min_depth=15, seed=42):
-    """Load data with quality weights."""
-    import glob as globmod
-    import pandas as pd
-    import numpy as np
-
-    parquet_files = globmod.glob(str(Path(__file__).resolve().parent.parent / PARQUET_GLOB))
-    if not parquet_files:
-        raise FileNotFoundError("No parquet file found.")
-
-    parquet_path = parquet_files[0]
-    total_needed = n_train + n_eval
-
-    print(f"  Loading from local parquet: {Path(parquet_path).name}")
-    t0 = time.time()
-
-    df = pd.read_parquet(parquet_path, columns=["fen", "line", "depth", "cp", "mate"])
-    print(f"  Read {len(df):,} rows in {time.time()-t0:.1f}s")
-    if "depth" in df.columns:
-        df = df[df["depth"].notna() & (df["depth"] >= min_depth)]
-    df = df[df["line"].notna() & (df["line"].str.len() > 0)]
-    print(f"  After depth/line filter: {len(df):,}")
-    rng = np.random.RandomState(seed)
-    df = df.sample(frac=1, random_state=rng).reset_index(drop=True)
-
-    fused_ids_list = []
-    turn_list = []
-    castling_list = []
-    ep_list = []
-    move_idx_list = []
-    wdl_list = []
-    weight_list = []
-    phase_list = []
-    eval_boards = []
-    eval_moves = []
-
-    n_collected = 0
-    t1 = time.time()
-    for row_idx in range(len(df)):
-        if n_collected >= total_needed:
-            break
-        try:
-            row = df.iloc[row_idx]
-            line = row["line"]
-            best_move_uci = line.split()[0]
-            if best_move_uci not in UCI_TO_IDX:
-                continue
-
-            fen = row["fen"]
-            board = chess.Board(fen)
-            move = chess.Move.from_uci(best_move_uci)
-            if move not in board.legal_moves:
-                continue
-
-            cp_val = row["cp"]
-            mate_val = row["mate"]
-            n_legal = len(list(board.legal_moves))
-            weight, _ = compute_sample_weight(
-                int(cp_val) if pd.notna(cp_val) else None,
-                n_legal, line,
-            )
-
-            ft = board_to_fused_token_ids(board)
-            fused_ids_list.append(ft["fused_ids"])
-            turn_list.append(ft["turn"])
-            castling_list.append(ft["castling"])
-            ep_list.append(ft["ep_file"])
-            move_idx_list.append(UCI_TO_IDX[best_move_uci])
-            wdl_list.append(cp_to_wdl(
-                int(cp_val) if pd.notna(cp_val) else None,
-                int(mate_val) if pd.notna(mate_val) else None,
-            ))
-            weight_list.append(weight)
-            phase_list.append(fen_to_phase(fen))
-
-            if n_collected < n_eval:
-                eval_boards.append(board)
-                eval_moves.append(move)
-
-            n_collected += 1
-            if n_collected % 50000 == 0:
-                elapsed = time.time() - t1
-                rate = n_collected / max(elapsed, 0.1)
-                print(f"    {n_collected:,} loaded ({rate:.0f} pos/s)...", flush=True)
-        except Exception:
-            continue
-
-    tok_time = time.time() - t1
-    print(f"  Tokenized {n_collected:,} in {tok_time:.1f}s ({n_collected/max(tok_time,0.1):.0f} pos/s)")
-
-    del df
-    gc.collect()
-
-    # Split: first n_eval -> eval, rest -> train
-    n_eval_actual = min(n_eval, len(eval_boards))
-    n_train_actual = min(n_train, n_collected - n_eval_actual)
-
-    # Weight statistics
-    import statistics as stat_mod
-    print(f"  Weight stats: mean={stat_mod.mean(weight_list):.3f} "
-          f"min={min(weight_list):.2f} max={max(weight_list):.2f}")
-    w_counts = {}
-    for w in weight_list:
-        w_counts[w] = w_counts.get(w, 0) + 1
-    for w in sorted(w_counts):
-        pct = w_counts[w] / n_collected * 100
-        print(f"    weight={w:.1f}: {w_counts[w]:,} ({pct:.1f}%)")
-
-    eval_data = []
-    for i in range(n_eval_actual):
-        eval_data.append({
-            "board": eval_boards[i], "move": eval_moves[i],
-            "wdl": wdl_list[i], "phase": phase_list[i],
-        })
-
-    train_tensors = {
-        "fused_ids": torch.stack(fused_ids_list[n_eval_actual:n_eval_actual + n_train_actual]),
-        "turn": torch.stack(turn_list[n_eval_actual:n_eval_actual + n_train_actual]),
-        "castling": torch.stack(castling_list[n_eval_actual:n_eval_actual + n_train_actual]),
-        "ep_file": torch.stack(ep_list[n_eval_actual:n_eval_actual + n_train_actual]),
-        "move_idx": torch.tensor(move_idx_list[n_eval_actual:n_eval_actual + n_train_actual], dtype=torch.long),
-        "wdl": torch.tensor(wdl_list[n_eval_actual:n_eval_actual + n_train_actual], dtype=torch.float32),
-        "weight": torch.tensor(weight_list[n_eval_actual:n_eval_actual + n_train_actual], dtype=torch.float32),
-    }
-
-    eval_tensors = {
-        "fused_ids": torch.stack(fused_ids_list[:n_eval_actual]),
-        "turn": torch.stack(turn_list[:n_eval_actual]),
-        "castling": torch.stack(castling_list[:n_eval_actual]),
-        "ep_file": torch.stack(ep_list[:n_eval_actual]),
-    }
-
-    del fused_ids_list, turn_list, castling_list, ep_list
-    del move_idx_list, wdl_list, weight_list, eval_boards, eval_moves
-    gc.collect()
-
-    print(f"  Train: {n_train_actual:,}, Eval: {n_eval_actual:,}")
-    return train_tensors, eval_data, eval_tensors
-
-
 # ── Training ──
 
 def train_one(use_weights, train_tensors, eval_data, eval_tensors, device, seed):
@@ -370,7 +160,7 @@ def train_one(use_weights, train_tensors, eval_data, eval_tensors, device, seed)
     print(f"\n  [{label} seed={seed}] Params: {n_params:,}")
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-    n_train = train_tensors["fused_ids"].shape[0]
+    n_train = train_tensors["move_idx"].shape[0]
     steps = n_train // BATCH_SIZE
     warmup_steps = max(int(steps * WARMUP_FRAC), 1)
 
@@ -394,14 +184,9 @@ def train_one(use_weights, train_tensors, eval_data, eval_tensors, device, seed)
         if len(indices) < 2:
             continue
 
-        batch_input = {
-            "fused_ids": train_tensors["fused_ids"][indices].to(device),
-            "turn": train_tensors["turn"][indices].to(device),
-            "castling": train_tensors["castling"][indices].to(device),
-            "ep_file": train_tensors["ep_file"][indices].to(device),
-        }
+        batch_input = get_batch_input(train_tensors, indices, "fused", device)
         targets = train_tensors["move_idx"][indices].to(device)
-        wdl_targets = train_tensors["wdl"][indices].to(device)
+        wdl_targets = train_tensors["wdl"][indices].float().to(device)
 
         with autocast('cuda', dtype=torch.float16):
             result = model(batch_input)
@@ -488,12 +273,7 @@ def evaluate(model, eval_data, eval_tensors, device, batch_size=256):
             n = len(chunk)
             idx = slice(i, i + n)
 
-            batch_input = {
-                "fused_ids": eval_tensors["fused_ids"][idx].to(device),
-                "turn": eval_tensors["turn"][idx].to(device),
-                "castling": eval_tensors["castling"][idx].to(device),
-                "ep_file": eval_tensors["ep_file"][idx].to(device),
-            }
+            batch_input = get_eval_batch_input(eval_tensors, idx, "fused", device)
 
             with autocast('cuda', dtype=torch.float16):
                 result = model(batch_input)
@@ -562,8 +342,10 @@ def main():
     print(f"  Seeds: {TRAINING_SEEDS}")
     print()
 
-    train_tensors, eval_data, eval_tensors = load_data(
-        TRAIN_POSITIONS, EVAL_POSITIONS, min_depth=MIN_DEPTH, seed=SEED,
+    train_tensors, eval_data, eval_tensors = load_training_data(
+        n_train=TRAIN_POSITIONS, n_eval=EVAL_POSITIONS,
+        encoder_type="fused", min_depth=MIN_DEPTH, seed=SEED,
+        include_weights=True,
     )
 
     results = []

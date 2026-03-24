@@ -1,251 +1,208 @@
 # Current Architecture
 
-This document describes the architecture currently used in
-[`experiments/exp050_head_comparison.py`](/root/transform/experiments/exp050_head_comparison.py).
+This document describes the architecture used in the active experiment series
+(`exp067`–`exp069`) and shared via `data_loader.py` + `chess_model.py`.
 
-It is the "current working" model, not the target V1 design from
-[`ARCHITECTURE_V1.md`](/root/transform/ARCHITECTURE_V1.md).
+It supersedes the earlier exp050-era description.
+The aspirational V1 design is in [`ARCHITECTURE_V1.md`](ARCHITECTURE_V1.md).
 
 ## Overview
 
-Two policy-head variants share the same encoder and transformer body:
+A chess-native encoder–transformer with:
 
-- `FlatPolicyHead`
-- `SpatialPolicyHead`
+- **FusedBoardEncoder** (primary) or **LearnedBoardEncoder** (baseline comparison)
+- A learned **[CLS]** token prepended to the sequence
+- **SpatialPolicyHead** for move prediction
+- **WDL Value Head** (win/draw/loss) trained jointly
 
-Both output logits over the same fixed move vocabulary from
-[`move_vocab.py`](/root/transform/move_vocab.py), where `VOCAB_SIZE = 5504`.
+All output logits over the fixed 5 504-move vocabulary from
+[`move_vocab.py`](move_vocab.py).
 
 ## End-to-End Diagram
 
 ```text
-chess.Board
+chess.Board  (or board_array from cache)
    |
    v
-batch_boards_to_token_ids(...)
+Encoder input dict
+  FusedBoardEncoder:
+    fused_ids: (B, 64)   # 0–12: empty + 6 white + 6 black
+    turn:      (B,)
+    castling:  (B,)
+    ep_file:   (B,)
+  LearnedBoardEncoder (baseline):
+    piece_ids: (B, 64)
+    color_ids: (B, 64)
+    turn, castling, ep_file as above
    |
    v
-Token-ID dict
-  - piece_ids: (B, 64)
-  - color_ids: (B, 64)
-  - turn:      (B,)
-  - castling:  (B,)
-  - ep_file:   (B,)
-   |
-   v
-LearnedBoardEncoder(embed_dim=256)
-  - piece_embed
-  - color_proj
-  - square_embed
-  - turn/castling/ep embeddings
-  - LayerNorm
+Encoder  (embed_dim = 256)
    |
    v
 Tokens: (B, 67, 256)
-[turn] [castling] [ep] [sq0] ... [sq63]
+[turn] [castling] [ep] [sq0] … [sq63]
    |
    v
-Linear input projection
-256 -> 512
+Linear input projection  256 → 512
    |
    v
-+ learned positional embedding: (1, 67, 512)
+Prepend learned [CLS] token: (B, 68, 512)
+   |
+   v
++ learned positional embedding: (1, 68, 512)
    |
    v
 TransformerEncoder
-  - 8 layers
-  - 8 heads
-  - GELU
-  - dropout=0.1
-  - norm_first=True
+  8 layers · 8 heads · FFN 4× · GELU · dropout 0.1 · norm_first
    |
    v
-Hidden states: (B, 67, 512)
+LayerNorm → hidden states: (B, 68, 512)
    |
    +------------------------------+
    |                              |
    v                              v
-Policy head                       Value head
-(flat or spatial)                 token 0 -> MLP
-   |                              512 -> 256 -> 3
-   v
-Policy logits: (B, 5504)          Value logits: (B, 3)
+SpatialPolicyHead              Value Head
+  cls_hidden + sq tokens         cls_hidden → MLP
+   |                              512 → 256 → 3
+   v                              v
+Policy logits: (B, 5504)       Value logits: (B, 3)  [win/draw/loss]
    |
    v
-Mask illegal moves with legal_move_mask(board)
+Mask illegal moves (legal_move_mask)
    |
    v
-Softmax over legal moves
-   |
-   v
-Predicted best legal move
-```
-
-## Mermaid Diagram
-
-```mermaid
-flowchart TD
-    A[chess.Board] --> B[batch_boards_to_token_ids]
-    B --> C[Token dict<br/>piece_ids, color_ids, turn, castling, ep_file]
-    C --> D[LearnedBoardEncoder<br/>67 tokens x 256]
-    D --> E[Linear Projection<br/>256 to 512]
-    E --> F[Add Positional Embedding<br/>1 x 67 x 512]
-    F --> G[TransformerEncoder<br/>8 layers, 8 heads, GELU]
-    G --> H[LayerNorm]
-
-    H --> I[FlatPolicyHead]
-    H --> J[SpatialPolicyHead]
-    H --> K[Value Head]
-
-    I --> L[Policy logits<br/>B x 5504]
-    J --> L
-    K --> M[Value logits<br/>B x 3]
-
-    L --> N[Mask illegal moves]
-    N --> O[Softmax]
-    O --> P[Argmax legal move]
+Softmax → argmax → predicted best move
 ```
 
 ## Token Layout
 
-The current token order is:
-
 ```text
-[turn] [castling] [ep] [sq0] [sq1] ... [sq63]
+Position 0:  [CLS]      (learned, not tied to any board feature)
+Position 1:  [turn]
+Position 2:  [castling]
+Position 3:  [ep]
+Positions 4–67:  [sq0] … [sq63]
 ```
 
-Important detail:
+The **[CLS]** token at position 0 serves as the global readout for:
+- the value head
+- the global context inside `SpatialPolicyHead`
 
-- Token `0` is the `turn` token.
-- The current model uses token `0` as the global readout for:
-  - `FlatPolicyHead`
-  - `Value head`
-  - global context inside `SpatialPolicyHead`
+This replaces the earlier design where the turn token doubled as the
+global readout.
 
-So the model does not currently use a dedicated `[CLS]` token.
+## Encoder Variants
 
-## Shared Model Body
+### FusedBoardEncoder (primary)
 
-### LearnedBoardEncoder
-
-Input:
-
-- `piece_ids`: which piece is on each square
-- `color_ids`: empty / white / black
-- `turn`
-- `castling`
-- `ep_file`
-
-Per-square representation:
+Single embedding table of 13 tokens (empty + 6 white + 6 black pieces).
+Input `fused_ids` maps each square to one of these 13 values.
 
 ```text
-color_proj[color](piece_embed[piece]) + square_embed[square]
+fused_embed(fused_ids) + square_embed(0..63)
 ```
 
-Then 3 context tokens are prepended:
+Then 3 context tokens are prepended: turn, castling, ep.
 
-- `turn`
-- `castling`
-- `ep`
+Output: `(B, 67, 256)`
 
-Output:
+### LearnedBoardEncoder (baseline)
 
-- `(B, 67, 256)`
-
-### Transformer Body
-
-- Input projection: `256 -> 512`
-- Learnable positional embedding: `(1, 67, 512)`
-- `nn.TransformerEncoder`
-- `num_layers = 8`
-- `num_heads = 8`
-- `dropout = 0.1`
-- Feed-forward width: `4 * hidden_dim`
-
-Output:
-
-- hidden states `(B, 67, 512)`
-
-## Policy Head Variants
-
-### Variant A: FlatPolicyHead
-
-Reads only token `0`:
+Factored representation: separate `piece_embed` and per-color linear
+projections.
 
 ```text
-hidden[:, 0, :] -> Linear(512, 512) -> ReLU -> Linear(512, 5504)
+color_proj[color](piece_embed[piece]) + square_embed(0..63)
 ```
 
-Output:
+Same 3 context tokens prepended. Same output shape.
 
-- `policy_logits`: `(B, 5504)`
+## Transformer Body
 
-### Variant B: SpatialPolicyHead
+- Input projection: `256 → 512`
+- Learned [CLS] token prepended: sequence length 67 → 68
+- Learnable positional embedding: `(1, 68, 512)`
+- `nn.TransformerEncoder` with `norm_first=True`
+- 8 layers, 8 heads, FFN = 2048, dropout = 0.1
+- Final `LayerNorm`
+
+Output: `(B, 68, 512)`
+
+## SpatialPolicyHead
 
 Reads:
+- square tokens `hidden[:, 4:68, :]` (64 squares, after CLS + 3 context)
+- `cls_hidden = hidden[:, 0, :]` as global context
 
-- square tokens `hidden[:, 3:67, :]`
-- token `0` as global context
-
-For each move in the 5504-move vocabulary:
+For each of the 5 504 moves:
 
 ```text
-from_feat = from_proj(square_hidden[from_sq])
-to_feat = to_proj(square_hidden[to_sq])
-global_feat = global_proj(global_hidden)
-promo_feat = promo_embed(promo_type)
+from_feat = from_proj(sq[from_sq])
+to_feat   = to_proj(sq[to_sq])
+global    = global_proj(cls_hidden)
+promo     = promo_embed(promo_type)
 
-combined = from_feat * to_feat + global_feat + promo_feat
-logit = score_proj(ReLU(combined))
+combined = from_feat * to_feat + global + promo
+logit    = score_proj(ReLU(combined))
 ```
 
-Output:
-
-- `policy_logits`: `(B, 5504)`
+Output: `policy_logits (B, 5504)`
 
 ## Value Head
 
-The current experiment defines a value head even though the head-comparison
-training loop only optimizes policy loss.
-
-Current structure:
-
 ```text
-hidden[:, 0, :] -> Linear(512, 256) -> ReLU -> Linear(256, 3)
+cls_hidden → Linear(512, 256) → ReLU → Linear(256, 3)
 ```
 
-Output:
+Output: `value_logits (B, 3)` — win / draw / loss
 
-- `value_logits`: `(B, 3)` for win / draw / loss
-
-## Inference Path
-
-At inference time:
-
-1. Run a forward pass to get `policy_logits`
-2. Build a legal-move mask with `legal_move_mask(board)`
-3. Set illegal logits to `-inf`
-4. Apply softmax
-5. Take argmax
-
+Trained jointly with policy via:
 ```text
-policy_logits -> legal mask -> masked logits -> softmax -> best legal move
+loss = policy_CE + 0.5 * KL_div(log_softmax(value_logits), wdl_targets)
 ```
+
+## Training Setup (exp067–069 defaults)
+
+| Parameter | Value |
+|-----------|-------|
+| Train positions | 500 000 |
+| Eval positions | 2 500 |
+| Batch size | 256 |
+| Learning rate | 3e-4 |
+| Optimizer | AdamW (weight_decay=0.01) |
+| Schedule | Linear warmup 5% → cosine decay |
+| Precision | AMP float16 |
+| Seeds | 42, 123, 314 |
+| Min depth | 15 |
+
+## Data Pipeline
+
+Data loads instantly from a `.pt` cache built by `data_loader.py`:
+
+1. **Local cache** (`outputs/data_cache/*.pt`) — ~2s load
+2. **HF streaming** (`avewright/chess-positions-lichess-sf`) — fallback
+3. **Raw parquet** (Lichess/Stockfish 49.7M rows) — last resort
+
+The cache stores encoding-agnostic `board_array[64]` with values 0–12,
+plus metadata (turn, castling, ep_square, move_idx, cp, mate, depth, fen).
+Both fused and baseline tokenizations are derived at load time.
 
 ## Current Shapes Summary
 
 | Stage | Shape |
-|------|------|
-| token ids | dict of board features |
-| encoder output | `(B, 67, 256)` |
-| projected tokens | `(B, 67, 512)` |
-| transformer output | `(B, 67, 512)` |
-| policy logits | `(B, 5504)` |
-| value logits | `(B, 3)` |
+|-------|-------|
+| encoder input | dict of (B,64) + (B,) features |
+| encoder output | (B, 67, 256) |
+| + CLS + projection | (B, 68, 512) |
+| transformer output | (B, 68, 512) |
+| policy logits | (B, 5504) |
+| value logits | (B, 3) |
 
 ## Notes
 
-- Move legality is not built into the head; it is enforced after the head by masking.
-- The current model is encoder-only and chess-native.
-- The main comparison in `exp050` is not body vs body; it is head vs head on the same body.
+- Move legality is enforced by post-hoc masking, not built into the head.
+- The model is encoder-only and chess-native (no language backbone).
+- exp067 compares LearnedBoardEncoder vs FusedBoardEncoder.
+- exp068 tests relative geometry bias in attention.
+- exp069 tests confidence-weighted sampling vs uniform.
 - The current implementation uses the `turn` token as the de facto global token.
