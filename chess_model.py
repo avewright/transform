@@ -21,7 +21,9 @@ import torch.nn.functional as F
 from chess_features import (
     board_to_planes, batch_boards_to_planes, NUM_PLANES,
     board_to_token_ids, batch_boards_to_token_ids,
+    board_to_fused_token_ids, batch_boards_to_fused_token_ids,
     NUM_PIECE_TYPES, NUM_COLORS, NUM_CASTLING_STATES, NUM_EP_STATES,
+    NUM_FUSED_TOKENS,
 )
 from move_vocab import VOCAB_SIZE, legal_move_mask, move_to_index, index_to_move
 
@@ -176,6 +178,154 @@ class LearnedBoardEncoder(nn.Module):
     def prepare_batch(self, boards: list[chess.Board], device: torch.device):
         """Convert a list of boards to batched token IDs."""
         return batch_boards_to_token_ids(boards, device)
+
+
+class FusedBoardEncoder(nn.Module):
+    """Fused-token encoder: single embedding for 13 piece-color types.
+
+    Instead of separate piece_embed + color_proj, uses one embedding table
+    for all 13 tokens (empty + 6 white pieces + 6 black pieces).
+    This is simpler, has fewer params, and lets the model learn piece-color
+    interactions directly without the factored bottleneck.
+
+    Output shape: (batch, 67, embed_dim) — same as LearnedBoardEncoder.
+    """
+
+    NUM_CONTEXT = 3  # turn + castling + ep tokens
+
+    def __init__(self, embed_dim: int = 256):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_tokens = 64 + self.NUM_CONTEXT  # 67
+
+        # Single fused embedding: 13 piece-color types
+        self.piece_color_embed = nn.Embedding(NUM_FUSED_TOKENS, embed_dim)
+
+        # Square positional embeddings
+        self.square_embed = nn.Embedding(64, embed_dim)
+
+        # Context embeddings (same as LearnedBoardEncoder)
+        self.turn_embed = nn.Embedding(2, embed_dim)
+        self.castling_embed = nn.Embedding(NUM_CASTLING_STATES, embed_dim)
+        self.ep_embed = nn.Embedding(NUM_EP_STATES, embed_dim)
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, token_ids: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            token_ids: dict with
+                fused_ids (B,64),
+                turn (B,), castling (B,), ep_file (B,)
+        Returns:
+            (B, 67, embed_dim)
+        """
+        fused_ids = token_ids["fused_ids"]  # (B, 64)
+
+        # Look up fused piece-color embeddings
+        sq_emb = self.piece_color_embed(fused_ids)  # (B, 64, D)
+
+        # Add positional embeddings
+        sq_idx = torch.arange(64, device=fused_ids.device)
+        sq_emb = sq_emb + self.square_embed(sq_idx)
+
+        # Context tokens
+        turn_tok = self.turn_embed(token_ids["turn"]).unsqueeze(1)
+        castle_tok = self.castling_embed(token_ids["castling"]).unsqueeze(1)
+        ep_tok = self.ep_embed(token_ids["ep_file"]).unsqueeze(1)
+
+        tokens = torch.cat([turn_tok, castle_tok, ep_tok, sq_emb], dim=1)
+        return self.norm(tokens)
+
+    def prepare_input(self, board: chess.Board, device: torch.device):
+        return batch_boards_to_fused_token_ids([board], device)
+
+    def prepare_batch(self, boards: list[chess.Board], device: torch.device):
+        return batch_boards_to_fused_token_ids(boards, device)
+
+
+class ChessRelativeBias(nn.Module):
+    """Chess-aware relative geometry bias for attention.
+
+    For each pair of squares (i, j), computes a learned bias based on:
+      - rank distance (0..7, 8 buckets)
+      - file distance (0..7, 8 buckets)
+      - same diagonal (bool)
+      - same anti-diagonal (bool)
+      - knight-move relationship (bool)
+
+    The bias is per-head and added to attention logits before softmax.
+    Non-square tokens (CLS, turn, castling, ep) get separate learned biases.
+
+    seq_len = n_ctx + 64 where n_ctx = number of context tokens (CLS + turn + castling + ep = 4).
+    """
+
+    def __init__(self, num_heads: int, n_ctx: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.n_ctx = n_ctx
+        seq_len = n_ctx + 64
+
+        # Precompute distance features for 64×64 square pairs
+        rank_dist = torch.zeros(64, 64, dtype=torch.long)
+        file_dist = torch.zeros(64, 64, dtype=torch.long)
+        same_diag = torch.zeros(64, 64, dtype=torch.long)
+        same_anti = torch.zeros(64, 64, dtype=torch.long)
+        knight_rel = torch.zeros(64, 64, dtype=torch.long)
+
+        for i in range(64):
+            ri, fi = i // 8, i % 8
+            for j in range(64):
+                rj, fj = j // 8, j % 8
+                dr, df = abs(ri - rj), abs(fi - fj)
+                rank_dist[i, j] = dr
+                file_dist[i, j] = df
+                same_diag[i, j] = 1 if (ri - fi) == (rj - fj) else 0
+                same_anti[i, j] = 1 if (ri + fi) == (rj + fj) else 0
+                knight_rel[i, j] = 1 if (dr == 2 and df == 1) or (dr == 1 and df == 2) else 0
+
+        self.register_buffer("rank_dist", rank_dist)
+        self.register_buffer("file_dist", file_dist)
+        self.register_buffer("same_diag", same_diag)
+        self.register_buffer("same_anti", same_anti)
+        self.register_buffer("knight_rel", knight_rel)
+
+        # Learned bias tables (per head)
+        self.rank_bias = nn.Embedding(8, num_heads)   # |rank_i - rank_j| in 0..7
+        self.file_bias = nn.Embedding(8, num_heads)   # |file_i - file_j| in 0..7
+        self.diag_bias = nn.Parameter(torch.zeros(num_heads))
+        self.anti_bias = nn.Parameter(torch.zeros(num_heads))
+        self.knight_bias = nn.Parameter(torch.zeros(num_heads))
+
+        # Context token biases: ctx↔ctx and ctx↔sq interactions
+        self.ctx_ctx_bias = nn.Parameter(torch.zeros(num_heads, n_ctx, n_ctx))
+        self.ctx_sq_bias = nn.Parameter(torch.zeros(num_heads, n_ctx))  # broadcast over 64 sq
+        self.sq_ctx_bias = nn.Parameter(torch.zeros(num_heads, n_ctx))
+
+    def forward(self) -> torch.Tensor:
+        """Returns (num_heads, seq_len, seq_len) attention bias."""
+        seq_len = self.n_ctx + 64
+        bias = torch.zeros(self.num_heads, seq_len, seq_len,
+                           device=self.rank_dist.device)
+
+        # Square-square region: n_ctx..n_ctx+64
+        c = self.n_ctx
+        rb = self.rank_bias(self.rank_dist)  # (64, 64, H)
+        fb = self.file_bias(self.file_dist)  # (64, 64, H)
+        sq_bias = rb + fb  # (64, 64, H)
+        sq_bias = sq_bias + self.same_diag.unsqueeze(-1).float() * self.diag_bias
+        sq_bias = sq_bias + self.same_anti.unsqueeze(-1).float() * self.anti_bias
+        sq_bias = sq_bias + self.knight_rel.unsqueeze(-1).float() * self.knight_bias
+        bias[:, c:, c:] = sq_bias.permute(2, 0, 1)  # (H, 64, 64)
+
+        # Context-context
+        bias[:, :c, :c] = self.ctx_ctx_bias
+
+        # Context-square and square-context (broadcast)
+        bias[:, :c, c:] = self.ctx_sq_bias.unsqueeze(-1).expand(-1, -1, 64)
+        bias[:, c:, :c] = self.sq_ctx_bias.unsqueeze(-2).expand(-1, 64, -1)
+
+        return bias
 
 
 class ChessModel(nn.Module):

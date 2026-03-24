@@ -4,11 +4,11 @@ description: Always use these instructions
 
 # Chess-Transformer Agent Instructions
 
-This repository is for autonomous chess research around a pretrained language model adapted for chess through:
+This repository is for autonomous chess research around a chess-native transformer stack with strong data and evaluation discipline:
 
-- self-play evolutionary training
-- evaluation on legal move generation and move quality
-- applying attention to as many layers, features, qualities as possible. attention on attention on attention
+- supervised policy/value training on large Stockfish-labeled position sets
+- controlled architecture ablations (encoder, policy head, search-aware heads)
+- evaluation on move quality, gameplay, and search-time utility
 
 The agent should behave like an autonomous research loop operator, not a generic coding assistant.
 
@@ -16,12 +16,12 @@ The agent should behave like an autonomous research loop operator, not a generic
 
 1. Read [README.md](../../README.md) for the current workflow and CLI.
 2. Read [codex_ideas.md](../../codex_ideas.md) if it exists. Use it as the working log for research feedback, follow-up ideas, and notable observations.
-3. Inspect the main entry points before proposing changes:
-   - [train.py](../../train.py)
-   - [selfplay.py](../../selfplay.py)
-   - [evaluate.py](../../evaluate.py)
-   - [randopt.py](../../randopt.py)
-   - [config.py](../../config.py)
+3. Inspect the active experiment path before proposing changes:
+   - [experiments/](../../experiments/) (latest exp0xx scripts first)
+   - [hf_data.py](../../hf_data.py)
+   - [generate_data_cpu.py](../../generate_data_cpu.py)
+   - [relabel_deep.py](../../relabel_deep.py)
+   - [chess_model.py](../../chess_model.py)
 4. Check the current workspace state before editing:
    - existing outputs under `outputs/` if present
    - any local notes, logs, or experiment artifacts already created
@@ -37,15 +37,18 @@ LOOP FOREVER:
     - hypothesize changes that would improve performance:
         - how can the encoder learn and provide as much information and context without loss?
         - what model architecture/pipeline would enhance the chess model the most?
-        - what training structure would enhance the model the most? 
-        -  to do this, feel free to reference research (arXiv)
+        - what training structure would enhance the model the most?
+        - to do this, feel free to reference research (arXiv)
     - create an experiment file
-    - Make sure each experiment is quick, do not dig yourself into holes. Each experiment should take NO longer than 10 minutes.
+    - start with a cheap falsification run before large compute
     - with a standard metric, test your hypothesis.
-    - regardless of the result, log the reesult. Push all changes/edits/new files to remote repository via the github PAT in .env to avewright/transform
+    - regardless of the result, log the result with durable artifacts
     - Repeat
 
-The default research direction should favor self-play unless the task clearly calls for static evaluation or perturbation search.
+Default research direction should favor:
+1. data and supervision quality improvements
+2. controlled architecture ablations
+3. search-time evaluation only after policy prior quality improves
 
 ## Autonomous Research Loop
 
@@ -61,16 +64,32 @@ When asked to do research or iterate autonomously, follow this loop:
 
 Do not make multiple experimental changes at once unless the variables are tightly coupled.
 
+## Current Priority Order
+
+Use this order unless the user explicitly redirects:
+
+1. Data quality and labeling confidence:
+   - larger diverse generated sets
+   - deep relabel subsets
+   - confidence/margin metadata
+2. Controlled encoder/head ablations:
+   - baseline vs fused 12-piece tokenization
+   - relative geometry bias
+   - policy readout improvements
+3. Scale successful variants to larger data
+4. Search complexity and internal search heads after policy gains are proven
+
 ## Success Metrics
 
 Prefer metrics that reflect chess usefulness, not just code execution:
 
 - legal move rate
-- self-play win rate against previous checkpoints
-- win/draw/loss spread across colors
 - move accuracy on labeled positions
+- top-3 accuracy
+- mean SF rank of target move
+- phase-sliced accuracy (opening/middlegame/endgame)
+- gameplay score vs fixed Stockfish depths
 - robustness across seeds
-- reduction in illegal fallback behavior
 - evaluation throughput per unit compute
 
 If a new metric is introduced, document exactly how it is computed and where it is reported.
@@ -86,6 +105,8 @@ If a new metric is introduced, document exactly how it is computed and where it 
 4. Prefer additive changes over destructive rewrites.
 5. Do not claim improvement from anecdotal game samples alone.
 6. If an experiment changes training behavior, also verify evaluation still works.
+7. For architecture comparisons, keep data, steps, optimizer, and eval fixed.
+8. Treat <2pp top-1 gains as provisional unless replicated.
 
 ## Experiment Contract
 
@@ -114,16 +135,37 @@ If static-label metrics improve, verify whether that improvement survives search
 
 When estimating next steps, default to the cheapest experiment that can falsify the current hypothesis.
 
+For architecture ablations, include:
+
+- explicit baseline reference script/checkpoint
+- parameter count delta
+- throughput delta (samples/sec or epoch time)
+- exact variable under test
+
 ## Coding Expectations
 
 1. Keep changes aligned with the current repo structure.
 2. Prefer explicit configs over hard-coded constants.
 3. Add small, useful comments only where the logic is non-obvious.
 4. Avoid introducing new dependencies unless clearly justified.
-5. Preserve both major modes:
-   - `selfplay`
-   - `randopt`
-6. If changing CLI behavior in [train.py](../../train.py), update [README.md](../../README.md) too.
+5. Do not silently break existing experiment scripts.
+6. If changing data schema, provide backward-compatible reads or migration notes.
+7. If changing CLI behavior in [train.py](../../train.py), update [README.md](../../README.md) too.
+
+## Data Engineering Guidance
+
+Data quality is a primary research surface. Favor:
+
+- dedup by FEN and prevent split leakage
+- preserving `source`, `phase`, and provenance metadata
+- recording label confidence features (e.g., cp gap, shallow/deep agreement)
+- keeping top-k move distributions when available for soft-target training
+- writing manifests with generation settings, seed, depth, and counts
+
+When compute is limited, prefer:
+
+- broad shallow labeling for coverage
+- smaller deep-labeled subset for high-confidence supervision
 
 ## Self-Play Guidance
 
@@ -163,6 +205,12 @@ If compute, model weights, or dependencies block a run, state the blocker precis
 
 ## Useful Entry Points
 
+- [experiments/](../../experiments/): primary research scripts and latest results
+- [hf_data.py](../../hf_data.py): HF dataset loader
+- [generate_data_cpu.py](../../generate_data_cpu.py): bulk CPU Stockfish labeling
+- [relabel_deep.py](../../relabel_deep.py): deeper relabel pass for quality subset
+- [chess_model.py](../../chess_model.py): board encoder implementations
+- [move_vocab.py](../../move_vocab.py): move space and legality masks
 - [train.py](../../train.py): main CLI for `selfplay` and `randopt`
 - [selfplay.py](../../selfplay.py): game loop, match logic, evolutionary update
 - [evaluate.py](../../evaluate.py): model and ensemble evaluation
@@ -179,7 +227,7 @@ A change is good if it does at least one of the following:
 - improves a chess metric
 - improves experimental rigor
 - reduces compute waste
-- makes self-play or evaluation more reproducible
+- makes training/evaluation more reproducible
 - makes future research loops faster and safer
 
 A change is not good if it only adds complexity without improving measurement, training stability, or chess behavior.
