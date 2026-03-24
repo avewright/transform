@@ -1782,23 +1782,59 @@ KL-divergence loss instead of cross-entropy. Same 247.5K data as exp059.
 and better regularization (no overfitting). But the gain is small — data scaling
 remains the dominant lever. For exp062, sticking with hard targets for simplicity.
 
-### exp062: Massive data scaling (PLANNED)
+### exp062: Massive data scaling (RUNNING, 2026-03-24)
 
 **Hypothesis**: 700K+ combined data will significantly beat exp059 (247K → 47.2%).
 
-**Data**: 500K CPU-gen (SF d8) + 200K exp059 (SF d6) + 47.5K HF = ~750K (deduped)
-**Config**: 4 epochs (more data → fewer epochs needed), same Medium model (26M params)
+**Data**: 500K CPU-gen (SF d8) + 200K exp059 (SF d6) + 47.5K HF = 722,257 (deduped)
+**Config**: 4 epochs, same Medium model (26M params), hard cross-entropy targets
 **Target**: Beat exp031 old architecture ceiling (51.2%)
 
-### Updated roadmap (2026-03-23 evening):
+**Early results** (epoch 1 complete):
+- Ep1: 40.4% acc, 65.3% top-3, sf_rank=4.4 (3830s)
+- For context: exp059 ep1 was 34.6% on 247K → 3x data is already accelerating learning
 
-1. **exp061 RUNNING** — soft targets may give edge, results pending (~23:30 UTC)
-2. **CPU data gen RUNNING** — 500K positions (300K done, ~200K remaining)
-3. **exp062 READY** — code written, will run once GPU free + data gen done
-4. **Policy quality is king** — at 47.2% policy, argmax at d1 (31.2%) is already
-   strong. More data → better policy → better gameplay directly.
-5. **Search improvements on hold** — value reranking doesn't scale with policy
-   quality. Revisit search only if policy gains plateau.
-6. **The old 460K benchmark should fall** — ChessTransformerV2 at 247.5K already
-   matches exp024's 48.7%. At 700K+ it should significantly surpass 51.2%.
+### Strategic shift: Build neural prior, not deeper search (2026-03-24)
+
+Analysis of all experiments shows clearly:
+1. **Data scaling is the dominant lever**: 47.5K→247K→722K each gave 10+ pp gains
+2. **Search is bottlenecked by evaluation quality, not policy quality**:
+   - exp057 deep search: 2-ply hurts badly
+   - exp060 fix value: 85.6% WDL accuracy still didn't help reranking
+3. **Value head is misaligned with move selection** — good at coarse W/D/L
+   classification but bad at fine-grained "which of these 5 similar moves is better"
+
+**New strategy**: Build a much stronger neural prior, then use just enough search
+to cash it out. Specifically:
+
+1. **Stronger policy via data** — exp062 already running (722K) ✓
+2. **Search-policy training** — predict deeper SF's full move distribution,
+   not just best move. This makes top-k candidate sets actually searchable.
+3. **Fixed-node evaluation** — compare model at 0 nodes against SF at 100/1K/10K
+   nodes. This is the fair regime where a learned prior can shine.
+4. **Stop treating value classification as search objective** — shift to
+   move-ranking targets or deeper-engine move-quality targets.
+5. **Only revisit alpha-beta after policy improves** — current search ideas
+   (exp056, exp057) failed because the prior wasn't strong enough.
+
+**Target**: Beat node-limited Stockfish (SF at 100-1K nodes) with 0-node policy.
+
+### exp063: Search-policy with soft multi-PV at scale (PLANNED)
+
+**Hypothesis**: Soft targets at 722K scale will give both higher accuracy AND
+better distribution quality, creating a model that beats SF at low node counts.
+
+**Design**:
+- Same 722K data as exp062, but with KL-div soft targets from existing top-5 CP scores
+- Deep-labeled subset (10K at SF d12, 10 PVs) mixed in for higher-quality supervision
+- New fixed-node SF evaluation: model agreement with SF at 100/1K/10K/100K nodes
+- Will run after exp062 completes
+
+### Updated roadmap (2026-03-24):
+
+1. **exp062 RUNNING** — 722K hard targets, epoch 1 at 40.4%, 3 epochs remaining
+2. **Deep relabeling RUNNING** — 10K positions being relabeled at SF d12/10PVs on CPU
+3. **exp063 READY** — soft multi-PV at 722K scale + fixed-node evaluation
+4. **The goal is "beat shallow SF"** — not "beat Stockfish overall"
+5. **Data + supervision quality > search complexity** at this stage
 
