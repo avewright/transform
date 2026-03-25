@@ -202,7 +202,11 @@ def _build_from_parquet(n_total, min_depth, seed):
 # ── Build from HF streaming ──
 
 def _build_from_hf(n_total, seed):
-    """Build from HF streaming dataset."""
+    """Build from HF streaming dataset.
+
+    Handles both pre-encoded schema (board_array, move_idx, ...) and
+    the raw lichess-sf schema (fen, best_move, eval_type, eval_value, ...).
+    """
     try:
         from datasets import load_dataset
     except ImportError:
@@ -219,6 +223,11 @@ def _build_from_hf(n_total, seed):
 
     ds = ds.shuffle(seed=seed, buffer_size=10000)
 
+    # Peek at first row to detect schema
+    ds_iter = iter(ds)
+    first_row = next(ds_iter)
+    pre_encoded = "board_array" in first_row
+
     board_arrays = []
     turns = []
     castlings = []
@@ -229,18 +238,66 @@ def _build_from_hf(n_total, seed):
     depths = []
     fens = []
 
-    for row in ds:
+    import itertools
+    all_rows = itertools.chain([first_row], ds_iter)
+
+    for row in all_rows:
         if len(board_arrays) >= n_total:
             break
-        board_arrays.append(row["board_array"])
-        turns.append(row["turn"])
-        castlings.append(row["castling"])
-        ep_squares.append(row["ep_square"])
-        move_idxs.append(row["move_idx"])
-        cps.append(row["cp"])
-        mates.append(row["mate"])
-        depths.append(row["depth"])
-        fens.append(row["fen"])
+
+        if pre_encoded:
+            # Pre-encoded schema: fields are ready to use
+            board_arrays.append(row["board_array"])
+            turns.append(row["turn"])
+            castlings.append(row["castling"])
+            ep_squares.append(row["ep_square"])
+            move_idxs.append(row["move_idx"])
+            cps.append(row["cp"])
+            mates.append(row["mate"])
+            depths.append(row["depth"])
+            fens.append(row["fen"])
+        else:
+            # Raw lichess-sf schema: parse from fen/best_move/eval_*
+            try:
+                best_uci = row["best_move"]
+                if best_uci not in UCI_TO_IDX:
+                    continue
+
+                fen = row["fen"]
+                board = chess.Board(fen)
+                move = chess.Move.from_uci(best_uci)
+                if move not in board.legal_moves:
+                    continue
+
+                # Board array (encoding-agnostic)
+                arr = [0] * 64
+                for sq, piece in board.piece_map().items():
+                    arr[sq] = piece.piece_type if piece.color else piece.piece_type + 6
+                board_arrays.append(arr)
+
+                turns.append(0 if board.turn == chess.WHITE else 1)
+                castlings.append(
+                    (8 if board.has_kingside_castling_rights(chess.WHITE) else 0)
+                    | (4 if board.has_queenside_castling_rights(chess.WHITE) else 0)
+                    | (2 if board.has_kingside_castling_rights(chess.BLACK) else 0)
+                    | (1 if board.has_queenside_castling_rights(chess.BLACK) else 0)
+                )
+                ep_squares.append(board.ep_square if board.ep_square is not None else -1)
+                move_idxs.append(UCI_TO_IDX[best_uci])
+
+                eval_type = row.get("eval_type", "cp")
+                eval_value = int(row.get("eval_value", 0))
+                if eval_type == "mate":
+                    cps.append(0)
+                    mates.append(eval_value)
+                else:
+                    cps.append(eval_value)
+                    mates.append(0)
+
+                depths.append(int(row["depth"]))
+                fens.append(fen)
+            except Exception:
+                continue
 
         if len(board_arrays) % 100000 == 0:
             elapsed = time.time() - t0
