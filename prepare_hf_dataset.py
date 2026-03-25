@@ -542,20 +542,31 @@ def process_parquet_to_shards(
 
 
 def upload_shards_to_hf(shard_root: Path, repo_id: str, token: str, max_shard_size: str) -> None:
-    """Upload a local shard directory to Hugging Face."""
-    from datasets import load_dataset
+    """Upload a local shard directory to Hugging Face via direct Hub API.
 
-    train_files = sorted(str(p) for p in (shard_root / "train").glob("*.parquet"))
-    test_files = sorted(str(p) for p in (shard_root / "test").glob("*.parquet"))
+    Instead of materializing an Arrow dataset with ``load_dataset`` (which can
+    OOM or exhaust disk), this uploads the parquet shard files directly using
+    ``HfApi.create_commit`` with ``CommitOperationAdd``.
+    """
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    train_files = sorted((shard_root / "train").glob("*.parquet"))
+    test_files = sorted((shard_root / "test").glob("*.parquet"))
 
     if not train_files and not test_files:
         raise RuntimeError(f"No parquet shards found under {shard_root}")
 
-    data_files = {}
-    if train_files:
-        data_files["train"] = train_files
-    if test_files:
-        data_files["test"] = test_files
+    operations: list[CommitOperationAdd] = []
+    for i, f in enumerate(train_files):
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"data/train-{i:05d}.parquet",
+            path_or_fileobj=str(f),
+        ))
+    for i, f in enumerate(test_files):
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"data/test-{i:05d}.parquet",
+            path_or_fileobj=str(f),
+        ))
 
     _append_event(
         shard_root,
@@ -563,20 +574,20 @@ def upload_shards_to_hf(shard_root: Path, repo_id: str, token: str, max_shard_si
         repo_id=repo_id,
         train_files=len(train_files),
         test_files=len(test_files),
-        max_shard_size=max_shard_size,
     )
-    print(f"\nLoading local shards from {shard_root}...")
-    ds = load_dataset("parquet", data_files=data_files)
-    for split_name, split_ds in ds.items():
-        print(f"  {split_name}: {len(split_ds):,} rows")
+    print(f"\nUploading shards from {shard_root} to {repo_id}...")
+    print(f"  Train files: {len(train_files)}")
+    print(f"  Test files:  {len(test_files)}")
 
-    print(f"\nUploading to {repo_id}...")
     t0 = time.time()
-    ds.push_to_hub(
-        repo_id,
-        token=token,
-        max_shard_size=max_shard_size,
+    api = HfApi(token=token)
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True, token=token)
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        operations=operations,
         commit_message=f"Upload shard-first Lichess Stockfish conversion ({SOURCE_NAME})",
+        token=token,
     )
     print(f"  Uploaded in {time.time() - t0:.1f}s")
     print(f"  Dataset: https://huggingface.co/datasets/{repo_id}")
@@ -584,13 +595,14 @@ def upload_shards_to_hf(shard_root: Path, repo_id: str, token: str, max_shard_si
         shard_root,
         "upload_completed",
         repo_id=repo_id,
-        train_rows=len(ds["train"]) if "train" in ds else 0,
-        test_rows=len(ds["test"]) if "test" in ds else 0,
+        train_files=len(train_files),
+        test_files=len(test_files),
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare chess dataset for Hugging Face without OOMs")
+    parser.add_argument("--parquet-path", type=Path, default=None, help="Explicit parquet path to process")
     parser.add_argument("--max-rows", type=int, default=None, help="Max source rows to process")
     parser.add_argument("--min-depth", type=int, default=15, help="Minimum Stockfish depth")
     parser.add_argument("--repo-id", type=str, default=DEFAULT_REPO_ID, help="Hugging Face dataset repo ID")
@@ -611,12 +623,17 @@ def main():
 
     import glob as globmod
 
-    parquet_files = globmod.glob(str(Path(__file__).resolve().parent / PARQUET_GLOB))
-    if not parquet_files:
-        print("ERROR: No parquet file found. Run the dataset download first.")
-        sys.exit(1)
-
-    parquet_path = parquet_files[0]
+    if args.parquet_path is not None:
+        parquet_path = args.parquet_path
+        if not parquet_path.exists():
+            print(f"ERROR: parquet path does not exist: {parquet_path}")
+            sys.exit(1)
+    else:
+        parquet_files = globmod.glob(str(Path(__file__).resolve().parent / PARQUET_GLOB))
+        if not parquet_files:
+            print("ERROR: No parquet file found. Run the dataset download first.")
+            sys.exit(1)
+        parquet_path = Path(parquet_files[0])
 
     progress = _load_progress(args.shard_dir, args.repo_id, parquet_path, args)
     print(f"Progress manifest: {_manifest_path(args.shard_dir)}")

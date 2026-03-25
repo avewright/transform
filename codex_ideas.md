@@ -1903,3 +1903,50 @@ architecture is learning to use 1-ply lookahead purely from attention.
 - Consider extracting a shared `ablation_harness.py` from exp067 model/train/eval code once results are in
 - After 3-experiment results: decide which architecture choices graduate to a larger-data run
 
+---
+
+## Data Pipeline Status (2026-03-25)
+
+### `avewright/chess-positions-lichess-sf` — Lichess HF dataset generation
+
+**Pipeline**: `process_lichess_parquets.py` → `prepare_hf_dataset.py`
+**Source**: `Lichess/chess-position-evaluations` (17 source parquets)
+**Target**: `avewright/chess-positions-lichess-sf` on HuggingFace
+**Work root**: `/workspace/chess_hf_pipeline/`
+
+#### Upload architecture fix (2026-03-24)
+The original upload path used `load_dataset("parquet", data_files=...)` then `push_to_hub()`, which materialized the entire aggregate dataset as Arrow locally. With 2+ completed sources (~97M+ rows) this exhausted disk every time, causing repeating `DatasetGenerationError` / `OSError: No space left on device`. Fixed by replacing with `HfApi.create_commit()` + `CommitOperationAdd` — uploads parquet shard files directly, zero local Arrow materialization. Each source's shards are committed as `data/train-src{NNN}-{SSSSS}.parquet` / `data/test-src{NNN}-{SSSSS}.parquet`.
+
+#### Progress at pod shutdown (2026-03-25 ~01:35 UTC)
+| Source | Status | Valid Rows |
+|--------|--------|-----------|
+| 00000 | uploaded | 48,903,686 |
+| 00001 | uploaded | 48,695,978 |
+| 00002 | uploaded | 48,648,004 |
+| 00003 | uploaded | 48,623,920 |
+| 00004 | uploaded | 48,530,543 |
+| 00005 | uploaded | 48,641,704 |
+| 00006 | processing (checkpointed at 35M/~50M rows, batch 175, 131 train shards) | 34,256,595 so far |
+| 00007–00016 | not started | — |
+
+**Total uploaded**: 292,043,835 valid rows across 6/17 sources
+**Processing rate**: ~28k positions/sec
+**Estimated completion**: ~11 more sources × ~30min each ≈ ~5.5 hours remaining
+
+#### Resume instructions
+```bash
+# On new pod with /workspace mounted:
+cd /root/transform
+bash run_process_lichess_parquets_tmux.sh
+# Pipeline auto-resumes: source 6 continues from batch 175, sources 7-16 process fresh
+# Attach: tmux attach -t lichess_parquet_pipeline
+```
+
+#### Key invariants preserved
+- Per-source `progress.json` checkpoints → no reprocessing of completed work
+- Per-source upload (not aggregate) → no disk OOM during upload
+- One source parquet downloaded at a time → bounded disk usage
+- All temp/cache on `/workspace` → root overlay untouched
+- Deterministic train/test split by FEN hash → consistent across restarts
+- Append-only event logs at both orchestrator and per-source level
+
