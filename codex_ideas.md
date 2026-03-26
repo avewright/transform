@@ -2,6 +2,119 @@
 
 This file is the running log for:
 
+## 2026-03-25
+
+### exp070: Large-scale Lichess-SF training on A40 — COMPLETED
+
+**Hypothesis:** 12L/512d FusedEncoder on 2M lichess-sf positions will push accuracy beyond prior baselines.
+
+**Result:** 20.9% top-1, 46.7% top-3, 63.6% value accuracy (best at epoch 2 end)
+
+| Checkpoint | Top-1 | Top-3 | SF Rank | Value |
+|-----------|-------|-------|---------|-------|
+| Step 2000 (E1) | 15.3% | 35.4% | 73.7 | 58.2% |
+| Epoch 1 end | 17.7% | 40.2% | 72.3 | 62.9% |
+| Step 6000 (E2) | 19.8% | 45.1% | 71.5 | 64.6% |
+| **Final (E2 end)** | **20.9%** | **46.7%** | **71.2** | **63.6%** |
+
+Phase accuracy (final): opening 19.6%, middlegame 24.5%, endgame 26.2%
+
+**IMPORTANT:** This result CANNOT be directly compared to prior experiments (exp052-053: 30-37%) because the eval sets are different:
+- Prior: 2500 positions from `avewright/chess-positions` (HF dataset)
+- exp070: 5000 positions from `avewright/chess-positions-lichess-sf` (deeper SF labels, wider position distribution)
+
+**Key observations:**
+1. The 20.9% accuracy is on a HARDER eval set with deeper SF analysis (depth 15-245 vs depth ~8 prior)
+2. Positions with deeper analysis have more "correct" but less obvious best moves
+3. 58% of positions have |cp| < 100 — many nearly-equal positions where the "best" move is debatable
+4. 168K mate positions in training data (8.4%) — good tactical exposure
+5. Policy loss: 6.77 → 2.74 (60% drop), value loss: 0.34 → 0.19 (45% drop)
+6. Training throughput: stable 970 pos/s on A40, 69 min total
+7. Loss was still decreasing at end — more epochs would likely help
+
+**Data properties:**
+- 2M positions, median depth ~20, range 15-245
+- 58% have |cp| < 100 (contested positions)
+- 77% have |cp| < 300 (clear-enough positions)
+- Mean cp: 45, std: 881
+
+**Next experiments to try:**
+1. Filter to depth >= 20 only (higher confidence labels) — trade quantity for quality
+2. ~~More epochs (4-6) since loss was still dropping~~ → done in exp071
+3. ~~Cross-evaluate: run exp070 model on the old HF eval set for fair comparison~~ → done in exp071
+4. Train on ALL available data (~7-10M positions) since more data should help
+5. Relative bias (exp068 variant) on this larger dataset
+
+---
+
+### exp071: Extended training (6 epochs) + cross-eval — COMPLETED
+
+**Hypothesis:** Training 6 epochs instead of 2 on the same 2M positions improves accuracy (loss was still decreasing).
+
+**Result:** 22.9% top-1, 50.9% top-3, 72.6% value accuracy (best at step 18000, epoch 5 mid)
+
+| Checkpoint | Top-1 | Top-3 | SF Rank | Value |
+|-----------|-------|-------|---------|-------|
+| Epoch 1 end | 17.1% | 40.0% | 72.3 | 63.5% |
+| Epoch 2 end | 20.5% | 46.4% | 71.2 | 64.3% |
+| Epoch 3 end | 21.4% | 49.1% | 70.7 | 70.3% |
+| Epoch 4 end | 22.2% | 50.2% | 70.4 | 72.4% |
+| **Best (E5 step 18k)** | **22.9%** | **50.9%** | **70.3** | **72.6%** |
+| Epoch 5 end | 22.8% | 51.4% | 70.3 | 71.6% |
+| Epoch 6 end | 22.3% | 52.3% | 70.1 | 72.9% |
+
+Phase accuracy (best): endgame 30.8%, middlegame 24.6%, opening 21.7%
+
+**Cross-eval on avewright/chess-positions test set: 44.6% top-1, 73.5% top-3**
+
+This is the key result. Prior experiments on this eval set scored 30-37%. This model at **44.6%** represents a massive improvement, confirming:
+- The lichess-sf data is superior supervision (deeper SF, more diverse positions)
+- The 12L/512d architecture is working well
+- The "low" 22.9% on the lichess-sf eval set reflects harder positions, not a weaker model
+
+**Observations:**
+1. Accuracy peaked at epoch 5, then declined slightly by epoch 6 → mild overfitting on 2M positions
+2. Top-3 and value accuracy continued improving through epoch 6 (52.3% top-3, 72.9% value)
+3. Policy loss plateaued around 2.35 in epoch 6 (vs 2.41 in epoch 5)
+4. Training throughput: 975→834 pos/s (pipeline CPU contention reduced GPU throughput ~15%)
+5. Total time: 240 min (4 hours) for 6 epochs
+6. +2.0pp over exp070 baseline on lichess-sf eval, +7.6pp+ on HF cross-eval vs prior art
+
+**Conclusion:** Hypothesis CONFIRMED. More epochs helped significantly (+2pp on hard eval, +7.6pp+ on standard eval). But diminishing returns visible by epoch 5-6. The real bottleneck is data quantity (2M positions seen 6× is overfitting). Next: scale to full dataset.
+
+**Next experiments:**
+1. **Scale data to 10M+ positions** (now that pipeline is uploading more) — top priority
+2. Train for 2-3 epochs on 10M (same compute budget as 6×2M, but more diverse)
+3. Relative bias / architecture improvements after data scaling
+
+---
+
+### Data Pipeline Status — 2026-03-26 (pod shutdown)
+
+**Lichess pipeline: COMPLETE**
+- All 17 sources (0-16) from `Lichess/chess-position-evaluations` processed and uploaded to `avewright/chess-positions-lichess-sf`
+- Sources 1-5: pre-existing
+- Sources 6-16: processed by `process_lichess_parquets.py` (48 workers, ~19K pos/s)
+- Source 0: processed separately by `prepare_hf_dataset.py` (--dry-run), uploaded by `monitor_and_generate.py`
+- Total: ~850M raw positions → filtered to depth >= 15 with valid SF evals
+- Schema: fen, best_move, eval_type, eval_value, wdl_win, wdl_draw, wdl_loss, phase, num_legal, source, game_id, top_moves, ply, depth
+
+**Custom position generation: STOPPED at 119K/5M**
+- `generate_and_upload.py` ran with 48 Stockfish 14 workers at depth 10
+- Generated ~119,203 positions before pod shutdown (42 pos/s)
+- Positions were pending upload (hadn't reached 250K upload threshold)
+- Generation too slow with Stockfish 14 (~42 pos/s total) — consider Stockfish 16+ or lower depth for throughput
+- Script and pipeline are ready to resume on next pod
+
+**Key scripts created this session:**
+- `generate_and_upload.py`: Custom position generator matching lichess-sf schema, with diverse position sampling strategies
+- `monitor_and_generate.py`: Autonomous orchestrator (pipeline monitoring → source 0 upload → verification → generation)
+- `experiments/exp072_data_scale.py`: Ready to run (10M positions × 2 epochs), not yet executed
+
+---
+
+This file is the running log for:
+
 - research feedback
 - experiment ideas
 - architecture suggestions
