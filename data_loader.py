@@ -38,7 +38,7 @@ from chess_features import (
 from move_vocab import UCI_TO_IDX, IDX_TO_UCI
 
 CACHE_DIR = Path(__file__).resolve().parent / "outputs" / "data_cache"
-PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluations/snapshots/*/data/train-00000-of-00017.parquet"
+PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluations/snapshots/*/data/train-*-of-*.parquet"
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 
 
@@ -74,6 +74,43 @@ def ep_square_to_file(ep_squares):
     return result
 
 
+# ── Fast FEN parser (no chess.Board) ──
+
+PIECE_MAP = {
+    'P': 1, 'N': 2, 'B': 3, 'R': 4, 'Q': 5, 'K': 6,
+    'p': 7, 'n': 8, 'b': 9, 'r': 10, 'q': 11, 'k': 12,
+}
+CASTLING_MAP = {'K': 8, 'Q': 4, 'k': 2, 'q': 1}
+
+
+def _fast_parse_fen(fen_str, arr_out):
+    """Parse FEN string into board_array (written to arr_out[64]), turn, castling, ep_square.
+    Pure string parsing — no chess.Board(). ~10× faster."""
+    parts = fen_str.split(' ')
+    board_part = parts[0]
+    arr_out[:] = 0
+    rank = 7
+    file_idx = 0
+    for ch in board_part:
+        if ch == '/':
+            rank -= 1
+            file_idx = 0
+        elif '1' <= ch <= '8':
+            file_idx += int(ch)
+        else:
+            arr_out[rank * 8 + file_idx] = PIECE_MAP[ch]
+            file_idx += 1
+    turn = 0 if parts[1] == 'w' else 1
+    castling = 0
+    if parts[2] != '-':
+        for ch in parts[2]:
+            castling |= CASTLING_MAP.get(ch, 0)
+    ep = -1
+    if len(parts) > 3 and parts[3] != '-':
+        ep = (int(parts[3][1]) - 1) * 8 + (ord(parts[3][0]) - ord('a'))
+    return turn, castling, ep
+
+
 # ── Cache I/O ──
 
 def _cache_path(n_total, min_depth, seed):
@@ -102,16 +139,17 @@ def _build_from_parquet(n_total, min_depth, seed):
     import glob as globmod
     import pandas as pd
 
-    parquet_files = globmod.glob(str(Path(__file__).resolve().parent / PARQUET_GLOB))
+    parquet_files = sorted(globmod.glob(str(Path(__file__).resolve().parent / PARQUET_GLOB)))
     if not parquet_files:
         return None
 
-    parquet_path = parquet_files[0]
-    print(f"  Building cache from parquet: {Path(parquet_path).name}")
+    print(f"  Building cache from {len(parquet_files)} parquet shard(s)...")
     t0 = time.time()
 
-    df = pd.read_parquet(parquet_path, columns=["fen", "line", "depth", "cp", "mate"])
-    print(f"  Read {len(df):,} rows in {time.time()-t0:.1f}s")
+    dfs = [pd.read_parquet(p, columns=["fen", "line", "depth", "cp", "mate"]) for p in parquet_files]
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    print(f"  Read {len(df):,} rows from {len(parquet_files)} shards in {time.time()-t0:.1f}s")
 
     df = df[df["depth"].notna() & (df["depth"] >= min_depth)]
     df = df[df["line"].notna() & (df["line"].str.len() > 0)]
@@ -221,7 +259,7 @@ def _build_from_hf(n_total, seed):
         print(f"  HF dataset not available: {e}")
         return None
 
-    ds = ds.shuffle(seed=seed, buffer_size=10000)
+    ds = ds.shuffle(seed=seed, buffer_size=100000)
 
     # Peek at first row to detect schema
     ds_iter = iter(ds)
@@ -413,6 +451,7 @@ def load_training_data(
     # Build eval_data with Board objects (only for eval, small count)
     t0 = time.time()
     eval_data = []
+    eval_surviving = []  # track which indices successfully built
     eval_wdl = compute_wdl(raw["cp"][:n_eval_actual], raw["mate"][:n_eval_actual])
     eval_phases = compute_phase(eval_fens)
 
@@ -427,22 +466,24 @@ def load_training_data(
                 "wdl": (eval_wdl[i, 0].item(), eval_wdl[i, 1].item(), eval_wdl[i, 2].item()),
                 "phase": eval_phases[i],
             })
+            eval_surviving.append(i)
         except Exception:
             continue
     print(f"  Built {len(eval_data)} eval boards in {time.time()-t0:.1f}s")
 
-    # Build tensors from encoding-agnostic board_array
+    # Build tensors — use surviving indices to keep alignment
     t1 = time.time()
     train_ba = raw["board_array"][n_eval_actual:n_eval_actual + n_train_actual]
-    eval_ba = raw["board_array"][:len(eval_data)]
+    eval_idx = torch.tensor(eval_surviving, dtype=torch.long)
+    eval_ba = raw["board_array"][eval_idx]
 
     train_turn = raw["turn"][n_eval_actual:n_eval_actual + n_train_actual].long()
     train_castling = raw["castling"][n_eval_actual:n_eval_actual + n_train_actual].long()
     train_ep = ep_square_to_file(raw["ep_square"][n_eval_actual:n_eval_actual + n_train_actual].long())
 
-    eval_turn = raw["turn"][:len(eval_data)].long()
-    eval_castling = raw["castling"][:len(eval_data)].long()
-    eval_ep = ep_square_to_file(raw["ep_square"][:len(eval_data)].long())
+    eval_turn = raw["turn"][eval_idx].long()
+    eval_castling = raw["castling"][eval_idx].long()
+    eval_ep = ep_square_to_file(raw["ep_square"][eval_idx].long())
 
     train_tensors = {
         "turn": train_turn,
@@ -533,27 +574,507 @@ def get_eval_batch_input(eval_tensors, idx_slice, encoder_type, device):
     return result
 
 
+# ── Sharded data pipeline for mass training ──
+#
+# For datasets that don't fit comfortably as one .pt cache (>10M rows),
+# pretokenize parquet into compact shard files, then iterate with
+# ShardedChessLoader. Each shard is loaded one at a time — full dataset
+# never materialized in RAM.
+#
+# Usage:
+#   pretokenize_parquet_to_shards(parquet_files, shard_dir, n_eval=5000)
+#   eval_data, eval_tensors = build_eval_from_pretokenized(shard_dir / "eval.pt")
+#   loader = ShardedChessLoader(shard_dir, batch_size=256, device="cuda")
+#   for batch_input, move_targets, wdl_targets in loader:
+#       result = model(batch_input)
+
+
+def _flush_shard(output_dir, shard_idx, ba, turns, castlings,
+                 eps, midxs, cp_arr, mate_arr, depth_arr, n):
+    """Write a pretokenized shard to disk atomically (tmp + rename)."""
+    shard_path = output_dir / f"shard_{shard_idx:05d}.pt"
+    tmp_path = output_dir / f"shard_{shard_idx:05d}.pt.tmp"
+    torch.save({
+        "board_array": torch.from_numpy(ba[:n].copy()),
+        "turn": torch.from_numpy(turns[:n].copy()),
+        "castling": torch.from_numpy(castlings[:n].copy()),
+        "ep_square": torch.from_numpy(eps[:n].copy()),
+        "move_idx": torch.from_numpy(midxs[:n].copy()),
+        "cp": torch.from_numpy(cp_arr[:n].copy()),
+        "mate": torch.from_numpy(mate_arr[:n].copy()),
+        "depth": torch.from_numpy(depth_arr[:n].copy()),
+    }, tmp_path)
+    os.rename(tmp_path, shard_path)
+
+
+def _flush_eval(output_dir, eval_ba, eval_turns, eval_castlings,
+                eval_eps, eval_midxs, eval_cps, eval_mates, eval_fens, n):
+    """Write eval.pt to disk atomically."""
+    output_dir = Path(output_dir)
+    eval_path = output_dir / "eval.pt"
+    tmp_path = output_dir / "eval.pt.tmp"
+    torch.save({
+        "board_array": torch.from_numpy(eval_ba[:n].copy()),
+        "turn": torch.from_numpy(eval_turns[:n].copy()),
+        "castling": torch.from_numpy(eval_castlings[:n].copy()),
+        "ep_square": torch.from_numpy(eval_eps[:n].copy()),
+        "move_idx": torch.from_numpy(eval_midxs[:n].copy()),
+        "cp": torch.from_numpy(eval_cps[:n].copy()),
+        "mate": torch.from_numpy(eval_mates[:n].copy()),
+        "fen": eval_fens[:n],
+    }, tmp_path)
+    os.rename(tmp_path, eval_path)
+    print(f"  Eval: {n:,} positions saved to {eval_path.name}")
+
+
+def pretokenize_parquet_to_shards(parquet_files, output_dir, n_eval=5000,
+                                   rows_per_shard=3_000_000):
+    """Convert parquet files to compact pretokenized .pt shard files.
+
+    Handles both avewright/chess-positions-lichess-sf schema
+    (fen, best_move, eval_type, eval_value) and original Lichess schema
+    (fen, line, cp, mate, depth).
+
+    First n_eval valid rows are saved to eval.pt with FEN strings.
+    Remaining rows are split into shard_XXXXX.pt files.
+
+    Returns:
+        (n_shards, total_train_positions)
+    """
+    import pyarrow.parquet as pq
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    arr_buf = np.zeros(64, dtype=np.int8)
+    shard_idx = 0
+
+    # Preallocate accumulator arrays
+    ba = np.zeros((rows_per_shard, 64), dtype=np.int8)
+    turns_a = np.zeros(rows_per_shard, dtype=np.int8)
+    castlings_a = np.zeros(rows_per_shard, dtype=np.int8)
+    eps_a = np.zeros(rows_per_shard, dtype=np.int8)
+    midxs_a = np.zeros(rows_per_shard, dtype=np.int32)
+    cp_a = np.zeros(rows_per_shard, dtype=np.int32)
+    mate_a = np.zeros(rows_per_shard, dtype=np.int32)
+    depth_a = np.zeros(rows_per_shard, dtype=np.int16)
+    pos = 0
+
+    # Eval accumulators
+    eval_fens = []
+    eval_ba = np.zeros((n_eval, 64), dtype=np.int8)
+    eval_turns = np.zeros(n_eval, dtype=np.int8)
+    eval_castlings = np.zeros(n_eval, dtype=np.int8)
+    eval_eps = np.zeros(n_eval, dtype=np.int8)
+    eval_midxs = np.zeros(n_eval, dtype=np.int32)
+    eval_cps = np.zeros(n_eval, dtype=np.int32)
+    eval_mates = np.zeros(n_eval, dtype=np.int32)
+    eval_pos = 0
+
+    total_written = 0
+    total_skipped = 0
+    eval_written = False
+    t0 = time.time()
+
+    for pq_path in parquet_files:
+        pq_path = Path(pq_path)
+        print(f"  Reading {pq_path.name}...", flush=True)
+
+        table = pq.read_table(pq_path)
+        col_names = set(table.column_names)
+        is_lichess_sf = "best_move" in col_names
+
+        fen_col = table.column("fen").to_pylist()
+        n_rows = len(fen_col)
+
+        if is_lichess_sf:
+            move_col = table.column("best_move").to_pylist()
+            et_col = table.column("eval_type").to_pylist() if "eval_type" in col_names else None
+            ev_col = table.column("eval_value").to_pylist() if "eval_value" in col_names else None
+            depth_col = table.column("depth").to_pylist() if "depth" in col_names else None
+        else:
+            line_col = table.column("line").to_pylist()
+            cp_col = table.column("cp").to_pylist() if "cp" in col_names else None
+            mate_col_data = table.column("mate").to_pylist() if "mate" in col_names else None
+            depth_col = table.column("depth").to_pylist() if "depth" in col_names else None
+
+        del table
+        gc.collect()
+
+        for i in range(n_rows):
+            if is_lichess_sf:
+                best_uci = move_col[i]
+            else:
+                line = line_col[i]
+                if not line:
+                    total_skipped += 1
+                    continue
+                best_uci = line.split()[0]
+
+            if best_uci not in UCI_TO_IDX:
+                total_skipped += 1
+                continue
+
+            fen = fen_col[i]
+            try:
+                turn, castling, ep = _fast_parse_fen(fen, arr_buf)
+            except Exception:
+                total_skipped += 1
+                continue
+
+            if is_lichess_sf:
+                et = et_col[i] if et_col else "cp"
+                ev = int(ev_col[i]) if ev_col and ev_col[i] is not None else 0
+                cp_val = 0 if et == "mate" else ev
+                mate_val = ev if et == "mate" else 0
+            else:
+                cp_val = int(cp_col[i]) if cp_col and cp_col[i] is not None else 0
+                mate_val = int(mate_col_data[i]) if mate_col_data and mate_col_data[i] is not None else 0
+
+            depth_val = int(depth_col[i]) if depth_col and depth_col[i] is not None else 0
+
+            # Fill eval first
+            if eval_pos < n_eval:
+                eval_fens.append(fen)
+                eval_ba[eval_pos] = arr_buf
+                eval_turns[eval_pos] = turn
+                eval_castlings[eval_pos] = castling
+                eval_eps[eval_pos] = ep
+                eval_midxs[eval_pos] = UCI_TO_IDX[best_uci]
+                eval_cps[eval_pos] = cp_val
+                eval_mates[eval_pos] = mate_val
+                eval_pos += 1
+                # Write eval.pt as soon as we have enough (enables concurrent training)
+                if eval_pos >= n_eval and not eval_written:
+                    _flush_eval(output_dir, eval_ba, eval_turns, eval_castlings,
+                               eval_eps, eval_midxs, eval_cps, eval_mates,
+                               eval_fens, eval_pos)
+                    eval_written = True
+                continue
+
+            # Training row
+            ba[pos] = arr_buf
+            turns_a[pos] = turn
+            castlings_a[pos] = castling
+            eps_a[pos] = ep
+            midxs_a[pos] = UCI_TO_IDX[best_uci]
+            cp_a[pos] = cp_val
+            mate_a[pos] = mate_val
+            depth_a[pos] = depth_val
+            pos += 1
+
+            if pos >= rows_per_shard:
+                _flush_shard(output_dir, shard_idx, ba, turns_a, castlings_a,
+                            eps_a, midxs_a, cp_a, mate_a, depth_a, pos)
+                total_written += pos
+                shard_idx += 1
+                pos = 0
+                elapsed = time.time() - t0
+                print(f"    Shard {shard_idx-1}: {total_written:,} total "
+                      f"({total_written/elapsed:,.0f} pos/s)", flush=True)
+
+        # Free column lists
+        del fen_col
+        if is_lichess_sf:
+            del move_col
+        gc.collect()
+
+    # Flush remaining
+    if pos > 0:
+        _flush_shard(output_dir, shard_idx, ba, turns_a, castlings_a,
+                    eps_a, midxs_a, cp_a, mate_a, depth_a, pos)
+        total_written += pos
+        shard_idx += 1
+
+    # Write eval shard if not already written (small datasets or early exit)
+    if not eval_written:
+        _flush_eval(output_dir, eval_ba, eval_turns, eval_castlings,
+                   eval_eps, eval_midxs, eval_cps, eval_mates,
+                   eval_fens, eval_pos)
+
+    elapsed = time.time() - t0
+    print(f"  Pretokenized {total_written:,} train + {n_ev:,} eval "
+          f"into {shard_idx} shards in {elapsed:.0f}s "
+          f"({(total_written + n_ev)/elapsed:,.0f} pos/s, "
+          f"skipped={total_skipped:,})")
+
+    return shard_idx, total_written
+
+
+def build_eval_from_pretokenized(eval_path, encoder_type="fused"):
+    """Build eval_data and eval_tensors from pretokenized eval.pt file.
+
+    Returns:
+        eval_data: list of dicts with "board", "move", "wdl", "phase"
+        eval_tensors: dict of tensors for fast eval batching
+    """
+    print(f"  Loading eval data from {eval_path}...")
+    raw = torch.load(eval_path, map_location="cpu", weights_only=False)
+
+    n = raw["board_array"].shape[0]
+    fens = raw["fen"]
+    move_idxs = raw["move_idx"]
+    wdl = compute_wdl(raw["cp"], raw["mate"])
+    phases = compute_phase(fens)
+
+    eval_data = []
+    surviving = []
+    for i in range(n):
+        try:
+            board = chess.Board(fens[i])
+            uci = IDX_TO_UCI[move_idxs[i].item()]
+            move = chess.Move.from_uci(uci)
+            eval_data.append({
+                "board": board,
+                "move": move,
+                "wdl": (wdl[i, 0].item(), wdl[i, 1].item(), wdl[i, 2].item()),
+                "phase": phases[i],
+            })
+            surviving.append(i)
+        except Exception:
+            continue
+
+    idx = torch.tensor(surviving, dtype=torch.long)
+    eval_ba = raw["board_array"][idx]
+
+    eval_tensors = {
+        "turn": raw["turn"][idx].long(),
+        "castling": raw["castling"][idx].long(),
+        "ep_file": ep_square_to_file(raw["ep_square"][idx].long()),
+    }
+
+    if encoder_type in ("fused", "both"):
+        eval_tensors["fused_ids"] = board_array_to_fused(eval_ba)
+    if encoder_type in ("baseline", "both"):
+        p, c = board_array_to_baseline(eval_ba)
+        eval_tensors["baseline_piece_ids"] = p
+        eval_tensors["baseline_color_ids"] = c
+
+    print(f"  Eval: {len(eval_data)} positions ready")
+    return eval_data, eval_tensors
+
+
+class ShardedChessLoader:
+    """Streaming minibatch loader over pretokenized shard files.
+
+    Reads one shard at a time, shuffles within shard, yields minibatches.
+    Shard order reshuffled each epoch. Never materializes full dataset.
+
+    Supports concurrent pretokenization: if expected_shards is set, the loader
+    will wait for shard files to appear on disk before loading them.
+
+    Yields (batch_input, move_targets, wdl_targets) tuples where:
+      - batch_input: dict ready for model forward (fused_ids, turn, castling, ep_file)
+      - move_targets: (B,) long tensor
+      - wdl_targets: (B, 3) float tensor
+    """
+
+    def __init__(self, shard_dir, batch_size, encoder_type="fused",
+                 device="cpu", seed=42, drop_last=True, skip_positions=0,
+                 expected_shards=None):
+        self.shard_dir = Path(shard_dir)
+        self.batch_size = batch_size
+        self.encoder_type = encoder_type
+        self.device = device
+        self.seed = seed
+        self.drop_last = drop_last
+        self.skip_positions = skip_positions
+        self.epoch = 0
+        self.expected_shards = expected_shards
+
+        if expected_shards is not None:
+            # Dynamic mode: wait for first shard, scan sizes lazily
+            self._wait_for_shard(0)
+            self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+        else:
+            self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+        if not self.shard_files and expected_shards is None:
+            raise FileNotFoundError(f"No shard_*.pt in {shard_dir}")
+
+        # Count rows per shard (only for already-existing shards)
+        self._shard_sizes = []
+        self._total = 0
+        for sf in self.shard_files:
+            data = torch.load(sf, map_location="cpu", weights_only=True)
+            n = data["board_array"].shape[0]
+            self._shard_sizes.append(n)
+            self._total += n
+            del data
+
+        print(f"  ShardedChessLoader: {len(self.shard_files)} shards ready, "
+              f"{self._total:,} positions, batch={batch_size}"
+              f"{f', expecting {expected_shards} total' if expected_shards else ''}")
+
+    def _wait_for_shard(self, shard_idx, timeout=600):
+        """Block until shard file appears on disk (atomic rename ensures completeness)."""
+        shard_path = self.shard_dir / f"shard_{shard_idx:05d}.pt"
+        if shard_path.exists():
+            return shard_path
+        t0 = time.time()
+        while not shard_path.exists():
+            if time.time() - t0 > timeout:
+                raise TimeoutError(f"Shard {shard_idx} not ready after {timeout}s")
+            time.sleep(0.5)
+        return shard_path
+
+    @property
+    def total_positions(self):
+        return self._total
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        # In dynamic mode, this is an approximation until all shards are loaded
+        effective = self._total - self.skip_positions
+        if self.drop_last:
+            return effective // self.batch_size
+        return math.ceil(effective / self.batch_size)
+
+    def update_total(self):
+        """Refresh total_positions from shard sizes (call after all shards ready)."""
+        self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+        # Scan any new shards not yet counted
+        for i in range(len(self._shard_sizes), len(self.shard_files)):
+            data = torch.load(self.shard_files[i], map_location="cpu", weights_only=True)
+            self._shard_sizes.append(data["board_array"].shape[0])
+            self._total += data["board_array"].shape[0]
+            del data
+
+    def __iter__(self):
+        rng = torch.Generator().manual_seed(self.seed + self.epoch * 7919)
+
+        if self.expected_shards is not None:
+            # Dynamic mode: iterate sequentially, waiting for each shard
+            n_shards = self.expected_shards
+            shard_order = list(range(n_shards))
+        else:
+            n_shards = len(self.shard_files)
+            shard_perm = torch.randperm(n_shards, generator=rng)
+            shard_order = shard_perm.tolist()
+
+        skip_remaining = self.skip_positions
+
+        for si in shard_order:
+            # In dynamic mode, wait for shard and register if new
+            if self.expected_shards is not None:
+                shard_path = self._wait_for_shard(si)
+                if si >= len(self.shard_files):
+                    self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+                if si >= len(self._shard_sizes):
+                    data = torch.load(shard_path, map_location="cpu", weights_only=True)
+                    n = data["board_array"].shape[0]
+                    self._shard_sizes.append(n)
+                    self._total += n
+                    del data
+
+            shard_size = self._shard_sizes[si]
+
+            # Skip entire shards for resume
+            if skip_remaining >= shard_size:
+                skip_remaining -= shard_size
+                continue
+
+            shard = torch.load(self.shard_files[si], map_location="cpu",
+                              weights_only=True)
+            n = shard["board_array"].shape[0]
+
+            # Precompute derived fields for full shard
+            fused = board_array_to_fused(shard["board_array"])
+            turn = shard["turn"].long()
+            castling_t = shard["castling"].long()
+            ep_file = ep_square_to_file(shard["ep_square"].long())
+            move_idx = shard["move_idx"].long()
+            wdl = compute_wdl(shard["cp"], shard["mate"])
+            del shard
+
+            # Shuffle within shard
+            row_rng = torch.Generator().manual_seed(
+                self.seed + self.epoch * 7919 + si * 31)
+            perm = torch.randperm(n, generator=row_rng)
+
+            # Skip batches within this shard for resume
+            start_offset = 0
+            if skip_remaining > 0:
+                skip_batches = skip_remaining // self.batch_size
+                start_offset = skip_batches * self.batch_size
+                skip_remaining = 0
+
+            for start in range(start_offset, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                if self.drop_last and (end - start) < self.batch_size:
+                    break
+
+                idx = perm[start:end]
+
+                batch_input = {
+                    "turn": turn[idx].to(self.device),
+                    "castling": castling_t[idx].to(self.device),
+                    "ep_file": ep_file[idx].to(self.device),
+                }
+                if self.encoder_type in ("fused", "both"):
+                    batch_input["fused_ids"] = fused[idx].to(self.device)
+                if self.encoder_type in ("baseline", "both"):
+                    pass  # extend when needed
+
+                yield (batch_input,
+                       move_idx[idx].to(self.device),
+                       wdl[idx].float().to(self.device))
+
+            del fused, turn, castling_t, ep_file, move_idx, wdl
+
+
 # ── CLI: Build cache manually ──
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Build data cache")
-    parser.add_argument("--n-total", type=int, default=502500,
+    parser = argparse.ArgumentParser(description="Build data cache or pretokenize")
+    sub = parser.add_subparsers(dest="command")
+
+    # Legacy cache builder
+    cache_p = sub.add_parser("cache", help="Build .pt cache (legacy sampler)")
+    cache_p.add_argument("--n-total", type=int, default=502500,
                         help="Total positions (train+eval)")
-    parser.add_argument("--min-depth", type=int, default=15)
-    parser.add_argument("--seed", type=int, default=42)
+    cache_p.add_argument("--min-depth", type=int, default=15)
+    cache_p.add_argument("--seed", type=int, default=42)
+
+    # Pretokenize parquet shards
+    pre_p = sub.add_parser("pretokenize", help="Pretokenize parquet shards")
+    pre_p.add_argument("parquet_dir", help="Directory containing parquet files")
+    pre_p.add_argument("output_dir", help="Output directory for shard .pt files")
+    pre_p.add_argument("--n-eval", type=int, default=5000)
+    pre_p.add_argument("--rows-per-shard", type=int, default=3_000_000)
+    pre_p.add_argument("--glob", default="train-*-of-*.parquet",
+                       help="Glob pattern for parquet files within parquet_dir")
+
     args = parser.parse_args()
 
-    cache_path = _cache_path(args.n_total, args.min_depth, args.seed)
-    if cache_path.exists():
-        print(f"Cache already exists: {cache_path}")
-        data = _load_cache(cache_path)
-        print(f"  {data['board_array'].shape[0]:,} positions")
-    else:
-        print("Building cache from parquet...")
-        data = _build_from_parquet(args.n_total, args.min_depth, args.seed)
-        if data:
-            _save_cache(cache_path, data)
-            print(f"  {data['board_array'].shape[0]:,} positions cached")
+    if args.command == "pretokenize":
+        import glob as globmod
+        parquet_files = sorted(globmod.glob(str(Path(args.parquet_dir) / args.glob)))
+        if not parquet_files:
+            print(f"ERROR: No files matching {args.glob} in {args.parquet_dir}")
         else:
-            print("ERROR: No parquet file found")
+            print(f"Found {len(parquet_files)} parquet files")
+            pretokenize_parquet_to_shards(
+                parquet_files, args.output_dir,
+                n_eval=args.n_eval, rows_per_shard=args.rows_per_shard,
+            )
+    else:
+        # Default/cache command
+        n_total = getattr(args, 'n_total', 502500)
+        min_depth = getattr(args, 'min_depth', 15)
+        seed = getattr(args, 'seed', 42)
+        cache_path = _cache_path(n_total, min_depth, seed)
+        if cache_path.exists():
+            print(f"Cache already exists: {cache_path}")
+            data = _load_cache(cache_path)
+            print(f"  {data['board_array'].shape[0]:,} positions")
+        else:
+            print("Building cache from parquet...")
+            data = _build_from_parquet(n_total, min_depth, seed)
+            if data:
+                _save_cache(cache_path, data)
+                print(f"  {data['board_array'].shape[0]:,} positions cached")
+            else:
+                print("ERROR: No parquet file found")
