@@ -42,6 +42,73 @@ PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluati
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 
 
+def _maybe_load_hf_token_from_env():
+    """Populate HF_TOKEN from a local .env file if the process does not have it."""
+    if os.environ.get("HF_TOKEN"):
+        return
+
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() != "HF_TOKEN":
+                continue
+            value = value.strip().strip("'").strip('"')
+            if value:
+                os.environ["HF_TOKEN"] = value
+                return
+    except OSError:
+        return
+
+
+def _hf_token():
+    _maybe_load_hf_token_from_env()
+    return os.environ.get("HF_TOKEN")
+
+
+def get_hf_dataset_layout(repo_id):
+    """Return a canonical view of the parquet layout for a HF dataset repo."""
+    from huggingface_hub import HfApi, list_repo_files
+
+    token = _hf_token()
+    api = HfApi(token=token)
+    info = api.dataset_info(repo_id)
+    files = list_repo_files(repo_id, repo_type="dataset", token=token)
+
+    train_main = sorted([
+        f for f in files
+        if f.startswith("data/train-") and "of-" in f and f.endswith(".parquet")
+    ])
+    train_src = sorted([
+        f for f in files
+        if f.startswith("data/train-src") and f.endswith(".parquet")
+    ])
+    test_main = sorted([
+        f for f in files
+        if f.startswith("data/test-") and "of-" in f and f.endswith(".parquet")
+    ])
+    test_src = sorted([
+        f for f in files
+        if f.startswith("data/test-src") and f.endswith(".parquet")
+    ])
+
+    return {
+        "repo_id": repo_id,
+        "revision": info.sha,
+        "train_main": train_main,
+        "train_src": train_src,
+        "test_main": test_main,
+        "test_src": test_src,
+        "all_files": files,
+    }
+
+
 # ── Encoding-agnostic → specific encoder tensors ──
 
 def board_array_to_fused(board_array):
@@ -793,9 +860,9 @@ def pretokenize_parquet_to_shards(parquet_files, output_dir, n_eval=5000,
                    eval_fens, eval_pos)
 
     elapsed = time.time() - t0
-    print(f"  Pretokenized {total_written:,} train + {n_ev:,} eval "
+    print(f"  Pretokenized {total_written:,} train + {eval_pos:,} eval "
           f"into {shard_idx} shards in {elapsed:.0f}s "
-          f"({(total_written + n_ev)/elapsed:,.0f} pos/s, "
+          f"({(total_written + eval_pos)/elapsed:,.0f} pos/s, "
           f"skipped={total_skipped:,})")
 
     return shard_idx, total_written
@@ -854,6 +921,471 @@ def build_eval_from_pretokenized(eval_path, encoder_type="fused"):
     return eval_data, eval_tensors
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Streaming HF loader — streams parquets one at a time from HuggingFace
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _tokenize_parquet(pq_path):
+    """Read a single parquet file → dict of numpy arrays ready for tensor conversion.
+
+    Returns dict with keys: board_array, turn, castling, ep_square, move_idx, cp, mate
+    or None if the file has no valid rows.
+    """
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(pq_path)
+    col_names = set(table.column_names)
+    is_lichess_sf = "best_move" in col_names
+
+    fen_col = table.column("fen").to_pylist()
+    n_rows = len(fen_col)
+
+    if is_lichess_sf:
+        move_col = table.column("best_move").to_pylist()
+        et_col = table.column("eval_type").to_pylist() if "eval_type" in col_names else None
+        ev_col = table.column("eval_value").to_pylist() if "eval_value" in col_names else None
+    else:
+        line_col = table.column("line").to_pylist()
+        cp_col = table.column("cp").to_pylist() if "cp" in col_names else None
+        mate_col_data = table.column("mate").to_pylist() if "mate" in col_names else None
+
+    del table
+
+    # Preallocate
+    ba = np.zeros((n_rows, 64), dtype=np.int8)
+    turns = np.zeros(n_rows, dtype=np.int8)
+    castlings = np.zeros(n_rows, dtype=np.int8)
+    eps = np.zeros(n_rows, dtype=np.int8)
+    midxs = np.zeros(n_rows, dtype=np.int32)
+    cps = np.zeros(n_rows, dtype=np.int32)
+    mates = np.zeros(n_rows, dtype=np.int32)
+    arr_buf = np.zeros(64, dtype=np.int8)
+
+    pos = 0
+    for i in range(n_rows):
+        if is_lichess_sf:
+            best_uci = move_col[i]
+        else:
+            line = line_col[i]
+            if not line:
+                continue
+            best_uci = line.split()[0]
+
+        if best_uci not in UCI_TO_IDX:
+            continue
+
+        try:
+            turn, castling, ep = _fast_parse_fen(fen_col[i], arr_buf)
+        except Exception:
+            continue
+
+        if is_lichess_sf:
+            et = et_col[i] if et_col else "cp"
+            ev = int(ev_col[i]) if ev_col and ev_col[i] is not None else 0
+            cp_val = 0 if et == "mate" else ev
+            mate_val = ev if et == "mate" else 0
+        else:
+            cp_val = int(cp_col[i]) if cp_col and cp_col[i] is not None else 0
+            mate_val = int(mate_col_data[i]) if mate_col_data and mate_col_data[i] is not None else 0
+
+        ba[pos] = arr_buf
+        turns[pos] = turn
+        castlings[pos] = castling
+        eps[pos] = ep
+        midxs[pos] = UCI_TO_IDX[best_uci]
+        cps[pos] = cp_val
+        mates[pos] = mate_val
+        pos += 1
+
+    if pos == 0:
+        return None
+
+    return {
+        "board_array": ba[:pos],
+        "turn": turns[:pos],
+        "castling": castlings[:pos],
+        "ep_square": eps[:pos],
+        "move_idx": midxs[:pos],
+        "cp": cps[:pos],
+        "mate": mates[:pos],
+    }
+
+
+def build_eval_from_hf(repo_id, n_eval=5000, encoder_type="fused"):
+    """Download the test split from HF and build eval_data + eval_tensors.
+
+    Falls back to first train parquet if no test split exists.
+    """
+    from huggingface_hub import hf_hub_download
+
+    layout = get_hf_dataset_layout(repo_id)
+    token = _hf_token()
+
+    if layout["test_main"]:
+        target = layout["test_main"][0]
+    elif layout["test_src"]:
+        target = layout["test_src"][0]
+    else:
+        train_candidates = layout["train_main"] or layout["train_src"]
+        target = train_candidates[0]
+
+    print(f"  Downloading eval data: {target}...")
+    local_path = hf_hub_download(
+        repo_id,
+        target,
+        repo_type="dataset",
+        token=token,
+        revision=layout["revision"],
+    )
+
+    raw = _tokenize_parquet(local_path)
+    if raw is None:
+        raise RuntimeError(f"No valid eval positions in {target}")
+
+    n = min(n_eval, raw["board_array"].shape[0])
+    print(f"  Tokenized {raw['board_array'].shape[0]:,} eval candidates, using {n:,}")
+
+    # Build eval_data (needs chess.Board for legal_move_mask)
+    fens_for_phase = []
+    arr_buf = np.zeros(64, dtype=np.int8)
+    eval_data = []
+    surviving = []
+    wdl = compute_wdl(torch.tensor(raw["cp"][:n]), torch.tensor(raw["mate"][:n]))
+
+    for i in range(n):
+        try:
+            # Reconstruct FEN from board_array for chess.Board
+            board_arr = raw["board_array"][i]
+            turn = raw["turn"][i]
+            castling = raw["castling"][i]
+            ep = raw["ep_square"][i]
+            fen = _reconstruct_fen(board_arr, turn, castling, ep)
+            board = chess.Board(fen)
+            uci = IDX_TO_UCI[raw["move_idx"][i]]
+            move = chess.Move.from_uci(uci)
+            fens_for_phase.append(fen)
+            eval_data.append({
+                "board": board,
+                "move": move,
+                "wdl": (wdl[i, 0].item(), wdl[i, 1].item(), wdl[i, 2].item()),
+                "phase": None,  # filled below
+            })
+            surviving.append(i)
+        except Exception:
+            continue
+
+    phases = compute_phase(fens_for_phase)
+    for j, ed in enumerate(eval_data):
+        ed["phase"] = phases[j]
+
+    idx = torch.tensor(surviving, dtype=torch.long)
+    ba_t = torch.from_numpy(raw["board_array"][:n])[idx]
+    turn_t = torch.from_numpy(raw["turn"][:n])[idx].long()
+    cast_t = torch.from_numpy(raw["castling"][:n])[idx].long()
+    ep_t = ep_square_to_file(torch.from_numpy(raw["ep_square"][:n])[idx].long())
+
+    eval_tensors = {"turn": turn_t, "castling": cast_t, "ep_file": ep_t}
+    if encoder_type in ("fused", "both"):
+        eval_tensors["fused_ids"] = board_array_to_fused(ba_t)
+
+    print(f"  Eval ready: {len(eval_data)} positions")
+    return eval_data, eval_tensors
+
+
+# Reverse board_array → FEN (for eval only — not performance-critical)
+_INV_PIECE = {v: k for k, v in PIECE_MAP.items()}
+_INV_CASTLING = {8: 'K', 4: 'Q', 2: 'k', 1: 'q'}
+
+def _reconstruct_fen(board_arr, turn, castling, ep):
+    rows = []
+    for rank in range(7, -1, -1):
+        row = ""
+        empty = 0
+        for file in range(8):
+            p = board_arr[rank * 8 + file]
+            if p == 0:
+                empty += 1
+            else:
+                if empty > 0:
+                    row += str(empty)
+                    empty = 0
+                row += _INV_PIECE[p]
+        if empty > 0:
+            row += str(empty)
+        rows.append(row)
+    fen = "/".join(rows)
+    fen += " w " if turn == 0 else " b "
+    c = ""
+    for bit, ch in sorted(_INV_CASTLING.items(), key=lambda x: -x[0]):
+        if castling & bit:
+            c += ch
+    fen += c if c else "-"
+    if ep >= 0:
+        fen += " " + chr(ord('a') + ep % 8) + str(ep // 8 + 1)
+    else:
+        fen += " -"
+    fen += " 0 1"
+    return fen
+
+
+class StreamingHFChessLoader:
+    """Stream training data from HuggingFace parquet files, one file at a time.
+
+    Downloads each parquet via hf_hub_download (HF handles caching),
+    tokenizes in RAM (~20MB per source parquet), yields minibatches,
+    then drops it and loads the next file.
+
+    Peak RAM: ~50MB (1 tokenized parquet + GPU batch tensors).
+    Disk: only HF's download cache (~4MB per file, auto-managed).
+
+    Cursor-based resume: call get_cursor() at any point to snapshot the
+    iteration state. Pass that dict back as resume_cursor= to skip ahead
+    to exactly where you left off (same file, same batch offset).
+
+    Args:
+        repo_id: HuggingFace dataset repo (e.g. "avewright/chess-positions-lichess-sf")
+        batch_size: minibatch size
+        encoder_type: "fused" or "baseline"
+        device: target device for tensors
+        seed: shuffle seed (determines file order)
+        drop_last: drop last incomplete batch
+        file_pattern: glob pattern for selecting parquet files (default: source shards)
+        start_file: skip this many files from the *sorted* list before shuffling
+        max_files: limit number of files to use (None = all)
+        cache_dir: optional HF cache directory (None = default ~/.cache/huggingface)
+        resume_cursor: dict from get_cursor() to resume mid-stream
+    """
+
+    def __init__(self, repo_id, batch_size, encoder_type="fused",
+                 device="cpu", seed=42, drop_last=True,
+                 file_pattern="src", start_file=0, max_files=None,
+                 cache_dir=None, resume_cursor=None):
+        self.repo_id = repo_id
+        self.batch_size = batch_size
+        self.encoder_type = encoder_type
+        self.device = device
+        self.seed = seed
+        self.drop_last = drop_last
+        self.cache_dir = cache_dir
+        self.layout = get_hf_dataset_layout(repo_id)
+        self.revision = self.layout["revision"]
+        self.token = _hf_token()
+
+        if file_pattern == "src":
+            self.dataset_family = "train_src"
+            self.parquet_files = list(self.layout["train_src"])
+        elif file_pattern == "main":
+            self.dataset_family = "train_main"
+            self.parquet_files = list(self.layout["train_main"])
+        else:
+            self.dataset_family = f"custom:{file_pattern}"
+            all_files = self.layout["all_files"]
+            self.parquet_files = sorted([
+                f for f in all_files
+                if f.startswith("data/train") and f.endswith(".parquet")
+                and file_pattern in f
+            ])
+
+        # Apply start_file and max_files
+        self.parquet_files = self.parquet_files[start_file:]
+        if max_files is not None:
+            self.parquet_files = self.parquet_files[:max_files]
+
+        # Deterministic file order (same seed → same permutation)
+        rng = torch.Generator().manual_seed(self.seed)
+        self._file_order = torch.randperm(len(self.parquet_files), generator=rng).tolist()
+
+        # Estimate total positions (~254K per source parquet, ~3M per main)
+        if file_pattern == "src":
+            self._est_per_file = 254_000
+        else:
+            self._est_per_file = 3_000_000
+        self._est_total = len(self.parquet_files) * self._est_per_file
+        self._actual_total = 0  # updated as we iterate
+
+        # Iteration cursor (updated during __iter__)
+        self._files_completed = 0
+        self._batches_in_current_file = 0
+        self._positions_yielded = 0
+
+        # Resume support
+        self._resume_cursor = resume_cursor
+
+        print(f"  StreamingHFChessLoader: {len(self.parquet_files)} parquet files"
+              f" ({file_pattern}), est ~{self._est_total/1e6:.0f}M positions"
+              f", batch={batch_size}, device={device}, rev={self.revision[:8]}")
+        if resume_cursor:
+            print(f"    Resuming from cursor: file_seq={resume_cursor['files_completed']}/"
+                  f"{len(self.parquet_files)}, "
+                  f"batch_offset={resume_cursor['batches_in_current_file']}, "
+                  f"positions={resume_cursor['positions_yielded']:,}")
+
+    @property
+    def file_order(self):
+        """The deterministic shuffled file index order."""
+        return list(self._file_order)
+
+    @property
+    def fingerprint(self):
+        """Stable hash of (sorted file list, seed). Use to verify checkpoint
+        compatibility — if the fingerprint changes, the cursor is invalid."""
+        import hashlib
+        h = hashlib.sha256()
+        h.update(str(self.seed).encode())
+        for f in self.parquet_files:  # already sorted
+            h.update(f.encode())
+        return h.hexdigest()[:16]
+
+    def get_cursor(self):
+        """Return the current iteration state as a serializable dict.
+
+        Save this in your checkpoint. Pass it back as resume_cursor= to
+        restart iteration from exactly this point.
+        """
+        return {
+            "files_completed": self._files_completed,
+            "batches_in_current_file": self._batches_in_current_file,
+            "positions_yielded": self._positions_yielded,
+            "seed": self.seed,
+            "fingerprint": self.fingerprint,
+            "dataset_revision": self.revision,
+            "dataset_family": self.dataset_family,
+        }
+
+    @property
+    def total_positions(self):
+        """Actual total if we've iterated, else estimate."""
+        return self._actual_total if self._actual_total > 0 else self._est_total
+
+    @property
+    def num_files(self):
+        return len(self.parquet_files)
+
+    def __iter__(self):
+        from huggingface_hub import hf_hub_download
+        import threading
+        import queue
+
+        # Use the pre-computed deterministic file order
+        file_perm = self._file_order
+        positions_yielded = 0
+        files_done = 0
+
+        # Resume: figure out where to skip to
+        skip_files = 0
+        skip_batches_in_file = 0
+        if self._resume_cursor is not None:
+            skip_files = self._resume_cursor["files_completed"]
+            skip_batches_in_file = self._resume_cursor["batches_in_current_file"]
+            positions_yielded = self._resume_cursor["positions_yielded"]
+            if skip_files > 0:
+                print(f"    [stream] Skipping {skip_files} completed files...",
+                      flush=True)
+            self._resume_cursor = None  # only apply cursor once
+
+        # Determine which files to actually process
+        remaining_perm = file_perm[skip_files:]
+
+        # Prefetch buffer: download + tokenize next file in background thread
+        prefetch_q = queue.Queue(maxsize=2)
+
+        def _prefetch_worker(file_indices):
+            """Background thread: download & tokenize parquets, put tensors in queue."""
+            for fi in file_indices:
+                pq_name = self.parquet_files[fi]
+                try:
+                    local_path = hf_hub_download(
+                        self.repo_id, pq_name, repo_type="dataset",
+                        cache_dir=self.cache_dir,
+                        token=self.token,
+                        revision=self.revision,
+                    )
+                    raw = _tokenize_parquet(local_path)
+                except Exception as e:
+                    print(f"    [stream] Error loading {pq_name}: {e}", flush=True)
+                    raw = None
+                prefetch_q.put((fi, raw))
+            prefetch_q.put(None)  # sentinel
+
+        worker = threading.Thread(
+            target=_prefetch_worker, args=(remaining_perm,), daemon=True
+        )
+        worker.start()
+
+        is_first_file_after_resume = (skip_batches_in_file > 0)
+
+        while True:
+            item = prefetch_q.get()
+            if item is None:
+                break  # sentinel from worker
+            fi, raw = item
+
+            if raw is None:
+                files_done += 1
+                self._files_completed = skip_files + files_done
+                self._batches_in_current_file = 0
+                continue
+
+            n = raw["board_array"].shape[0]
+
+            # Convert to tensors
+            fused = board_array_to_fused(torch.from_numpy(raw["board_array"]))
+            turn = torch.from_numpy(raw["turn"]).long()
+            castling = torch.from_numpy(raw["castling"]).long()
+            ep_file = ep_square_to_file(torch.from_numpy(raw["ep_square"]).long())
+            move_idx = torch.from_numpy(raw["move_idx"]).long()
+            wdl = compute_wdl(torch.from_numpy(raw["cp"]), torch.from_numpy(raw["mate"]))
+            del raw
+
+            # Shuffle within file (deterministic per file index)
+            row_rng = torch.Generator().manual_seed(self.seed + fi * 31)
+            perm = torch.randperm(n, generator=row_rng)
+
+            batch_idx_in_file = 0
+            for start in range(0, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                if self.drop_last and (end - start) < self.batch_size:
+                    break
+
+                # Skip batches we already yielded before the crash
+                if is_first_file_after_resume and batch_idx_in_file < skip_batches_in_file:
+                    batch_idx_in_file += 1
+                    continue
+                is_first_file_after_resume = False
+
+                idx = perm[start:end]
+                batch_input = {
+                    "turn": turn[idx].to(self.device),
+                    "castling": castling[idx].to(self.device),
+                    "ep_file": ep_file[idx].to(self.device),
+                }
+                if self.encoder_type in ("fused", "both"):
+                    batch_input["fused_ids"] = fused[idx].to(self.device)
+
+                positions_yielded += idx.shape[0]
+                batch_idx_in_file += 1
+
+                # Update cursor state before yielding
+                self._files_completed = skip_files + files_done
+                self._batches_in_current_file = batch_idx_in_file
+                self._positions_yielded = positions_yielded
+
+                yield (batch_input,
+                       move_idx[idx].to(self.device),
+                       wdl[idx].float().to(self.device))
+
+            del fused, turn, castling, ep_file, move_idx, wdl
+            files_done += 1
+            self._files_completed = skip_files + files_done
+            self._batches_in_current_file = 0
+
+            if files_done % 50 == 0:
+                print(f"    [stream] {skip_files + files_done}/{len(self.parquet_files)} files, "
+                      f"{positions_yielded:,} positions", flush=True)
+
+        self._actual_total = positions_yielded
+
+
 class ShardedChessLoader:
     """Streaming minibatch loader over pretokenized shard files.
 
@@ -871,7 +1403,7 @@ class ShardedChessLoader:
 
     def __init__(self, shard_dir, batch_size, encoder_type="fused",
                  device="cpu", seed=42, drop_last=True, skip_positions=0,
-                 expected_shards=None):
+                 expected_shards=None, start_shard=0):
         self.shard_dir = Path(shard_dir)
         self.batch_size = batch_size
         self.encoder_type = encoder_type
@@ -890,6 +1422,12 @@ class ShardedChessLoader:
             self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
         if not self.shard_files and expected_shards is None:
             raise FileNotFoundError(f"No shard_*.pt in {shard_dir}")
+
+        # Drop leading shards (e.g. already trained on)
+        if start_shard > 0:
+            skipped = self.shard_files[:start_shard]
+            self.shard_files = self.shard_files[start_shard:]
+            print(f"  start_shard={start_shard}: skipping {len(skipped)} shard(s)")
 
         # Count rows per shard (only for already-existing shards)
         self._shard_sizes = []
