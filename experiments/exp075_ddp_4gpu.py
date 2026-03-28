@@ -391,6 +391,7 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
         return False
 
     # Load and average all worker weights ON CPU to avoid GPU OOM
+    # Only average float tensors; integer buffers (like move indices) are identical
     avg_state = None
     for i in range(NUM_GPUS):
         path = SYNC_DIR / f"worker{i}_step{sync_step}.pt"
@@ -399,21 +400,25 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
             avg_state = sd
         else:
             for k in avg_state:
-                avg_state[k] += sd[k]
+                if avg_state[k].is_floating_point():
+                    avg_state[k] += sd[k]
         del sd
 
     for k in avg_state:
-        avg_state[k] /= NUM_GPUS
-
-    # Move averaged weights to device and load into model
-    avg_state = {k: v.to(device) for k, v in avg_state.items()}
+        if avg_state[k].is_floating_point():
+            avg_state[k] /= NUM_GPUS
 
     # Handle torch.compile prefix
     current_keys = set(model.state_dict().keys())
-    if any(k.startswith("_orig_mod.") for k in current_keys):
-        avg_state = {"_orig_mod." + k: v for k, v in avg_state.items()}
-
-    model.load_state_dict(avg_state)
+    needs_prefix = any(k.startswith("_orig_mod.") for k in current_keys)
+    
+    # Copy averaged weights into model IN-PLACE to avoid GPU OOM
+    # (no duplicate state dict on GPU)
+    model_sd = model.state_dict()
+    for k, v in avg_state.items():
+        target_key = ("_orig_mod." + k) if needs_prefix else k
+        if target_key in model_sd:
+            model_sd[target_key].copy_(v)
     del avg_state
     gc.collect()
     torch.cuda.empty_cache()
