@@ -96,7 +96,7 @@ VALUE_HIDDEN = 512
 # Logging/checkpoint intervals (in optimizer steps)
 LOG_INTERVAL = 100
 EVAL_INTERVAL = 1000
-SAVE_INTERVAL = 500
+SAVE_INTERVAL = 250
 HEARTBEAT_INTERVAL = 25
 
 # ── Graceful shutdown ──
@@ -371,7 +371,11 @@ def write_worker_weights(model, worker_id, sync_step):
 
 
 def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
-    """Wait for all workers to write weights, then load averaged weights."""
+    """Wait for all workers to write weights, then load averaged weights.
+    
+    Loads all state dicts to CPU to avoid GPU OOM, averages on CPU,
+    then loads the averaged result back to the model on GPU.
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
         ready = sum(
@@ -386,11 +390,11 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
               f"only {ready}/{NUM_GPUS} ready. Continuing without sync.", flush=True)
         return False
 
-    # Load and average all worker weights
+    # Load and average all worker weights ON CPU to avoid GPU OOM
     avg_state = None
     for i in range(NUM_GPUS):
         path = SYNC_DIR / f"worker{i}_step{sync_step}.pt"
-        sd = torch.load(path, map_location=device, weights_only=True)
+        sd = torch.load(path, map_location='cpu', weights_only=True)
         if avg_state is None:
             avg_state = sd
         else:
@@ -401,6 +405,9 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
     for k in avg_state:
         avg_state[k] /= NUM_GPUS
 
+    # Move averaged weights to device and load into model
+    avg_state = {k: v.to(device) for k, v in avg_state.items()}
+
     # Handle torch.compile prefix
     current_keys = set(model.state_dict().keys())
     if any(k.startswith("_orig_mod.") for k in current_keys):
@@ -408,11 +415,12 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
 
     model.load_state_dict(avg_state)
     del avg_state
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    # Cleanup old sync files
-    for f in SYNC_DIR.glob("worker*"):
-        if f"step{sync_step}" not in f.name:
-            f.unlink(missing_ok=True)
+    # Cleanup ALL sync files for this step
+    for f in SYNC_DIR.glob("*step*"):
+        f.unlink(missing_ok=True)
 
     return True
 
@@ -437,9 +445,13 @@ def train_worker(worker_id):
     worker_dir.mkdir(parents=True, exist_ok=True)
     log_path = worker_dir / "train.log"
 
-    log_file = open(log_path, "w", buffering=1)
+    log_file = open(log_path, "a", buffering=1)
     sys.stdout = log_file
     sys.stderr = log_file
+
+    print(f"\n\n{'#'*72}", flush=True)
+    print(f"# Worker {worker_id} starting at {datetime.now(timezone.utc).isoformat()}", flush=True)
+    print(f"{'#'*72}", flush=True)
 
     try:
         _train_worker_inner(worker_id, device, worker_dir)
@@ -451,6 +463,11 @@ def train_worker(worker_id):
 
 
 def _train_worker_inner(worker_id, device, worker_dir):
+    # Clean stale sync files from previous runs (worker 0 does this)
+    if worker_id == 0:
+        for f in SYNC_DIR.glob("*"):
+            f.unlink(missing_ok=True)
+
     print(f"\n{'='*72}")
     print(f" EXP075 WORKER {worker_id} on GPU {worker_id} "
           f"({torch.cuda.get_device_name(worker_id)})")
