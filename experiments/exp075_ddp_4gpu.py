@@ -688,9 +688,11 @@ def _train_worker_inner(worker_id, device, worker_dir):
 
             # Local SGD sync + checkpoint (always save at sync points)
             if global_step >= next_sync_step:
-                print(f"\n    [W{worker_id}] Sync at step {global_step}...", flush=True)
-                write_worker_weights(model, worker_id, global_step)
-                synced = wait_and_average_weights(model, worker_id, global_step, device)
+                sync_id = next_sync_step  # use planned step as sync key
+                print(f"\n    [W{worker_id}] Sync at step {global_step} "
+                      f"(sync_id={sync_id})...", flush=True)
+                write_worker_weights(model, worker_id, sync_id)
+                synced = wait_and_average_weights(model, worker_id, sync_id, device)
                 if synced:
                     print(f"    [W{worker_id}] Weights averaged with {NUM_GPUS} workers",
                           flush=True)
@@ -701,7 +703,7 @@ def _train_worker_inner(worker_id, device, worker_dir):
                     data_cursor=loader.get_cursor(),
                     worker_id=worker_id,
                 )
-                next_sync_step = global_step + SYNC_INTERVAL
+                next_sync_step += SYNC_INTERVAL
 
             # Evaluation (worker 0 only)
             if worker_id == 0 and global_step % EVAL_INTERVAL == 0:
