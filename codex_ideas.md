@@ -2063,3 +2063,63 @@ bash run_process_lichess_parquets_tmux.sh
 - Deterministic train/test split by FEN hash → consistent across restarts
 - Append-only event logs at both orchestrator and per-source level
 
+---
+
+## 2026-03-28
+
+### exp076: Continue v2 model on source-sharded corpus — FAILED (divergence)
+
+**Hypothesis:** Continuing the 200M v2 model on ~832M new source-sharded positions
+from `avewright/chess-positions-lichess-sf` will improve accuracy beyond the 16.5%
+baseline.
+
+**GPU:** 1x NVIDIA A40 46GB, RunPod
+
+**Run 1 (LR=1e-4, warmup 8123 steps):**
+- Training was stable at LR < 3.5e-5 (steps 200–2800, pl ~3.3–3.5)
+- Best observed loss: pl=2.91 at step 3000 (LR=3.7e-5)
+- Divergence onset at step ~4800 (LR=5.9e-5): grad norm spiked to 6.1
+- Full divergence steps 5000+: pl exploded 3.4 → 5.5 → 8.2
+- Eval at step 5000: 14.0% accuracy (WORSE than 16.5% baseline)
+- Throughput: 488 pos/s steady state on A40
+
+**Run 2 (LR=3e-5, warmup 200 steps):**
+- Restated from original v2 weights with conservative LR 3e-5
+- Stable for first ~3000 steps (pl ~3.3–3.5, gnorm ~2)
+- Divergence AGAIN at step ~4000+: pl climbed 3.4 → 4.3 → 5.3 → 5.6
+- Eval at step 5000: 13.8% accuracy (WORSE than baseline)
+- Same pattern: even at 3e-5, the model destabilizes after ~4M positions
+
+**Key observations:**
+1. **Both runs diverged at roughly the same training volume (~4–5M positions)**, regardless of LR
+2. Value loss remained stable (0.13–0.17) while policy loss exploded — the policy head is the issue
+3. Grad norms were manageable (2-5) even during divergence — not a gradient explosion
+4. The model LEARNS initially (pl drops to 2.9–3.3) then catastrophically forgets
+5. This looks like **catastrophic forgetting** or **distribution shift** between the main shards (exp073 training data) and the source shards being used here
+
+**Possible root causes:**
+1. **Data distribution mismatch**: The source shards may have very different position distributions than the main shards the model was originally trained on. Streaming different source files introduces distribution shifts every ~254K positions.
+2. **No replay of original data**: The model sees entirely new positions with no interleaving of the data it was originally good at.
+3. **Optimizer state mismatch**: Starting with a fresh optimizer on a pretrained model means the adaptive learning rate estimates (Adam momentum/variance) start from scratch, which can cause large effective learning rates for some parameters.
+4. **Sequence of source files**: Different source parquets may have very different difficulty/character — e.g., one source of all endgame positions followed by one of all openings.
+
+**What to try next (priority order):**
+1. **Mix source shards with main shards** (e.g., 50/50 interleaving) to prevent catastrophic forgetting
+2. **Lower LR further** (1e-5) with longer warmup — though this may just delay the divergence
+3. **Train from scratch** on all data combined rather than continuing — the exp071 result (22.9% on 2M positions × 6 epochs) suggests fresh training works fine
+4. **Add data mixing**: Shuffle positions from multiple source files into each batch instead of streaming one file at a time
+5. **Gradient accumulation with EMA**: Use exponential moving average of weights for eval/save
+
+**Files preserved:**
+- `outputs/exp076_continue_v2/failed_run1/` — LR=1e-4 run (training_log.json, config, health.log)
+- `outputs/exp076_continue_v2/failed_run2/` — LR=3e-5 run (training_log.json, config, health.log)
+- Both runs' logs uploaded to `avewright/chess-transformer-200m-latest` on HF
+- Original v2 model weights (`best_model.pt`) preserved and unchanged
+
+**Infrastructure built (reusable):**
+- `experiments/exp076_continue_v2.py` — full streaming continuation trainer with cursor-based resume, NaN guards, graceful shutdown, auto HF upload
+- `watchdog_exp076.sh` — auto-restart watchdog for tmux sessions
+- `monitor_exp076.py` — persistent health monitor with GPU/stall/NaN alerts
+- `avewright/chess-transformer-200m-latest` HF repo — "always the most-trained model" pattern
+- 20K eval positions (4x previous) for more stable metrics
+
