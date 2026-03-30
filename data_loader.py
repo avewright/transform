@@ -1068,6 +1068,8 @@ def build_eval_from_hf(repo_id, n_eval=5000, encoder_type="fused"):
                 "board": board,
                 "move": move,
                 "wdl": (wdl[i, 0].item(), wdl[i, 1].item(), wdl[i, 2].item()),
+                "cp": int(raw["cp"][i]),
+                "mate": int(raw["mate"][i]),
                 "phase": None,  # filled below
             })
             surviving.append(i)

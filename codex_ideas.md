@@ -2,6 +2,50 @@
 
 This file is the running log for:
 
+## 2026-03-30
+
+### exp083: Full-corpus pretraining on 4×A40 — KILLED (LR too high)
+
+**Hypothesis:** Training the 204M ChessTransformer on the full ~832M position
+corpus using 4 A40 GPUs with Local SGD will push accuracy well beyond the
+22.9% (lichess-sf eval) / 44.6% (HF cross-eval) from exp071.
+
+**Setup:**
+- 4× NVIDIA A40 (46GB each), all at 100% utilization
+- ChessTransformer200M: 204M params, 16L/1024d, SpatialPolicyHead
+- Init from avewright/chess-transformer-200m-v2 (exp074 best)
+- Local SGD: 4 workers, each on ~208M positions (818 parquet files), sync every 500 steps
+- Batch 256 × accum 4 = eff 1024 per worker, LR=1e-4 cosine to 5%
+- Baseline from init: 16.3% top-1, 41.8% top-3, 78.5% value accuracy
+- Combined throughput: ~1,200 pos/s (300/worker)
+- Aggressive logging: metrics JSONL every 10 steps, checkpoint every 100 steps
+- Health monitor: `monitor_exp083.py`
+
+**Results (killed at step ~2100):**
+- Step 0: 16.3% top-1, 41.8% top-3, 78.5% value (init)
+- Step 500: **16.7%** top-1, 41.9% top-3, 79.7% value (**best**)
+- Step 1000: 15.8% top-1, 39.6% top-3, 78.2% value (declining)
+- Step 1500: 15.7% top-1, 40.8% top-3, 80.6% value
+- Step 2000: 14.8% top-1, 38.2% top-3, 79.7% value (clear regression)
+- Policy loss rose from 3.5 → 5.5, well above init baseline
+- **Root cause**: LR=1e-4 too aggressive for continuation training. Warmup destroyed learned features before cosine could recover.
+
+**Key lesson**: For continuation from pretrained weights, use LR ≤ 3e-5. High LR on a converged model is catastrophic forgetting.
+
+### exp083b: Continuation with LR=3e-5 from exp083 best — RUNNING
+
+**Hypothesis:** With 10× lower LR (3e-5 vs 1e-4), the model will improve
+without regressing. Starting from exp083 step-500 best (16.7% acc).
+
+**Setup (changes from exp083):**
+- LR: 3e-5 (was 1e-4)
+- WARMUP_FRAC: 0.005 (was 0.01) — shorter warmup
+- MIN_LR_FRAC: 0.10 (was 0.05) — higher LR floor
+- Init from: outputs/exp083_pretrain_4xa40/best_model.pt (16.7% top-1)
+- Same data, model, and sync strategy as exp083
+
+**Status:** Training, step ~510. First eval at step 500: **16.3% top-1, 42.1% top-3, 79.5% value** — NO REGRESSION. LR still warming up (1.5e-5 of peak 3e-5). Combined throughput ~1,340 pos/s.
+
 ## 2026-03-29
 
 ### exp081: Confidence-weighted cached continuation — ADDED
@@ -2202,3 +2246,80 @@ step after supervised pretraining improves the policy prior.
 **Next:** Continued pretraining with soft multi-PV targets from HF data (exp078).
 The model needs better supervision, not more self-play.
 
+---
+
+### exp083b / exp083c: 4xA40 continuation from exp083 best — LOGGED (stable but no gain)
+
+**Goal:** Continue training the 204M fused chess transformer from the
+`exp083` best checkpoint on the full HF source-sharded corpus using 4x A40s,
+while avoiding the earlier high-LR collapse.
+
+**Runs:**
+- `exp083b_pretrain_lr3e5`: continuation with `lr=3e-5`
+- `exp083c_pretrain_lr1e5`: safer continuation with `lr=1e-5`
+
+**Shared setup:**
+- Model: `ChessTransformer200M` (~204M params)
+- Encoder: `FusedBoardEncoder 256d -> Transformer 1024d, 16L, 16H`
+- Batch: `256 x accum 4` per worker
+- Strategy: 4-worker Local SGD, sync every 500 steps
+- Init: `outputs/exp083_pretrain_4xa40/best_model.pt`
+
+**Baseline checkpoint (step 0):**
+- Accuracy: `16.7%`
+- Top-3: `41.9%`
+- Mean SF rank: `66.7`
+- Value acc: `79.7%`
+
+**exp083b results:**
+- Step 500: `16.34%` acc, `42.06%` top-3, `66.77` SF rank, `79.46%` value acc
+- Step 1000: `15.82%` acc, `40.40%` top-3, `66.89` SF rank, `79.36%` value acc
+
+**exp083c results (with stronger eval):**
+- Step 500:
+  - Accuracy: `16.04%`
+  - Top-3: `40.60%`
+  - Mean SF rank: `66.76`
+  - Avg true-move prob: `0.1509`
+  - Avg pred confidence: `0.3023`
+  - Avg legal entropy: `1.7438`
+  - Value acc: `79.64%`
+  - Value KL: `0.1015`
+- Step 1000:
+  - Accuracy: `15.92%`
+  - Top-3: `39.38%`
+  - Mean SF rank: `67.22`
+  - Avg true-move prob: `0.1453`
+  - Avg pred confidence: `0.2941`
+  - Avg legal entropy: `1.8167`
+  - Value acc: `79.60%`
+  - Value KL: `0.1000`
+
+**Key findings:**
+1. Lowering LR from `3e-5` to `1e-5` made training look calmer, but did not
+   produce policy improvement.
+2. Both continuation runs stayed below the original checkpoint on the main
+   policy metrics.
+3. `exp083c` was slightly more stable than `exp083b`, but by step 1000 it was
+   still worse than baseline and policy sharpness had degraded:
+   lower top-3, lower true-move probability, higher entropy.
+4. Value metrics were basically flat or slightly improved (`value_kl`), which
+   suggests the continuation recipe is not obviously destroying the value head;
+   the policy learning signal is the bottleneck.
+5. Conclusion: **same architecture + same full-corpus continuation recipe is not
+   enough**. More time on this exact setup is unlikely to pay off.
+
+**Infra/code added during this cycle:**
+- `experiments/exp083c_pretrain_lr1e5.py`
+- stronger eval metrics:
+  - avg true-move probability
+  - avg true-move NLL
+  - prediction confidence
+  - legal-move entropy
+  - value KL
+- `MODEL_ARCHITECTURE_EXP083.md` documenting the active model
+
+**Recommended next direction:**
+1. Stop spending 4xA40 time on plain continuation of the same objective.
+2. Change the data recipe or supervision target before the next large run.
+3. Fix the `Infinity` NLL eval bug before relying on that metric.
