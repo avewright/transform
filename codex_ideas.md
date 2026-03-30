@@ -2,6 +2,39 @@
 
 This file is the running log for:
 
+## 2026-03-29
+
+### exp081: Confidence-weighted cached continuation — ADDED
+
+Hypothesis: The productive continuation path on 8GB VRAM is still local cached
+supervised training, but policy loss should be weighted by label confidence so
+clear Stockfish decisions dominate gradient over nearly-equal positions.
+
+Design:
+- based on exp079, not the exp076 one-pass stream
+- local cached lichess-sf subset + replay mixing
+- soft top-move targets retained
+- confidence-weighted CE/KL using eval magnitude + top-2 margin
+- richer eval slices by phase and confidence bucket
+
+Expected outcome:
+- better sample efficiency than unweighted continuation
+- same 8GB VRAM footprint as exp079
+- more interpretable failure modes if gains only come from high-confidence buckets
+
+### exp082: Online SF game soft-label loop — ADDED
+
+Hypothesis: An online loop that plays full games vs Stockfish, then relabels each
+model position with full legal-move Stockfish scores, can create denser policy
+supervision than single best-move targets while staying within 8GB VRAM.
+
+Design:
+- limited-strength Stockfish for gameplay opponent
+- full-strength Stockfish analysis for all legal moves after the game
+- soft policy targets from legal-move score distributions
+- replay buffer across cycles
+- resumable checkpoint + cycle logs + per-cycle label dumps
+
 ## 2026-03-25
 
 ### exp070: Large-scale Lichess-SF training on A40 — COMPLETED
@@ -2122,4 +2155,50 @@ baseline.
 - `monitor_exp076.py` — persistent health monitor with GPU/stall/NaN alerts
 - `avewright/chess-transformer-200m-latest` HF repo — "always the most-trained model" pattern
 - 20K eval positions (4x previous) for more stable metrics
+
+---
+
+### exp077: Evolutionary Expert Iteration — COMPLETED (modest gains, no forgetting)
+
+**Hypothesis:** Population-based self-play with temperature diversity (0.0–0.6) and
+supervised training on winning moves creates evolutionary improvement without RL gradients.
+
+**GPU:** NVIDIA RTX 4060 Laptop (8GB VRAM)
+**Config:** 6 temp variants (0.0–0.6), 60 games/tournament (4 per pair), 5 generations,
+LR=5e-6, batch=4×accum=32 (eff 128), 500-pos eval set.
+
+**Results by generation:**
+
+| Gen | Accuracy | Top-3 | Train Loss | SF 1320 | SF 1450 | Draw Rate | Winner |
+|-----|----------|-------|------------|---------|---------|-----------|--------|
+| 0 (baseline) | 45.8% | 72.8% | — | 100% | 37.5% | — | — |
+| 1 | 46.6% (+0.8) | 72.8% | 1.035 | 100% | 25% | 32% | t=0.0 |
+| 2 | 46.6% (+0.8) | 73.4% | 0.942 | 62.5% | 50% | 32% | t=0.3 |
+| 3 | 45.6% (−0.2) | 73.0% | 0.829 | 62.5% | 100% | 55% | t=0.3 |
+| 4 | 46.4% (+0.6) | 72.4% | 0.776 | 100% | 62.5% | 58% | t=0.3 |
+| 5 | 46.4% (+0.6) | 73.4% | 0.734 | 50% | 25% | 45% | t=0.3 |
+
+**Total runtime:** 26 minutes (5 generations).
+
+**Key findings:**
+1. **No catastrophic forgetting** — accuracy stable within ±1pp of baseline across all gens.
+   This is a significant win vs prior self-play (exp033 REINFORCE destroyed the model).
+2. **Modest improvement:** +0.6pp accuracy, +0.6pp top-3 at final generation.
+3. **Training loss monotonically decreasing** (1.035 → 0.734) — model consistently learning
+   from winner moves without overfitting.
+4. **Temperature 0.3 dominated** — won every tournament from Gen 2 onward. Slight stochasticity
+   outperforms pure greedy (t=0.0) in self-play.
+5. **Draw rate increased** (32% → 58%) — model's self-play more balanced as it improves.
+6. **SF calibration noisy** — 4 games per level is insufficient (swings from 25% to 100%).
+7. **Ceiling is data-quality-driven.** Self-play cannot find moves the model doesn't already
+   "almost know." Need higher-quality supervision to break past ~46%.
+
+**Files:** `experiments/exp077_evolutionary.py`, `outputs/exp077_evolutionary/`
+
+**Architecture validated:** The evolutionary framework works and is stable. Could be
+re-used with larger populations, more games per matchup, or as a post-training refinement
+step after supervised pretraining improves the policy prior.
+
+**Next:** Continued pretraining with soft multi-PV targets from HF data (exp078).
+The model needs better supervision, not more self-play.
 

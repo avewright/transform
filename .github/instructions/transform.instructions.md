@@ -1,7 +1,8 @@
 ---
 description: Always use these instructions
 ---
-
+The goal is to get the highest elo possible. Unless specifically told otherwise by the user, design experiments to get the highest elo possible. Check the hardware available and utilize it. 
+Fall into an autonmous loop of consistently experimenting and logging.
 # Chess-Transformer Agent Instructions
 
 This repository is for autonomous chess research around a chess-native transformer stack with strong data and evaluation discipline:
