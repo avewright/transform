@@ -31,6 +31,7 @@ import json
 import math
 import os
 import random
+import shutil
 import signal
 import sys
 import time
@@ -62,6 +63,7 @@ from data_loader import (
 OUTPUT_DIR = Path("outputs/exp075_ddp_4gpu")
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 SYNC_DIR = OUTPUT_DIR / "sync"
+STATUS_DIR = OUTPUT_DIR / "status"
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 HF_MODEL = "avewright/chess-transformer-200m-v2"
 
@@ -98,9 +100,60 @@ LOG_INTERVAL = 100
 EVAL_INTERVAL = 1000
 SAVE_INTERVAL = 250
 HEARTBEAT_INTERVAL = 25
+KEEP_CHECKPOINTS = 3
 
 # ── Graceful shutdown ──
 SHUTDOWN_REQUESTED = False
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_torch_save(obj, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    tmp_path.replace(path)
+
+
+def atomic_write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp_path.replace(path)
+
+
+def atomic_append_jsonl(path: Path, record: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def prune_old_checkpoints(ckpt_dir: Path, keep: int = KEEP_CHECKPOINTS):
+    checkpoints = sorted(
+        [p for p in ckpt_dir.glob("step_*.pt") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in checkpoints[keep:]:
+        stale.unlink(missing_ok=True)
+
+
+def write_worker_status(worker_id: int, **status):
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        STATUS_DIR / f"worker{worker_id}.json",
+        {"worker_id": worker_id, "timestamp": utcnow_iso(), **status},
+    )
+
+
+def append_worker_event(worker_id: int, event: str, **fields):
+    atomic_append_jsonl(
+        STATUS_DIR / f"worker{worker_id}.events.jsonl",
+        {"timestamp": utcnow_iso(), "worker_id": worker_id, "event": event, **fields},
+    )
 
 
 def _signal_handler(signum, frame):
@@ -301,32 +354,62 @@ def save_checkpoint(model, optimizer, scaler, scheduler, global_step,
             "accum_steps": ACCUM_STEPS, "lr": LR, "seed": SEED,
             "num_gpus": NUM_GPUS,
         },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": utcnow_iso(),
     }
-    torch.save(ckpt, ckpt_path)
+    atomic_torch_save(ckpt, ckpt_path)
     size_mb = ckpt_path.stat().st_size / 1e6
     print(f"    [W{worker_id}][CKPT] Saved {ckpt_path.name} ({size_mb:.0f} MB)", flush=True)
 
     latest_path = ckpt_dir / "latest.pt"
-    if latest_path.exists():
-        latest_path.unlink()
-    import shutil
-    shutil.copy2(ckpt_path, latest_path)
+    tmp_latest = latest_path.with_suffix(".pt.tmpcopy")
+    shutil.copy2(ckpt_path, tmp_latest)
+    tmp_latest.replace(latest_path)
+    prune_old_checkpoints(ckpt_dir)
+    write_worker_status(
+        worker_id,
+        state="checkpoint_saved",
+        global_step=global_step,
+        positions_seen=positions_seen,
+        best_acc=best_acc,
+        checkpoint=str(ckpt_path),
+    )
 
 
 def load_checkpoint(model, optimizer, scaler, device, worker_id=0):
-    latest_path = CHECKPOINT_DIR / f"worker{worker_id}" / "latest.pt"
-    if not latest_path.exists():
+    ckpt_dir = CHECKPOINT_DIR / f"worker{worker_id}"
+    candidates = []
+    latest_path = ckpt_dir / "latest.pt"
+    if latest_path.exists():
+        candidates.append(latest_path)
+    candidates.extend(
+        sorted(
+            [p for p in ckpt_dir.glob("*.pt") if p.name != "latest.pt"],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    )
+    if not candidates:
         return None
 
-    print(f"  [W{worker_id}] Resuming from checkpoint: {latest_path}", flush=True)
-    ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+    ckpt = None
+    loaded_from = None
+    for path in candidates:
+        try:
+            print(f"  [W{worker_id}] Trying checkpoint: {path}", flush=True)
+            ckpt = torch.load(path, map_location=device, weights_only=False)
+            loaded_from = path
+            break
+        except Exception as e:
+            print(f"  [W{worker_id}][WARN] Failed to load {path.name}: {e}", flush=True)
+    if ckpt is None:
+        return None
 
     model.load_state_dict(
         {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
     )
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scaler.load_state_dict(ckpt["scaler_state_dict"])
+    print(f"  [W{worker_id}] Resumed from checkpoint: {loaded_from}", flush=True)
 
     return {
         "global_step": ckpt["global_step"],
@@ -365,7 +448,7 @@ def write_worker_weights(model, worker_id, sync_step):
     path = SYNC_DIR / f"worker{worker_id}_step{sync_step}.pt"
     sd = {k.replace("_orig_mod.", ""): v.cpu()
           for k, v in model.state_dict().items()}
-    torch.save(sd, path)
+    atomic_torch_save(sd, path)
     (SYNC_DIR / f"worker{worker_id}_step{sync_step}.ready").touch()
     return path
 
@@ -423,8 +506,8 @@ def wait_and_average_weights(model, worker_id, sync_step, device, timeout=300):
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Cleanup ALL sync files for this step
-    for f in SYNC_DIR.glob("*step*"):
+    # Cleanup only this step's sync files.
+    for f in SYNC_DIR.glob(f"*step{sync_step}*"):
         f.unlink(missing_ok=True)
 
     return True
@@ -455,14 +538,18 @@ def train_worker(worker_id):
     sys.stderr = log_file
 
     print(f"\n\n{'#'*72}", flush=True)
-    print(f"# Worker {worker_id} starting at {datetime.now(timezone.utc).isoformat()}", flush=True)
+    print(f"# Worker {worker_id} starting at {utcnow_iso()}", flush=True)
     print(f"{'#'*72}", flush=True)
+    write_worker_status(worker_id, state="starting", pid=os.getpid())
+    append_worker_event(worker_id, "worker_start", pid=os.getpid())
 
     try:
         _train_worker_inner(worker_id, device, worker_dir)
     except Exception as e:
         print(f"\n  [W{worker_id}] FATAL ERROR: {e}", flush=True)
         traceback.print_exc()
+        append_worker_event(worker_id, "fatal_error", error=str(e))
+        write_worker_status(worker_id, state="fatal_error", error=str(e))
     finally:
         log_file.close()
 
@@ -477,7 +564,7 @@ def _train_worker_inner(worker_id, device, worker_dir):
     print(f" EXP075 WORKER {worker_id} on GPU {worker_id} "
           f"({torch.cuda.get_device_name(worker_id)})")
     print(f"{'='*72}")
-    print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()}")
+    print(f"  Timestamp: {utcnow_iso()}")
     print(f"  VRAM: {torch.cuda.get_device_properties(worker_id).total_mem / 1e9:.1f} GB"
           if hasattr(torch.cuda.get_device_properties(worker_id), 'total_mem')
           else f"  VRAM: {torch.cuda.get_device_properties(worker_id).total_memory / 1e9:.1f} GB")
@@ -495,6 +582,13 @@ def _train_worker_inner(worker_id, device, worker_dir):
     print(f"  Data split: files [{my_start}:{my_end}) = "
           f"{my_end - my_start}/{n_files} files, "
           f"~{(my_end - my_start) * 254_000 / 1e6:.0f}M positions")
+    append_worker_event(
+        worker_id,
+        "data_split",
+        file_start=my_start,
+        file_end=my_end,
+        total_files=n_files,
+    )
 
     # Build model
     model = ChessTransformer200M().to(device)
@@ -516,6 +610,13 @@ def _train_worker_inner(worker_id, device, worker_dir):
         resume_cursor = own_ckpt.get("data_cursor")
         print(f"  Resumed: step={global_step}, pos={positions_seen:,}, "
               f"best={best_acc:.1%}", flush=True)
+        append_worker_event(
+            worker_id,
+            "resume",
+            global_step=global_step,
+            positions_seen=positions_seen,
+            best_acc=best_acc,
+        )
     else:
         load_best_model_from_hf(model, device)
         global_step = 0
@@ -588,11 +689,10 @@ def _train_worker_inner(worker_id, device, worker_dir):
             **{k: round(v, 4) if isinstance(v, float) else v
                for k, v in ev0.items()},
         })
-        with open(OUTPUT_DIR / "training_log.json", "w") as f:
-            json.dump(results_log, f, indent=2)
+        atomic_write_json(OUTPUT_DIR / "training_log.json", results_log)
         best_state = {k.replace("_orig_mod.", ""): v.cpu().clone()
                       for k, v in model.state_dict().items()}
-        torch.save(best_state, OUTPUT_DIR / "best_model.pt")
+        atomic_torch_save(best_state, OUTPUT_DIR / "best_model.pt")
         print(f"  Saved baseline as best_model.pt (acc={best_acc:.1%})", flush=True)
 
     # Training loop
@@ -613,6 +713,15 @@ def _train_worker_inner(worker_id, device, worker_dir):
     print(f" [W{worker_id}] Training started (~{n_train/1e6:.0f}M positions, "
           f"~{total_opt_steps:,} opt steps)")
     print(f"{'---'*24}\n", flush=True)
+    write_worker_status(
+        worker_id,
+        state="training",
+        global_step=global_step,
+        positions_seen=positions_seen,
+        best_acc=best_acc,
+        total_opt_steps=total_opt_steps,
+        estimated_positions=n_train,
+    )
 
     for batch_input, move_targets, wdl_targets in loader:
         if SHUTDOWN_REQUESTED:
@@ -684,6 +793,17 @@ def _train_worker_inner(worker_id, device, worker_dir):
                     f"{tp:.0f} pos/s | ETA {eta_h:.1f}h"
                 )
                 sys.stdout.flush()
+                write_worker_status(
+                    worker_id,
+                    state="training",
+                    global_step=global_step,
+                    positions_seen=positions_seen,
+                    best_acc=best_acc,
+                    throughput_pos_s=round(tp),
+                    progress_pct=round(progress, 2),
+                    eta_h=round(eta_h, 2),
+                    lr=scheduler.get_last_lr()[0],
+                )
 
             # Detailed log
             if global_step % LOG_INTERVAL == 0:
@@ -703,6 +823,19 @@ def _train_worker_inner(worker_id, device, worker_dir):
                       f"| pos={positions_seen:,} "
                       f"| mem={peak_mem:.1f}GB",
                       flush=True)
+                append_worker_event(
+                    worker_id,
+                    "train_log",
+                    global_step=global_step,
+                    positions_seen=positions_seen,
+                    policy_loss=round(avg_pl, 6),
+                    value_loss=round(avg_vl, 6),
+                    lr=lr_now,
+                    grad_norm=float(grad_norm),
+                    throughput_pos_s=round(tp),
+                    progress_pct=round(progress, 2),
+                    peak_mem_gb=round(peak_mem, 2),
+                )
 
                 running_pl = 0.0
                 running_vl = 0.0
@@ -718,6 +851,9 @@ def _train_worker_inner(worker_id, device, worker_dir):
                 if synced:
                     print(f"    [W{worker_id}] Weights averaged with {NUM_GPUS} workers",
                           flush=True)
+                    append_worker_event(worker_id, "sync_complete", sync_id=sync_id)
+                else:
+                    append_worker_event(worker_id, "sync_timeout", sync_id=sync_id)
                 # Always save checkpoint at sync points for safety
                 save_checkpoint(
                     model, optimizer, scaler, scheduler,
@@ -755,10 +891,19 @@ def _train_worker_inner(worker_id, device, worker_dir):
                     best_state = {k.replace("_orig_mod.", ""): v.cpu().clone()
                                   for k, v in model.state_dict().items()}
                     print(f"    ** New best: {best_acc:.1%}")
-                    torch.save(best_state, OUTPUT_DIR / "best_model.pt")
+                    atomic_torch_save(best_state, OUTPUT_DIR / "best_model.pt")
 
-                with open(OUTPUT_DIR / "training_log.json", "w") as f:
-                    json.dump(results_log, f, indent=2)
+                atomic_write_json(OUTPUT_DIR / "training_log.json", results_log)
+                atomic_write_json(
+                    OUTPUT_DIR / "last_eval.json",
+                    {
+                        "timestamp": utcnow_iso(),
+                        "step": global_step,
+                        "positions_seen": positions_seen,
+                        "best_acc": best_acc,
+                        **results_log[-1],
+                    },
+                )
 
                 model.train()
 
@@ -803,11 +948,10 @@ def _train_worker_inner(worker_id, device, worker_dir):
                           for k, v in model.state_dict().items()}
 
         if best_state is not None:
-            torch.save(best_state, OUTPUT_DIR / "best_model.pt")
+            atomic_torch_save(best_state, OUTPUT_DIR / "best_model.pt")
             print(f"\n  Best model saved ({best_acc:.1%})")
 
-        with open(OUTPUT_DIR / "training_log.json", "w") as f:
-            json.dump(results_log, f, indent=2)
+        atomic_write_json(OUTPUT_DIR / "training_log.json", results_log)
 
     save_checkpoint(
         model, optimizer, scaler, scheduler,
@@ -818,7 +962,7 @@ def _train_worker_inner(worker_id, device, worker_dir):
 
     final_sd = {k.replace("_orig_mod.", ""): v
                 for k, v in model.state_dict().items()}
-    torch.save(final_sd, worker_dir / "final_model.pt")
+    atomic_torch_save(final_sd, worker_dir / "final_model.pt")
 
     new_positions = positions_seen - start_positions
     print(f"\n  [W{worker_id}] Summary:")
@@ -830,6 +974,24 @@ def _train_worker_inner(worker_id, device, worker_dir):
     peak = torch.cuda.max_memory_allocated(device) / 1e9
     print(f"    Peak GPU mem: {peak:.1f} GB")
     print(flush=True)
+    append_worker_event(
+        worker_id,
+        "worker_complete",
+        positions_seen=positions_seen,
+        global_step=global_step,
+        total_time_s=round(total_time),
+        throughput_pos_s=round(new_positions / total_time) if total_time > 0 else 0,
+        peak_mem_gb=round(peak, 2),
+    )
+    write_worker_status(
+        worker_id,
+        state="complete" if not SHUTDOWN_REQUESTED else "shutdown",
+        global_step=global_step,
+        positions_seen=positions_seen,
+        best_acc=best_acc,
+        total_time_s=round(total_time),
+        peak_mem_gb=round(peak, 2),
+    )
 
 
 # ── Orchestrator ──
@@ -838,11 +1000,12 @@ def train():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     SYNC_DIR.mkdir(parents=True, exist_ok=True)
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*72}")
     print(f" EXP075: LOCAL SGD -- {NUM_GPUS}xA40 MULTI-GPU TRAINING")
     print(f"{'='*72}")
-    print(f"  Timestamp:  {datetime.now(timezone.utc).isoformat()}")
+    print(f"  Timestamp:  {utcnow_iso()}")
     print(f"  GPUs:       {NUM_GPUS}x {torch.cuda.get_device_name(0)}")
     for i in range(NUM_GPUS):
         vram = torch.cuda.get_device_properties(i).total_memory / 1e9
@@ -856,6 +1019,22 @@ def train():
           f"(eff={BATCH_SIZE * ACCUM_STEPS}), lr={LR}")
     print(f"  Output:     {OUTPUT_DIR}")
     print(flush=True)
+    atomic_write_json(
+        OUTPUT_DIR / "run_manifest.json",
+        {
+            "timestamp": utcnow_iso(),
+            "experiment": "exp075_ddp_4gpu",
+            "num_gpus": NUM_GPUS,
+            "hf_dataset": HF_DATASET,
+            "hf_model": HF_MODEL,
+            "batch_size": BATCH_SIZE,
+            "accum_steps": ACCUM_STEPS,
+            "lr": LR,
+            "sync_interval": SYNC_INTERVAL,
+            "save_interval": SAVE_INTERVAL,
+            "eval_interval": EVAL_INTERVAL,
+        },
+    )
 
     import multiprocessing as mp
     mp.set_start_method('spawn', force=True)
@@ -878,24 +1057,24 @@ def train():
 
         status = []
         for i, p in enumerate(processes):
-            log_path = OUTPUT_DIR / f"worker{i}" / "train.log"
-            if log_path.exists():
+            status_path = STATUS_DIR / f"worker{i}.json"
+            if status_path.exists():
                 try:
-                    with open(log_path, 'r') as f:
-                        lines = f.readlines()
-                    for line in reversed(lines):
-                        if "step" in line and "pos/s" in line:
-                            status.append(f"  W{i}: {line.strip()}")
-                            break
-                    else:
-                        if lines:
-                            status.append(f"  W{i}: {lines[-1].strip()[:80]}")
-                        else:
-                            status.append(f"  W{i}: empty log")
+                    payload = json.loads(status_path.read_text(encoding="utf-8"))
+                    status.append(
+                        "  W{wid}: {state} step={step} pos={pos:,} best={best:.1%} ts={ts}".format(
+                            wid=i,
+                            state=payload.get("state", "unknown"),
+                            step=payload.get("global_step", 0),
+                            pos=payload.get("positions_seen", 0),
+                            best=payload.get("best_acc", 0.0),
+                            ts=payload.get("timestamp", "?").split("T")[-1][:8],
+                        )
+                    )
                 except Exception:
                     status.append(f"  W{i}: ???")
             else:
-                status.append(f"  W{i}: no log yet")
+                status.append(f"  W{i}: no status yet")
 
         print(f"\n  [{datetime.now().strftime('%H:%M:%S')}] "
               f"{alive}/{NUM_GPUS} workers alive")
