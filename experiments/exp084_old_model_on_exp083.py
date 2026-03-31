@@ -1,0 +1,520 @@
+"""exp084: Fine-tune the pre-architecture-change 200M model on the exp083 dataset snapshot.
+
+Uses the original 16-layer / 512-head-dim / pos_embed architecture and trains on
+the persistent JSONL corpus produced by exp083.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import chess
+import torch
+import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from chess_features import batch_boards_to_fused_token_ids
+from move_vocab import UCI_TO_IDX, VOCAB_SIZE, legal_move_mask
+from play import ChessTransformer200M
+
+OUTPUT_DIR = Path("outputs/exp084_old_model_on_exp083")
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+LOG_PATH = OUTPUT_DIR / "exp084.log"
+CONFIG_PATH = OUTPUT_DIR / "config.json"
+STATUS_PATH = OUTPUT_DIR / "status.json"
+LATEST_PATH = CHECKPOINT_DIR / "latest.pt"
+BEST_PATH = OUTPUT_DIR / "best_model.pt"
+
+DATASET_PATH = Path("outputs/exp083_sf_opening_stream/dataset/positions.jsonl")
+INIT_CHECKPOINT_CANDIDATES = [
+    Path("outputs/exp082_sf_game_softloop/latest_model.pt"),
+    Path("outputs/exp082_sf_game_softloop/best_model.pt"),
+    Path("outputs/hf/chess-transformer-200m-latest/best_model.pt"),
+]
+
+SEED = 42
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP_ENABLED = DEVICE.type == "cuda"
+
+BATCH_SIZE = 4
+ACCUM_STEPS = 16
+EPOCHS = 1
+LR = 5e-6
+WEIGHT_DECAY = 0.01
+GRAD_CLIP = 0.5
+HARD_CE_WEIGHT = 0.25
+VALUE_LOSS_WEIGHT = 0.10
+EVAL_FRACTION = 0.05
+MAX_EVAL_RECORDS = 2048
+LOG_INTERVAL = 25
+SAVE_INTERVAL = 200
+UPLOAD_TO_HF = True
+HF_REPO_ID = os.environ.get("EXP084_HF_REPO", "avewright/chess-transformer-200m-latest")
+HF_PATH_PREFIX = "exp084_old_model_on_exp083"
+HF_LATEST_MODEL_PATH = f"{HF_PATH_PREFIX}/latest_model.pt"
+HF_BEST_MODEL_PATH = f"{HF_PATH_PREFIX}/best_model.pt"
+HF_STATUS_PATH = f"{HF_PATH_PREFIX}/status.json"
+HF_CONFIG_PATH = f"{HF_PATH_PREFIX}/config.json"
+HF_LOG_PATH = f"{HF_PATH_PREFIX}/exp084.log"
+
+LOG_FILE = None
+
+
+def log(message: str) -> None:
+    stamped = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    print(stamped, flush=True)
+    if LOG_FILE is not None:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(stamped + "\n")
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def save_checkpoint(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    torch.save(payload, tmp, _use_new_zipfile_serialization=False)
+    os.replace(tmp, path)
+
+
+def _hf_token_local() -> str | None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("HF_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return os.environ.get("HF_TOKEN")
+
+
+def _resolve_init_checkpoint() -> Path:
+    for candidate in INIT_CHECKPOINT_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("No initial checkpoint found for exp084.")
+
+
+def _hf_download_to_temp(path_in_repo: str) -> Path | None:
+    if not UPLOAD_TO_HF:
+        return None
+    token = _hf_token_local()
+    if not token:
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=path_in_repo,
+            repo_type="model",
+            token=token,
+        )
+        return Path(downloaded)
+    except Exception:
+        return None
+
+
+def _upload_file_to_hf(local_path: Path, path_in_repo: str) -> None:
+    if not UPLOAD_TO_HF:
+        return
+    token = _hf_token_local()
+    if not token:
+        log("[hf] no HF_TOKEN found; skipping upload")
+        return
+    try:
+        from huggingface_hub import HfApi, create_repo
+
+        api = HfApi(token=token)
+        try:
+            create_repo(HF_REPO_ID, exist_ok=True, repo_type="model", token=token)
+        except Exception:
+            pass
+
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=path_in_repo,
+            repo_id=HF_REPO_ID,
+            repo_type="model",
+        )
+    except Exception as exc:
+        log(f"[hf] upload failed for {path_in_repo}: {exc}")
+
+
+def _write_model_weights_tmp(model: ChessTransformer200M) -> Path:
+    fd, tmp_name = tempfile.mkstemp(prefix="exp084_", suffix=".pt")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    state_dict = {
+        k.replace("_orig_mod.", ""): v.detach().cpu().clone()
+        for k, v in model.state_dict().items()
+    }
+    torch.save({"model_state_dict": state_dict}, tmp_path)
+    return tmp_path
+
+
+def _upload_snapshot(model: ChessTransformer200M, status_payload: dict, is_best: bool) -> None:
+    weights_path = _write_model_weights_tmp(model)
+    try:
+        _upload_file_to_hf(weights_path, HF_LATEST_MODEL_PATH)
+        if is_best:
+            _upload_file_to_hf(weights_path, HF_BEST_MODEL_PATH)
+    finally:
+        if weights_path.exists():
+            weights_path.unlink()
+
+    _upload_file_to_hf(STATUS_PATH, HF_STATUS_PATH)
+    _upload_file_to_hf(CONFIG_PATH, HF_CONFIG_PATH)
+    _upload_file_to_hf(LOG_PATH, HF_LOG_PATH)
+
+
+def load_jsonl_dataset(path: Path) -> list[dict]:
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def sparse_soft_targets_to_dense(batch: list[dict]) -> torch.Tensor:
+    dense = torch.zeros(len(batch), VOCAB_SIZE, dtype=torch.float32)
+    for row_idx, item in enumerate(batch):
+        for target in item["soft_targets"]:
+            dense[row_idx, UCI_TO_IDX[target["uci"]]] = float(target["prob"])
+    return dense
+
+
+def load_model(checkpoint_path: Path, device: torch.device) -> ChessTransformer200M:
+    model = ChessTransformer200M()
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "model_state_dict" in state:
+        state = state["model_state_dict"]
+    state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    model.load_state_dict(state)
+    model = model.to(device)
+    return model
+
+
+def sample_batch(records: list[dict], batch_size: int) -> list[dict]:
+    if len(records) >= batch_size:
+        return random.sample(records, batch_size)
+    return [random.choice(records) for _ in range(batch_size)]
+
+
+def evaluate(model: ChessTransformer200M, eval_records: list[dict]) -> dict:
+    model.eval()
+    loss_sum = ce_sum = kl_sum = val_sum = 0.0
+    total = correct = top3 = 0
+
+    with torch.no_grad():
+        for idx in range(0, len(eval_records), BATCH_SIZE):
+            batch = eval_records[idx:idx + BATCH_SIZE]
+            boards = [chess.Board(item["fen"]) for item in batch]
+            best_moves = torch.tensor([UCI_TO_IDX[item["best_move"]] for item in batch], dtype=torch.long, device=DEVICE)
+            value_targets = torch.tensor([item["value_target"] for item in batch], dtype=torch.long, device=DEVICE)
+            soft_targets = sparse_soft_targets_to_dense(batch).to(DEVICE)
+            out = model(batch_boards_to_fused_token_ids(boards, DEVICE))
+            logits = out["policy_logits"].float()
+            value_logits = out["value_logits"].float()
+
+            hard_ce = F.cross_entropy(logits, best_moves)
+            kl = F.kl_div(F.log_softmax(logits, dim=-1), soft_targets, reduction="batchmean")
+            value_loss = F.cross_entropy(value_logits, value_targets)
+            total_loss = (1.0 - HARD_CE_WEIGHT) * kl + HARD_CE_WEIGHT * hard_ce + VALUE_LOSS_WEIGHT * value_loss
+
+            loss_sum += total_loss.item() * len(batch)
+            ce_sum += hard_ce.item() * len(batch)
+            kl_sum += kl.item() * len(batch)
+            val_sum += value_loss.item() * len(batch)
+
+            for row_idx, board in enumerate(boards):
+                masked = logits[row_idx].clone()
+                mask = legal_move_mask(board).to(DEVICE)
+                masked[~mask] = float("-inf")
+                pred_idx = masked.argmax().item()
+                true_idx = best_moves[row_idx].item()
+                if pred_idx == true_idx:
+                    correct += 1
+                topk = masked.topk(min(3, int(mask.sum().item()))).indices.tolist()
+                if true_idx in topk:
+                    top3 += 1
+                total += 1
+
+    return {
+        "loss": loss_sum / max(total, 1),
+        "ce": ce_sum / max(total, 1),
+        "kl": kl_sum / max(total, 1),
+        "value": val_sum / max(total, 1),
+        "acc": correct / max(total, 1),
+        "top3": top3 / max(total, 1),
+        "n": total,
+    }
+
+
+def train_epoch(
+    model: ChessTransformer200M,
+    optimizer: AdamW,
+    scaler: GradScaler,
+    train_records: list[dict],
+    eval_records: list[dict],
+    state: dict,
+    init_checkpoint: Path,
+) -> dict:
+    model.train()
+    random.shuffle(train_records)
+    steps_per_epoch = math.ceil(len(train_records) / (BATCH_SIZE * ACCUM_STEPS))
+    cursor = 0
+    loss_sum = ce_sum = kl_sum = val_sum = 0.0
+    best_eval = state.get("best_eval_loss", float("inf"))
+
+    for step_idx in range(steps_per_epoch):
+        optimizer.zero_grad(set_to_none=True)
+        step_loss = step_ce = step_kl = step_val = 0.0
+
+        for _ in range(ACCUM_STEPS):
+            batch = train_records[cursor:cursor + BATCH_SIZE]
+            cursor += BATCH_SIZE
+            if len(batch) < BATCH_SIZE:
+                needed = BATCH_SIZE - len(batch)
+                batch = batch + train_records[:needed]
+                cursor = needed
+
+            boards = [chess.Board(item["fen"]) for item in batch]
+            best_moves = torch.tensor([UCI_TO_IDX[item["best_move"]] for item in batch], dtype=torch.long, device=DEVICE)
+            value_targets = torch.tensor([item["value_target"] for item in batch], dtype=torch.long, device=DEVICE)
+            soft_targets = sparse_soft_targets_to_dense(batch).to(DEVICE)
+
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=AMP_ENABLED):
+                out = model(batch_boards_to_fused_token_ids(boards, DEVICE))
+                logits = out["policy_logits"]
+                value_logits = out["value_logits"]
+                hard_ce = F.cross_entropy(logits, best_moves)
+                kl = F.kl_div(F.log_softmax(logits, dim=-1), soft_targets, reduction="batchmean")
+                value_loss = F.cross_entropy(value_logits, value_targets)
+                total_loss = ((1.0 - HARD_CE_WEIGHT) * kl + HARD_CE_WEIGHT * hard_ce + VALUE_LOSS_WEIGHT * value_loss) / ACCUM_STEPS
+
+            scaler.scale(total_loss).backward()
+            step_loss += total_loss.item() * ACCUM_STEPS
+            step_ce += hard_ce.item()
+            step_kl += kl.item()
+            step_val += value_loss.item()
+
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+        state["train_steps"] += 1
+        loss_sum += step_loss
+        ce_sum += step_ce / ACCUM_STEPS
+        kl_sum += step_kl / ACCUM_STEPS
+        val_sum += step_val / ACCUM_STEPS
+
+        if state["train_steps"] % LOG_INTERVAL == 0:
+            done_steps = step_idx + 1
+            log(
+                f"train_step={state['train_steps']} epoch={state['epoch']} "
+                f"loss={loss_sum / done_steps:.4f} ce={ce_sum / done_steps:.4f} "
+                f"kl={kl_sum / done_steps:.4f} value={val_sum / done_steps:.4f} "
+                f"gnorm={float(grad_norm):.2f}"
+            )
+
+        if state["train_steps"] % SAVE_INTERVAL == 0 or step_idx == steps_per_epoch - 1:
+            eval_metrics = evaluate(model, eval_records)
+            log(
+                f"eval step={state['train_steps']} loss={eval_metrics['loss']:.4f} "
+                f"ce={eval_metrics['ce']:.4f} kl={eval_metrics['kl']:.4f} value={eval_metrics['value']:.4f} "
+                f"acc={eval_metrics['acc']:.4f} top3={eval_metrics['top3']:.4f} n={eval_metrics['n']}"
+            )
+            is_best = eval_metrics["loss"] < best_eval
+            if is_best:
+                best_eval = eval_metrics["loss"]
+            status_payload = {
+                "updated_at": utcnow_iso(),
+                "epoch": state["epoch"],
+                "train_steps": state["train_steps"],
+                "dataset_records": state["dataset_records"],
+                "best_eval_loss": best_eval,
+                "last_eval": eval_metrics,
+                "init_checkpoint": str(init_checkpoint),
+                "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
+                "hf_latest_model_path": HF_LATEST_MODEL_PATH if UPLOAD_TO_HF else None,
+                "hf_best_model_path": HF_BEST_MODEL_PATH if UPLOAD_TO_HF else None,
+            }
+            atomic_write_json(STATUS_PATH, status_payload)
+            _upload_snapshot(model, status_payload, is_best=is_best)
+
+    state["best_eval_loss"] = best_eval
+    return state
+
+
+def main() -> None:
+    global LOG_FILE
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE = LOG_PATH
+
+    records = load_jsonl_dataset(DATASET_PATH)
+    random.shuffle(records)
+    eval_size = min(MAX_EVAL_RECORDS, max(512, int(len(records) * EVAL_FRACTION)))
+    eval_records = records[:eval_size]
+    train_records = records[eval_size:]
+
+    init_checkpoint = _resolve_init_checkpoint()
+    model = load_model(init_checkpoint, DEVICE)
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scaler = GradScaler(device="cuda", enabled=AMP_ENABLED)
+
+    state = {
+        "epoch": 1,
+        "train_steps": 0,
+        "best_eval_loss": float("inf"),
+        "dataset_records": len(records),
+    }
+
+    if LATEST_PATH.exists():
+        ckpt = torch.load(LATEST_PATH, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        state["epoch"] = int(ckpt.get("epoch", 1))
+        state["train_steps"] = int(ckpt.get("train_steps", 0))
+        state["best_eval_loss"] = float(ckpt.get("best_eval_loss", float("inf")))
+        log(f"resumed from {LATEST_PATH} at epoch={state['epoch']} step={state['train_steps']}")
+    else:
+        remote_model = _hf_download_to_temp(HF_LATEST_MODEL_PATH)
+        remote_status = _hf_download_to_temp(HF_STATUS_PATH)
+        if remote_model is not None:
+            remote_ckpt = torch.load(remote_model, map_location="cpu", weights_only=False)
+            remote_state = remote_ckpt.get("model_state_dict", remote_ckpt)
+            model.load_state_dict(remote_state)
+            if remote_status is not None:
+                try:
+                    status = json.loads(remote_status.read_text(encoding="utf-8"))
+                    state["epoch"] = int(status.get("epoch", 1))
+                    state["train_steps"] = int(status.get("train_steps", 0))
+                    state["best_eval_loss"] = float(status.get("best_eval_loss", float("inf")))
+                except Exception as exc:
+                    log(f"[hf] failed to parse remote status: {exc}")
+            log(
+                f"resumed weights from hf://{HF_REPO_ID}/{HF_LATEST_MODEL_PATH} "
+                f"at epoch={state['epoch']} step={state['train_steps']}"
+            )
+
+    atomic_write_json(
+        CONFIG_PATH,
+        {
+            "started_at": utcnow_iso(),
+            "init_checkpoint": str(init_checkpoint),
+            "dataset_path": str(DATASET_PATH),
+            "dataset_records": len(records),
+            "train_records": len(train_records),
+            "eval_records": len(eval_records),
+            "batch_size": BATCH_SIZE,
+            "accum_steps": ACCUM_STEPS,
+            "effective_batch": BATCH_SIZE * ACCUM_STEPS,
+            "epochs": EPOCHS,
+            "lr": LR,
+            "weight_decay": WEIGHT_DECAY,
+            "grad_clip": GRAD_CLIP,
+            "hard_ce_weight": HARD_CE_WEIGHT,
+            "value_loss_weight": VALUE_LOSS_WEIGHT,
+            "device": str(DEVICE),
+            "upload_to_hf": UPLOAD_TO_HF,
+            "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
+            "hf_path_prefix": HF_PATH_PREFIX if UPLOAD_TO_HF else None,
+        },
+    )
+
+    log("=" * 72)
+    log("exp084: old-architecture model fine-tune on exp083 dataset snapshot")
+    log("=" * 72)
+    log(f"device={DEVICE}")
+    if DEVICE.type == "cuda":
+        log(f"gpu={torch.cuda.get_device_name(0)} vram_gb={torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}")
+    log(f"dataset_records={len(records)} train={len(train_records)} eval={len(eval_records)}")
+    log(f"effective_batch={BATCH_SIZE * ACCUM_STEPS} epochs={EPOCHS}")
+    log(f"init_checkpoint={init_checkpoint}")
+    if UPLOAD_TO_HF:
+        log(f"hf_checkpoint_target={HF_REPO_ID}/{HF_PATH_PREFIX}")
+
+    initial_eval = evaluate(model, eval_records)
+    log(
+        f"initial_eval loss={initial_eval['loss']:.4f} ce={initial_eval['ce']:.4f} "
+        f"kl={initial_eval['kl']:.4f} value={initial_eval['value']:.4f} "
+        f"acc={initial_eval['acc']:.4f} top3={initial_eval['top3']:.4f} n={initial_eval['n']}"
+    )
+    state["best_eval_loss"] = min(state["best_eval_loss"], initial_eval["loss"])
+    atomic_write_json(
+        STATUS_PATH,
+        {
+            "updated_at": utcnow_iso(),
+            "epoch": state["epoch"],
+            "train_steps": state["train_steps"],
+            "dataset_records": state["dataset_records"],
+            "best_eval_loss": state["best_eval_loss"],
+            "last_eval": initial_eval,
+        },
+    )
+
+    while state["epoch"] <= EPOCHS:
+        train_epoch(model, optimizer, scaler, train_records, eval_records, state, init_checkpoint)
+        state["epoch"] += 1
+
+    final_eval = evaluate(model, eval_records)
+    log(
+        f"final_eval loss={final_eval['loss']:.4f} ce={final_eval['ce']:.4f} "
+        f"kl={final_eval['kl']:.4f} value={final_eval['value']:.4f} "
+        f"acc={final_eval['acc']:.4f} top3={final_eval['top3']:.4f} n={final_eval['n']}"
+    )
+    final_is_best = final_eval["loss"] <= state["best_eval_loss"]
+    final_status = {
+        "updated_at": utcnow_iso(),
+        "epoch": state["epoch"],
+        "train_steps": state["train_steps"],
+        "dataset_records": state["dataset_records"],
+        "best_eval_loss": min(state["best_eval_loss"], final_eval["loss"]),
+        "last_eval": final_eval,
+        "done": True,
+        "init_checkpoint": str(init_checkpoint),
+        "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
+        "hf_latest_model_path": HF_LATEST_MODEL_PATH if UPLOAD_TO_HF else None,
+        "hf_best_model_path": HF_BEST_MODEL_PATH if UPLOAD_TO_HF else None,
+    }
+    atomic_write_json(STATUS_PATH, final_status)
+    _upload_snapshot(model, final_status, is_best=final_is_best)
+    log("done")
+
+
+if __name__ == "__main__":
+    main()
