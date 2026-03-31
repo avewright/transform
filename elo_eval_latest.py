@@ -1,6 +1,8 @@
 import argparse
 import json
 import math
+import os
+import shutil
 from pathlib import Path
 
 import chess
@@ -10,7 +12,6 @@ import torch
 from play import load_model, get_model_move
 
 ROOT = Path(__file__).resolve().parent
-SF = ROOT / "stockfish" / "stockfish" / "stockfish-windows-x86-64-avx2.exe"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_CHECKPOINT = ROOT / "outputs" / "hf" / "chess-transformer-200m-latest" / "best_model.pt"
 
@@ -28,6 +29,32 @@ DEFAULT_TEST_ELOS = [1320, 1450, 1600, 1750, 1900]
 
 LOG: Path
 JSON_OUT: Path
+
+
+def resolve_stockfish_path() -> Path:
+    configured = os.environ.get("STOCKFISH_PATH")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    binary = shutil.which("stockfish")
+    if binary:
+        candidates.append(Path(binary))
+    candidates.extend(
+        [
+            Path("/usr/games/stockfish"),
+            Path("/usr/bin/stockfish"),
+            ROOT / "stockfish" / "stockfish" / "stockfish-ubuntu-x86-64-avx2",
+            ROOT / "stockfish" / "stockfish" / "stockfish-windows-x86-64-avx2.exe",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    checked = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Unable to locate Stockfish binary. Checked: {checked}")
+
+
+SF = resolve_stockfish_path()
 
 
 def log(msg: str) -> None:

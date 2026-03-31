@@ -21,6 +21,7 @@ import os
 import random
 import signal
 import sqlite3
+import shutil
 import sys
 import threading
 import time
@@ -37,7 +38,6 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
 OUTPUT_DIR = Path("outputs/exp085_parallel_multipv_harvest")
 DATASET_DIR = OUTPUT_DIR / "dataset"
 STATUS_PATH = OUTPUT_DIR / "status.json"
@@ -47,12 +47,14 @@ DB_PATH = OUTPUT_DIR / "seen_positions.sqlite"
 
 LABEL_TAU = 120.0
 STATUS_INTERVAL_SEC = 15.0
-TASK_QUEUE_MAXSIZE = 2048
-RESULT_QUEUE_MAXSIZE = 2048
+TASK_QUEUE_MAXSIZE = 8192
+RESULT_QUEUE_MAXSIZE = 8192
 DEFAULT_SHARD_RECORDS = 5000
+DB_COMMIT_INTERVAL = 100
+WRITER_FLUSH_INTERVAL = 100
 
-SF_THREADS = 1
-SF_HASH_MB = 64
+DEFAULT_SF_THREADS = 1
+DEFAULT_SF_HASH_MB = 128
 
 OPENINGS = [
     {"name": "startpos", "moves": []},
@@ -79,6 +81,31 @@ OPENINGS = [
 
 STOP_REQUESTED = False
 LOG_FILE = None
+
+
+def resolve_stockfish_path() -> Path:
+    configured = os.environ.get("STOCKFISH_PATH")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    binary = shutil.which("stockfish")
+    if binary:
+        candidates.append(Path(binary))
+    candidates.extend(
+        [
+            Path("/usr/games/stockfish"),
+            Path("/usr/bin/stockfish"),
+            Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe"),
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    checked = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Unable to locate Stockfish binary. Checked: {checked}")
+
+
+STOCKFISH_PATH = resolve_stockfish_path()
 
 
 def log(message: str) -> None:
@@ -113,9 +140,9 @@ def phase_name(board: chess.Board) -> str:
     return "endgame"
 
 
-def create_engine() -> chess.engine.SimpleEngine:
+def create_engine(*, threads: int, hash_mb: int) -> chess.engine.SimpleEngine:
     engine = chess.engine.SimpleEngine.popen_uci(str(STOCKFISH_PATH))
-    engine.configure({"Threads": SF_THREADS, "Hash": SF_HASH_MB})
+    engine.configure({"Threads": threads, "Hash": hash_mb})
     return engine
 
 
@@ -374,6 +401,9 @@ class PositionIndex:
         )
         self.conn.commit()
         self.lock = threading.Lock()
+        row = self.conn.execute("SELECT COUNT(*) FROM positions").fetchone()
+        self.cached_count = int(row[0] if row else 0)
+        self.pending_writes = 0
 
     def contains(self, position_key: str) -> bool:
         with self.lock:
@@ -401,16 +431,24 @@ class PositionIndex:
                     shard_name,
                 ),
             )
-            self.conn.commit()
-        return cursor.rowcount > 0
+            inserted = cursor.rowcount > 0
+            if inserted:
+                self.cached_count += 1
+                self.pending_writes += 1
+                if self.pending_writes >= DB_COMMIT_INTERVAL:
+                    self.conn.commit()
+                    self.pending_writes = 0
+        return inserted
 
     def count(self) -> int:
         with self.lock:
-            row = self.conn.execute("SELECT COUNT(*) FROM positions").fetchone()
-        return int(row[0] if row else 0)
+            return self.cached_count
 
     def close(self) -> None:
         with self.lock:
+            if self.pending_writes:
+                self.conn.commit()
+                self.pending_writes = 0
             self.conn.close()
 
 
@@ -424,6 +462,7 @@ class ShardedJsonlWriter:
         self.current_path: Path | None = None
         self.current_handle = None
         self.lock = threading.Lock()
+        self.pending_flush = 0
         self._rotate()
 
     def _rotate(self) -> None:
@@ -432,6 +471,7 @@ class ShardedJsonlWriter:
             self.current_handle.close()
         self.shard_index += 1
         self.current_records = 0
+        self.pending_flush = 0
         self.current_path = self.root / f"positions_{self.shard_index:06d}.jsonl"
         self.current_handle = open(self.current_path, "a", encoding="utf-8")
 
@@ -442,8 +482,11 @@ class ShardedJsonlWriter:
             assert self.current_handle is not None
             assert self.current_path is not None
             self.current_handle.write(json.dumps(record) + "\n")
-            self.current_handle.flush()
             self.current_records += 1
+            self.pending_flush += 1
+            if self.pending_flush >= WRITER_FLUSH_INTERVAL:
+                self.current_handle.flush()
+                self.pending_flush = 0
             return self.current_path.name
 
     def snapshot(self) -> dict:
@@ -460,6 +503,7 @@ class ShardedJsonlWriter:
                 self.current_handle.flush()
                 self.current_handle.close()
                 self.current_handle = None
+                self.pending_flush = 0
 
 
 def build_trajectory(
@@ -516,6 +560,7 @@ def choose_positions_from_trajectory(
 
 
 def scheduler_worker(
+    scheduler_id: int,
     task_queue: Queue,
     stop_event: threading.Event,
     store: PositionIndex,
@@ -524,8 +569,8 @@ def scheduler_worker(
     stats: HarvestStats,
     args: argparse.Namespace,
 ) -> None:
-    rng = random.Random(args.seed + 17)
-    engine = create_engine()
+    rng = random.Random(args.seed + 17 + scheduler_id)
+    engine = create_engine(threads=args.sf_threads, hash_mb=args.sf_hash_mb)
     try:
         while not stop_event.is_set():
             if args.max_records > 0:
@@ -547,7 +592,10 @@ def scheduler_worker(
             )
             stats.incr("lineages_started", 1)
             chosen = choose_positions_from_trajectory(positions, args.positions_per_lineage, rng)
-            lineage_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{stats.snapshot()['lineages_started']:08d}"
+            lineage_id = (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                f"s{scheduler_id:02d}_{stats.snapshot()['lineages_started']:08d}"
+            )
 
             for candidate in chosen:
                 if stop_event.is_set():
@@ -599,7 +647,7 @@ def label_worker(
     stop_event: threading.Event,
     args: argparse.Namespace,
 ) -> None:
-    engine = create_engine()
+    engine = create_engine(threads=args.sf_threads, hash_mb=args.sf_hash_mb)
     try:
         while True:
             try:
@@ -720,7 +768,10 @@ def write_manifest(args: argparse.Namespace) -> None:
             "dataset_dir": str(DATASET_DIR),
             "db_path": str(DB_PATH),
             "config": {
+                "scheduler_count": args.scheduler_count,
                 "worker_count": args.worker_count,
+                "sf_threads": args.sf_threads,
+                "sf_hash_mb": args.sf_hash_mb,
                 "label_depth": args.label_depth,
                 "label_multipv": args.label_multipv,
                 "label_tau": args.label_tau,
@@ -771,7 +822,10 @@ def signal_handler(_signum, _frame) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Parallel Stockfish multipv soft-target harvester")
-    parser.add_argument("--worker-count", type=int, default=4)
+    parser.add_argument("--scheduler-count", type=int, default=8)
+    parser.add_argument("--worker-count", type=int, default=96)
+    parser.add_argument("--sf-threads", type=int, default=DEFAULT_SF_THREADS)
+    parser.add_argument("--sf-hash-mb", type=int, default=DEFAULT_SF_HASH_MB)
     parser.add_argument("--label-depth", type=int, default=10)
     parser.add_argument("--label-multipv", type=int, default=8)
     parser.add_argument("--label-tau", type=float, default=LABEL_TAU)
@@ -805,7 +859,11 @@ def main() -> None:
     log("=" * 72)
     log("exp085: parallel Stockfish multipv harvesting")
     log("=" * 72)
-    log(f"worker_count={args.worker_count} label_depth={args.label_depth} label_multipv={args.label_multipv}")
+    log(
+        f"scheduler_count={args.scheduler_count} worker_count={args.worker_count} "
+        f"sf_threads={args.sf_threads} sf_hash_mb={args.sf_hash_mb}"
+    )
+    log(f"label_depth={args.label_depth} label_multipv={args.label_multipv}")
     log(f"play_depth={args.play_depth} play_multipv={args.play_multipv} positions_per_lineage={args.positions_per_lineage}")
     if args.max_records > 0:
         log(f"max_records={args.max_records}")
@@ -825,13 +883,16 @@ def main() -> None:
     inflight: set[str] = set()
     inflight_lock = threading.Lock()
 
-    scheduler = threading.Thread(
-        target=scheduler_worker,
-        args=(task_queue, stop_event, store, inflight, inflight_lock, stats, args),
-        daemon=True,
-        name="scheduler",
-    )
-    scheduler.start()
+    schedulers = []
+    for scheduler_id in range(args.scheduler_count):
+        thread = threading.Thread(
+            target=scheduler_worker,
+            args=(scheduler_id, task_queue, stop_event, store, inflight, inflight_lock, stats, args),
+            daemon=True,
+            name=f"scheduler-{scheduler_id}",
+        )
+        thread.start()
+        schedulers.append(thread)
 
     workers = []
     for worker_id in range(args.worker_count):
@@ -877,7 +938,8 @@ def main() -> None:
                 break
     finally:
         stop_event.set()
-        scheduler.join(timeout=5.0)
+        for scheduler in schedulers:
+            scheduler.join(timeout=5.0)
         for _ in workers:
             while True:
                 try:

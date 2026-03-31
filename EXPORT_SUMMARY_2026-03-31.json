@@ -1,0 +1,49 @@
+{
+  "export_date": "2026-03-31",
+  "model_repo": "avewright/chess-transformer-200m-latest",
+  "dataset_repo": "avewright/exp085-parallel-multipv-harvest",
+  "selected_model_revision": "c01d9434fbcd1a5e501f2f82ff88e89134c30f29",
+  "selected_model": {
+    "epoch": 7,
+    "train_steps": 2742,
+    "dataset_records": 107851,
+    "last_eval": {
+      "loss": 1.3680388554930687,
+      "ce": 1.983922704035649,
+      "kl": 1.0420954646542668,
+      "value": 0.9048658355022781,
+      "acc": 0.40478515625,
+      "top3": 0.69970703125,
+      "n": 2048
+    },
+    "quick_elo_estimate": 1646
+  },
+  "comparison_model": {
+    "epoch": 10,
+    "train_steps": 10600,
+    "last_eval": {
+      "loss": 2.3389811488450505,
+      "ce": 2.4491472522349795,
+      "kl": 2.185409284022171,
+      "value": 0.8763737036497332,
+      "acc": 0.38916015625,
+      "top3": 0.69873046875,
+      "n": 2048
+    },
+    "quick_elo_estimate": 1600
+  },
+  "dataset_snapshot": {
+    "files": 44,
+    "records": 224191,
+    "bytes": 551330268,
+    "last_shard": "positions_000044.jsonl",
+    "last_shard_records": 2724,
+    "status_written_positions": 217718,
+    "status_exact_positions_seen": 224181,
+    "status_records_per_min": 553.31
+  },
+  "git": {
+    "remote": "https://github.com/avewright/transform.git",
+    "branch": "main"
+  }
+}

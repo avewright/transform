@@ -6,6 +6,8 @@ the persistent JSONL corpus produced by exp083.
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import math
 import os
@@ -34,9 +36,10 @@ LOG_PATH = OUTPUT_DIR / "exp084.log"
 CONFIG_PATH = OUTPUT_DIR / "config.json"
 STATUS_PATH = OUTPUT_DIR / "status.json"
 LATEST_PATH = CHECKPOINT_DIR / "latest.pt"
+BEST_STATE_PATH = CHECKPOINT_DIR / "best.pt"
 BEST_PATH = OUTPUT_DIR / "best_model.pt"
 
-DATASET_PATH = Path("outputs/exp083_sf_opening_stream/dataset/positions.jsonl")
+DEFAULT_DATASET_PATH = Path("outputs/exp083_sf_opening_stream/dataset/positions.jsonl")
 INIT_CHECKPOINT_CANDIDATES = [
     Path("outputs/exp082_sf_game_softloop/latest_model.pt"),
     Path("outputs/exp082_sf_game_softloop/best_model.pt"),
@@ -59,14 +62,23 @@ EVAL_FRACTION = 0.05
 MAX_EVAL_RECORDS = 2048
 LOG_INTERVAL = 25
 SAVE_INTERVAL = 200
+UPLOAD_INTERVAL_SEC = 300
 UPLOAD_TO_HF = True
 HF_REPO_ID = os.environ.get("EXP084_HF_REPO", "avewright/chess-transformer-200m-latest")
-HF_PATH_PREFIX = "exp084_old_model_on_exp083"
-HF_LATEST_MODEL_PATH = f"{HF_PATH_PREFIX}/latest_model.pt"
-HF_BEST_MODEL_PATH = f"{HF_PATH_PREFIX}/best_model.pt"
-HF_STATUS_PATH = f"{HF_PATH_PREFIX}/status.json"
-HF_CONFIG_PATH = f"{HF_PATH_PREFIX}/config.json"
-HF_LOG_PATH = f"{HF_PATH_PREFIX}/exp084.log"
+HF_PATH_PREFIX = os.environ.get("EXP084_HF_PATH_PREFIX", "").strip().strip("/")
+
+
+def _hf_repo_path(filename: str) -> str:
+    return f"{HF_PATH_PREFIX}/{filename}" if HF_PATH_PREFIX else filename
+
+
+HF_LATEST_MODEL_PATH = _hf_repo_path("latest_model.pt")
+HF_BEST_MODEL_PATH = _hf_repo_path("best_model.pt")
+HF_STATUS_PATH = _hf_repo_path("status.json")
+HF_CONFIG_PATH = _hf_repo_path("config.json")
+HF_LOG_PATH = _hf_repo_path("exp084.log")
+HF_RUN_START_MODEL_PATH = _hf_repo_path("run_start_model.pt")
+HF_RUN_START_STATUS_PATH = _hf_repo_path("run_start_status.json")
 
 LOG_FILE = None
 
@@ -103,6 +115,40 @@ def save_checkpoint(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+def _model_state_dict_cpu(model: ChessTransformer200M) -> dict:
+    return {
+        k.replace("_orig_mod.", ""): v.detach().cpu().clone()
+        for k, v in model.state_dict().items()
+    }
+
+
+def build_resume_checkpoint(
+    *,
+    model: ChessTransformer200M,
+    optimizer: AdamW,
+    scaler: GradScaler,
+    state: dict,
+    eval_fens: set[str],
+) -> dict:
+    payload = {
+        "model_state_dict": _model_state_dict_cpu(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if AMP_ENABLED else None,
+        "epoch": int(state["epoch"]),
+        "train_steps": int(state["train_steps"]),
+        "best_eval_loss": float(state["best_eval_loss"]),
+        "last_eval": state.get("last_eval"),
+        "last_upload_time": float(state.get("last_upload_time", time.time())),
+        "dataset_records": int(state.get("dataset_records", 0)),
+        "eval_fens": sorted(eval_fens),
+        "python_random_state": random.getstate(),
+        "torch_random_state": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_random_state_all"] = torch.cuda.get_rng_state_all()
+    return payload
+
+
 def _hf_token_local() -> str | None:
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
@@ -112,11 +158,16 @@ def _hf_token_local() -> str | None:
     return os.environ.get("HF_TOKEN")
 
 
-def _resolve_init_checkpoint() -> Path:
+def _resolve_init_checkpoint(prefer: str = "latest") -> Path | None:
     for candidate in INIT_CHECKPOINT_CANDIDATES:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError("No initial checkpoint found for exp084.")
+    remote_paths = [HF_BEST_MODEL_PATH, HF_LATEST_MODEL_PATH] if prefer == "best" else [HF_LATEST_MODEL_PATH, HF_BEST_MODEL_PATH]
+    for remote_path in remote_paths:
+        downloaded = _hf_download_to_temp(remote_path)
+        if downloaded is not None:
+            return downloaded
+    return None
 
 
 def _hf_download_to_temp(path_in_repo: str) -> Path | None:
@@ -169,10 +220,7 @@ def _write_model_weights_tmp(model: ChessTransformer200M) -> Path:
     fd, tmp_name = tempfile.mkstemp(prefix="exp084_", suffix=".pt")
     os.close(fd)
     tmp_path = Path(tmp_name)
-    state_dict = {
-        k.replace("_orig_mod.", ""): v.detach().cpu().clone()
-        for k, v in model.state_dict().items()
-    }
+    state_dict = _model_state_dict_cpu(model)
     torch.save({"model_state_dict": state_dict}, tmp_path)
     return tmp_path
 
@@ -192,14 +240,74 @@ def _upload_snapshot(model: ChessTransformer200M, status_payload: dict, is_best:
     _upload_file_to_hf(LOG_PATH, HF_LOG_PATH)
 
 
-def load_jsonl_dataset(path: Path) -> list[dict]:
+def _upload_run_start_snapshot(init_checkpoint: Path, status_payload: dict) -> None:
+    if not UPLOAD_TO_HF:
+        return
+    _upload_file_to_hf(init_checkpoint, HF_RUN_START_MODEL_PATH)
+    run_start_status = dict(status_payload)
+    run_start_status["backup_kind"] = "run_start"
+    fd, tmp_name = tempfile.mkstemp(prefix="exp084_run_start_", suffix=".json")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        atomic_write_json(tmp_path, run_start_status)
+        _upload_file_to_hf(tmp_path, HF_RUN_START_STATUS_PATH)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def build_status_payload(
+    *,
+    state: dict,
+    init_checkpoint: Path,
+    last_eval: dict | None,
+    done: bool = False,
+) -> dict:
+    return {
+        "updated_at": utcnow_iso(),
+        "epoch": state["epoch"],
+        "train_steps": state["train_steps"],
+        "dataset_records": state["dataset_records"],
+        "best_eval_loss": state["best_eval_loss"],
+        "last_eval": last_eval,
+        "done": done,
+        "init_checkpoint": str(init_checkpoint),
+        "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
+        "hf_latest_model_path": HF_LATEST_MODEL_PATH if UPLOAD_TO_HF else None,
+        "hf_best_model_path": HF_BEST_MODEL_PATH if UPLOAD_TO_HF else None,
+    }
+
+
+def load_jsonl_dataset(paths: list[Path]) -> list[dict]:
     records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
     return records
+
+
+def stable_train_eval_split(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    if not records:
+        return [], []
+
+    eval_target = min(MAX_EVAL_RECORDS, max(512, int(len(records) * EVAL_FRACTION)))
+    keyed: list[tuple[int, dict]] = []
+    for item in records:
+        fen = item["fen"]
+        digest = hashlib.blake2b(fen.encode("utf-8"), digest_size=8).digest()
+        keyed.append((int.from_bytes(digest, "big"), item))
+    keyed.sort(key=lambda pair: pair[0])
+    eval_records = [item for _, item in keyed[:eval_target]]
+    train_records = [item for _, item in keyed[eval_target:]]
+    return train_records, eval_records
+
+
+def train_split_with_fixed_eval(records: list[dict], eval_fens: set[str]) -> list[dict]:
+    return [item for item in records if item["fen"] not in eval_fens]
 
 
 def sparse_soft_targets_to_dense(batch: list[dict]) -> torch.Tensor:
@@ -283,6 +391,7 @@ def train_epoch(
     scaler: GradScaler,
     train_records: list[dict],
     eval_records: list[dict],
+    eval_fens: set[str],
     state: dict,
     init_checkpoint: Path,
 ) -> dict:
@@ -292,6 +401,8 @@ def train_epoch(
     cursor = 0
     loss_sum = ce_sum = kl_sum = val_sum = 0.0
     best_eval = state.get("best_eval_loss", float("inf"))
+    last_upload_time = float(state.get("last_upload_time", time.time()))
+    last_eval_metrics = state.get("last_eval")
 
     for step_idx in range(steps_per_epoch):
         optimizer.zero_grad(set_to_none=True)
@@ -346,6 +457,31 @@ def train_epoch(
                 f"gnorm={float(grad_norm):.2f}"
             )
 
+        now = time.time()
+        if UPLOAD_TO_HF and now - last_upload_time >= UPLOAD_INTERVAL_SEC:
+            state["best_eval_loss"] = best_eval
+            state["last_eval"] = last_eval_metrics
+            save_checkpoint(
+                LATEST_PATH,
+                build_resume_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    state=state,
+                    eval_fens=eval_fens,
+                ),
+            )
+            heartbeat_status = build_status_payload(
+                state=state,
+                init_checkpoint=init_checkpoint,
+                last_eval=last_eval_metrics,
+            )
+            atomic_write_json(STATUS_PATH, heartbeat_status)
+            log(f"[hf] heartbeat upload at step={state['train_steps']}")
+            _upload_snapshot(model, heartbeat_status, is_best=False)
+            last_upload_time = time.time()
+            state["last_upload_time"] = last_upload_time
+
         if state["train_steps"] % SAVE_INTERVAL == 0 or step_idx == steps_per_epoch - 1:
             eval_metrics = evaluate(model, eval_records)
             log(
@@ -356,27 +492,67 @@ def train_epoch(
             is_best = eval_metrics["loss"] < best_eval
             if is_best:
                 best_eval = eval_metrics["loss"]
-            status_payload = {
-                "updated_at": utcnow_iso(),
-                "epoch": state["epoch"],
-                "train_steps": state["train_steps"],
-                "dataset_records": state["dataset_records"],
-                "best_eval_loss": best_eval,
-                "last_eval": eval_metrics,
-                "init_checkpoint": str(init_checkpoint),
-                "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
-                "hf_latest_model_path": HF_LATEST_MODEL_PATH if UPLOAD_TO_HF else None,
-                "hf_best_model_path": HF_BEST_MODEL_PATH if UPLOAD_TO_HF else None,
-            }
+            last_eval_metrics = eval_metrics
+            state["best_eval_loss"] = best_eval
+            state["last_eval"] = eval_metrics
+            resume_payload = build_resume_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                state=state,
+                eval_fens=eval_fens,
+            )
+            save_checkpoint(LATEST_PATH, resume_payload)
+            if is_best:
+                save_checkpoint(BEST_STATE_PATH, resume_payload)
+            status_payload = build_status_payload(
+                state=state,
+                init_checkpoint=init_checkpoint,
+                last_eval=eval_metrics,
+            )
             atomic_write_json(STATUS_PATH, status_payload)
             _upload_snapshot(model, status_payload, is_best=is_best)
+            last_upload_time = time.time()
+            state["last_upload_time"] = last_upload_time
 
     state["best_eval_loss"] = best_eval
+    state["last_eval"] = last_eval_metrics
+    state["last_upload_time"] = last_upload_time
     return state
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="exp084 trainer for JSONL soft-target datasets")
+    parser.add_argument("--dataset-path", type=Path, default=None)
+    parser.add_argument("--dataset-glob", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--upload-interval-sec", type=int, default=UPLOAD_INTERVAL_SEC)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--resume-from", choices=["latest", "best"], default="latest")
+    parser.add_argument("--reload-dataset-each-epoch", action="store_true")
+    return parser.parse_args()
+
+
+def resolve_dataset_paths(args: argparse.Namespace) -> list[Path]:
+    if args.dataset_path is not None:
+        paths = [args.dataset_path]
+    elif args.dataset_glob:
+        paths = sorted(Path().glob(args.dataset_glob))
+    elif DEFAULT_DATASET_PATH.exists():
+        paths = [DEFAULT_DATASET_PATH]
+    else:
+        paths = sorted((Path("outputs/exp085_parallel_multipv_harvest/dataset")).glob("positions_*.jsonl"))
+
+    paths = [path for path in paths if path.exists() and path.is_file()]
+    if not paths:
+        raise FileNotFoundError("No dataset files found for exp084.")
+    return paths
+
+
 def main() -> None:
-    global LOG_FILE
+    global LOG_FILE, UPLOAD_INTERVAL_SEC
+    args = parse_args()
+    UPLOAD_INTERVAL_SEC = args.upload_interval_sec
     random.seed(SEED)
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -386,15 +562,16 @@ def main() -> None:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_FILE = LOG_PATH
 
-    records = load_jsonl_dataset(DATASET_PATH)
-    random.shuffle(records)
-    eval_size = min(MAX_EVAL_RECORDS, max(512, int(len(records) * EVAL_FRACTION)))
-    eval_records = records[:eval_size]
-    train_records = records[eval_size:]
+    dataset_paths = resolve_dataset_paths(args)
+    records = load_jsonl_dataset(dataset_paths)
+    train_records, eval_records = stable_train_eval_split(records)
+    eval_fens = {item["fen"] for item in eval_records}
 
-    init_checkpoint = _resolve_init_checkpoint()
+    init_checkpoint = _resolve_init_checkpoint(args.resume_from)
+    if init_checkpoint is None:
+        raise FileNotFoundError("No initial checkpoint found locally or on Hugging Face for exp084.")
     model = load_model(init_checkpoint, DEVICE)
-    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     scaler = GradScaler(device="cuda", enabled=AMP_ENABLED)
 
     state = {
@@ -402,17 +579,36 @@ def main() -> None:
         "train_steps": 0,
         "best_eval_loss": float("inf"),
         "dataset_records": len(records),
+        "last_eval": None,
+        "last_upload_time": time.time(),
     }
 
     if LATEST_PATH.exists():
         ckpt = torch.load(LATEST_PATH, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if AMP_ENABLED and ckpt.get("scaler_state_dict"):
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         state["epoch"] = int(ckpt.get("epoch", 1))
         state["train_steps"] = int(ckpt.get("train_steps", 0))
         state["best_eval_loss"] = float(ckpt.get("best_eval_loss", float("inf")))
+        state["last_eval"] = ckpt.get("last_eval")
+        state["last_upload_time"] = float(ckpt.get("last_upload_time", time.time()))
+        state["dataset_records"] = int(ckpt.get("dataset_records", len(records)))
+        if ckpt.get("eval_fens"):
+            eval_fens = set(ckpt["eval_fens"])
+            eval_records = [item for item in records if item["fen"] in eval_fens]
+            train_records = train_split_with_fixed_eval(records, eval_fens)
+        if ckpt.get("python_random_state") is not None:
+            random.setstate(ckpt["python_random_state"])
+        if ckpt.get("torch_random_state") is not None:
+            torch.random.set_rng_state(ckpt["torch_random_state"])
+        if torch.cuda.is_available() and ckpt.get("cuda_random_state_all") is not None:
+            torch.cuda.set_rng_state_all(ckpt["cuda_random_state_all"])
         log(f"resumed from {LATEST_PATH} at epoch={state['epoch']} step={state['train_steps']}")
     else:
-        remote_model = _hf_download_to_temp(HF_LATEST_MODEL_PATH)
+        remote_model = _hf_download_to_temp(HF_BEST_MODEL_PATH if args.resume_from == "best" else HF_LATEST_MODEL_PATH)
         remote_status = _hf_download_to_temp(HF_STATUS_PATH)
         if remote_model is not None:
             remote_ckpt = torch.load(remote_model, map_location="cpu", weights_only=False)
@@ -424,10 +620,12 @@ def main() -> None:
                     state["epoch"] = int(status.get("epoch", 1))
                     state["train_steps"] = int(status.get("train_steps", 0))
                     state["best_eval_loss"] = float(status.get("best_eval_loss", float("inf")))
+                    state["last_eval"] = status.get("last_eval")
                 except Exception as exc:
                     log(f"[hf] failed to parse remote status: {exc}")
             log(
-                f"resumed weights from hf://{HF_REPO_ID}/{HF_LATEST_MODEL_PATH} "
+                f"resumed weights from hf://{HF_REPO_ID}/"
+                f"{HF_BEST_MODEL_PATH if args.resume_from == 'best' else HF_LATEST_MODEL_PATH} "
                 f"at epoch={state['epoch']} step={state['train_steps']}"
             )
 
@@ -436,19 +634,23 @@ def main() -> None:
         {
             "started_at": utcnow_iso(),
             "init_checkpoint": str(init_checkpoint),
-            "dataset_path": str(DATASET_PATH),
+            "dataset_path": str(dataset_paths[0]) if len(dataset_paths) == 1 else None,
+            "dataset_files": [str(path) for path in dataset_paths],
             "dataset_records": len(records),
             "train_records": len(train_records),
             "eval_records": len(eval_records),
+            "fixed_eval_fens": len(eval_fens),
             "batch_size": BATCH_SIZE,
             "accum_steps": ACCUM_STEPS,
             "effective_batch": BATCH_SIZE * ACCUM_STEPS,
-            "epochs": EPOCHS,
-            "lr": LR,
+            "epochs": args.epochs,
+            "lr": args.lr,
             "weight_decay": WEIGHT_DECAY,
             "grad_clip": GRAD_CLIP,
             "hard_ce_weight": HARD_CE_WEIGHT,
             "value_loss_weight": VALUE_LOSS_WEIGHT,
+            "resume_from": args.resume_from,
+            "reload_dataset_each_epoch": args.reload_dataset_each_epoch,
             "device": str(DEVICE),
             "upload_to_hf": UPLOAD_TO_HF,
             "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
@@ -462,8 +664,9 @@ def main() -> None:
     log(f"device={DEVICE}")
     if DEVICE.type == "cuda":
         log(f"gpu={torch.cuda.get_device_name(0)} vram_gb={torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}")
-    log(f"dataset_records={len(records)} train={len(train_records)} eval={len(eval_records)}")
-    log(f"effective_batch={BATCH_SIZE * ACCUM_STEPS} epochs={EPOCHS}")
+    log(f"dataset_records={len(records)} train={len(train_records)} eval={len(eval_records)} files={len(dataset_paths)}")
+    log(f"effective_batch={BATCH_SIZE * ACCUM_STEPS} epochs={args.epochs}")
+    log(f"lr={args.lr} resume_from={args.resume_from} reload_dataset_each_epoch={args.reload_dataset_each_epoch}")
     log(f"init_checkpoint={init_checkpoint}")
     if UPLOAD_TO_HF:
         log(f"hf_checkpoint_target={HF_REPO_ID}/{HF_PATH_PREFIX}")
@@ -475,20 +678,46 @@ def main() -> None:
         f"acc={initial_eval['acc']:.4f} top3={initial_eval['top3']:.4f} n={initial_eval['n']}"
     )
     state["best_eval_loss"] = min(state["best_eval_loss"], initial_eval["loss"])
+    state["last_eval"] = initial_eval
+    save_checkpoint(
+        LATEST_PATH,
+        build_resume_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            state=state,
+            eval_fens=eval_fens,
+        ),
+    )
     atomic_write_json(
         STATUS_PATH,
-        {
-            "updated_at": utcnow_iso(),
-            "epoch": state["epoch"],
-            "train_steps": state["train_steps"],
-            "dataset_records": state["dataset_records"],
-            "best_eval_loss": state["best_eval_loss"],
-            "last_eval": initial_eval,
-        },
+        build_status_payload(
+            state=state,
+            init_checkpoint=init_checkpoint,
+            last_eval=initial_eval,
+        ),
+    )
+    _upload_run_start_snapshot(
+        init_checkpoint,
+        build_status_payload(
+            state=state,
+            init_checkpoint=init_checkpoint,
+            last_eval=initial_eval,
+        ),
     )
 
-    while state["epoch"] <= EPOCHS:
-        train_epoch(model, optimizer, scaler, train_records, eval_records, state, init_checkpoint)
+    while state["epoch"] <= args.epochs:
+        if args.reload_dataset_each_epoch and state["epoch"] > 1:
+            dataset_paths = resolve_dataset_paths(args)
+            records = load_jsonl_dataset(dataset_paths)
+            eval_records = [item for item in records if item["fen"] in eval_fens]
+            train_records = train_split_with_fixed_eval(records, eval_fens)
+            state["dataset_records"] = len(records)
+            log(
+                f"reloaded_dataset epoch={state['epoch']} records={len(records)} "
+                f"train={len(train_records)} eval={len(eval_records)} files={len(dataset_paths)}"
+            )
+        train_epoch(model, optimizer, scaler, train_records, eval_records, eval_fens, state, init_checkpoint)
         state["epoch"] += 1
 
     final_eval = evaluate(model, eval_records)
@@ -498,19 +727,24 @@ def main() -> None:
         f"acc={final_eval['acc']:.4f} top3={final_eval['top3']:.4f} n={final_eval['n']}"
     )
     final_is_best = final_eval["loss"] <= state["best_eval_loss"]
-    final_status = {
-        "updated_at": utcnow_iso(),
-        "epoch": state["epoch"],
-        "train_steps": state["train_steps"],
-        "dataset_records": state["dataset_records"],
-        "best_eval_loss": min(state["best_eval_loss"], final_eval["loss"]),
-        "last_eval": final_eval,
-        "done": True,
-        "init_checkpoint": str(init_checkpoint),
-        "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
-        "hf_latest_model_path": HF_LATEST_MODEL_PATH if UPLOAD_TO_HF else None,
-        "hf_best_model_path": HF_BEST_MODEL_PATH if UPLOAD_TO_HF else None,
-    }
+    state["best_eval_loss"] = min(state["best_eval_loss"], final_eval["loss"])
+    state["last_eval"] = final_eval
+    final_resume_payload = build_resume_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        state=state,
+        eval_fens=eval_fens,
+    )
+    save_checkpoint(LATEST_PATH, final_resume_payload)
+    if final_is_best:
+        save_checkpoint(BEST_STATE_PATH, final_resume_payload)
+    final_status = build_status_payload(
+        state=state,
+        init_checkpoint=init_checkpoint,
+        last_eval=final_eval,
+        done=True,
+    )
     atomic_write_json(STATUS_PATH, final_status)
     _upload_snapshot(model, final_status, is_best=final_is_best)
     log("done")
