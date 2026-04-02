@@ -37,6 +37,7 @@ CONFIG_PATH = OUTPUT_DIR / "config.json"
 STATUS_PATH = OUTPUT_DIR / "status.json"
 LATEST_PATH = CHECKPOINT_DIR / "latest.pt"
 BEST_STATE_PATH = CHECKPOINT_DIR / "best.pt"
+LATEST_MODEL_PATH = OUTPUT_DIR / "latest_model.pt"
 BEST_PATH = OUTPUT_DIR / "best_model.pt"
 
 DEFAULT_DATASET_PATH = Path("outputs/exp083_sf_opening_stream/dataset/positions.jsonl")
@@ -58,14 +59,24 @@ WEIGHT_DECAY = 0.01
 GRAD_CLIP = 0.5
 HARD_CE_WEIGHT = 0.25
 VALUE_LOSS_WEIGHT = 0.10
+TEACHER_TEMP = 1.0
+SOFT_TOP_K = 0
+KL_CONF_SCALE = 0.0
+KL_CONF_MIN = 0.10
+KL_CONF_MAX = 1.00
 EVAL_FRACTION = 0.05
 MAX_EVAL_RECORDS = 2048
 LOG_INTERVAL = 25
 SAVE_INTERVAL = 200
 UPLOAD_INTERVAL_SEC = 300
 UPLOAD_TO_HF = True
+SAVE_CHECKPOINTS = True
+SAVE_FINAL_ONLY = False
+SAVE_WEIGHTS_ONLY_CHECKPOINTS = False
 HF_REPO_ID = os.environ.get("EXP084_HF_REPO", "avewright/chess-transformer-200m-latest")
 HF_PATH_PREFIX = os.environ.get("EXP084_HF_PATH_PREFIX", "").strip().strip("/")
+HF_DATASET_REPO = os.environ.get("EXP084_HF_DATASET_REPO", "avewright/exp085-parallel-multipv-harvest")
+HF_DATASET_GLOB = "dataset/positions_*.jsonl"
 
 
 def _hf_repo_path(filename: str) -> str:
@@ -112,6 +123,15 @@ def save_checkpoint(path: Path, payload: dict) -> None:
     if tmp.exists():
         tmp.unlink()
     torch.save(payload, tmp, _use_new_zipfile_serialization=False)
+    os.replace(tmp, path)
+
+
+def save_model_weights(path: Path, model: ChessTransformer200M) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    torch.save({"model_state_dict": _model_state_dict_cpu(model)}, tmp)
     os.replace(tmp, path)
 
 
@@ -283,10 +303,14 @@ def load_jsonl_dataset(paths: list[Path]) -> list[dict]:
     records = []
     for path in paths:
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if line:
-                    records.append(json.loads(line))
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        # Allow training off a live-growing dataset shard without dying on a partial final line.
+                        log(f"skipping malformed jsonl row path={path} line={line_no}")
     return records
 
 
@@ -310,12 +334,71 @@ def train_split_with_fixed_eval(records: list[dict], eval_fens: set[str]) -> lis
     return [item for item in records if item["fen"] not in eval_fens]
 
 
-def sparse_soft_targets_to_dense(batch: list[dict]) -> torch.Tensor:
+def _temperature_scale_probs(targets: list[dict], teacher_temp: float) -> list[float]:
+    probs = [max(float(target["prob"]), 1e-12) for target in targets]
+    if teacher_temp <= 0:
+        raise ValueError("teacher_temp must be > 0")
+    if abs(teacher_temp - 1.0) < 1e-9:
+        total = sum(probs)
+        return [prob / total for prob in probs]
+    scaled = [prob ** (1.0 / teacher_temp) for prob in probs]
+    total = sum(scaled)
+    if total <= 0:
+        return [1.0 / len(targets)] * len(targets)
+    return [prob / total for prob in scaled]
+
+
+def _select_soft_targets(item: dict, soft_top_k: int) -> list[dict]:
+    targets = item["soft_targets"]
+    if soft_top_k > 0:
+        return targets[:soft_top_k]
+    return targets
+
+
+def sparse_soft_targets_to_dense(
+    batch: list[dict],
+    teacher_temp: float = TEACHER_TEMP,
+    soft_top_k: int = SOFT_TOP_K,
+) -> torch.Tensor:
     dense = torch.zeros(len(batch), VOCAB_SIZE, dtype=torch.float32)
     for row_idx, item in enumerate(batch):
-        for target in item["soft_targets"]:
-            dense[row_idx, UCI_TO_IDX[target["uci"]]] = float(target["prob"])
+        selected_targets = _select_soft_targets(item, soft_top_k)
+        scaled_probs = _temperature_scale_probs(selected_targets, teacher_temp)
+        for target, scaled_prob in zip(selected_targets, scaled_probs):
+            dense[row_idx, UCI_TO_IDX[target["uci"]]] = float(scaled_prob)
     return dense
+
+
+def batch_kl_confidence_weights(
+    batch: list[dict],
+    *,
+    kl_conf_scale: float,
+    kl_conf_min: float,
+    kl_conf_max: float,
+) -> torch.Tensor:
+    if kl_conf_scale <= 0:
+        return torch.ones(len(batch), dtype=torch.float32)
+
+    weights = []
+    for item in batch:
+        cp_gap = max(float(item.get("cp_gap_top1_top2", 0.0)), 0.0)
+        conf = cp_gap / kl_conf_scale
+        conf = max(kl_conf_min, min(kl_conf_max, conf))
+        weights.append(conf)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def compute_policy_losses(
+    logits: torch.Tensor,
+    best_moves: torch.Tensor,
+    soft_targets: torch.Tensor,
+    kl_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hard_ce = F.cross_entropy(logits, best_moves)
+    log_probs = F.log_softmax(logits, dim=-1)
+    kl_per_sample = F.kl_div(log_probs, soft_targets, reduction="none").sum(dim=-1)
+    kl = (kl_per_sample * kl_weights).mean()
+    return hard_ce, kl
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> ChessTransformer200M:
@@ -335,7 +418,18 @@ def sample_batch(records: list[dict], batch_size: int) -> list[dict]:
     return [random.choice(records) for _ in range(batch_size)]
 
 
-def evaluate(model: ChessTransformer200M, eval_records: list[dict]) -> dict:
+def evaluate(
+    model: ChessTransformer200M,
+    eval_records: list[dict],
+    *,
+    teacher_temp: float = TEACHER_TEMP,
+    hard_ce_weight: float = HARD_CE_WEIGHT,
+    value_loss_weight: float = VALUE_LOSS_WEIGHT,
+    soft_top_k: int = SOFT_TOP_K,
+    kl_conf_scale: float = KL_CONF_SCALE,
+    kl_conf_min: float = KL_CONF_MIN,
+    kl_conf_max: float = KL_CONF_MAX,
+) -> dict:
     model.eval()
     loss_sum = ce_sum = kl_sum = val_sum = 0.0
     total = correct = top3 = 0
@@ -346,15 +440,20 @@ def evaluate(model: ChessTransformer200M, eval_records: list[dict]) -> dict:
             boards = [chess.Board(item["fen"]) for item in batch]
             best_moves = torch.tensor([UCI_TO_IDX[item["best_move"]] for item in batch], dtype=torch.long, device=DEVICE)
             value_targets = torch.tensor([item["value_target"] for item in batch], dtype=torch.long, device=DEVICE)
-            soft_targets = sparse_soft_targets_to_dense(batch).to(DEVICE)
+            soft_targets = sparse_soft_targets_to_dense(batch, teacher_temp=teacher_temp, soft_top_k=soft_top_k).to(DEVICE)
+            kl_weights = batch_kl_confidence_weights(
+                batch,
+                kl_conf_scale=kl_conf_scale,
+                kl_conf_min=kl_conf_min,
+                kl_conf_max=kl_conf_max,
+            ).to(DEVICE)
             out = model(batch_boards_to_fused_token_ids(boards, DEVICE))
             logits = out["policy_logits"].float()
             value_logits = out["value_logits"].float()
 
-            hard_ce = F.cross_entropy(logits, best_moves)
-            kl = F.kl_div(F.log_softmax(logits, dim=-1), soft_targets, reduction="batchmean")
+            hard_ce, kl = compute_policy_losses(logits, best_moves, soft_targets, kl_weights)
             value_loss = F.cross_entropy(value_logits, value_targets)
-            total_loss = (1.0 - HARD_CE_WEIGHT) * kl + HARD_CE_WEIGHT * hard_ce + VALUE_LOSS_WEIGHT * value_loss
+            total_loss = (1.0 - hard_ce_weight) * kl + hard_ce_weight * hard_ce + value_loss_weight * value_loss
 
             loss_sum += total_loss.item() * len(batch)
             ce_sum += hard_ce.item() * len(batch)
@@ -394,6 +493,13 @@ def train_epoch(
     eval_fens: set[str],
     state: dict,
     init_checkpoint: Path,
+    teacher_temp: float,
+    hard_ce_weight: float,
+    value_loss_weight: float,
+    soft_top_k: int,
+    kl_conf_scale: float,
+    kl_conf_min: float,
+    kl_conf_max: float,
 ) -> dict:
     model.train()
     random.shuffle(train_records)
@@ -419,16 +525,21 @@ def train_epoch(
             boards = [chess.Board(item["fen"]) for item in batch]
             best_moves = torch.tensor([UCI_TO_IDX[item["best_move"]] for item in batch], dtype=torch.long, device=DEVICE)
             value_targets = torch.tensor([item["value_target"] for item in batch], dtype=torch.long, device=DEVICE)
-            soft_targets = sparse_soft_targets_to_dense(batch).to(DEVICE)
+            soft_targets = sparse_soft_targets_to_dense(batch, teacher_temp=teacher_temp, soft_top_k=soft_top_k).to(DEVICE)
+            kl_weights = batch_kl_confidence_weights(
+                batch,
+                kl_conf_scale=kl_conf_scale,
+                kl_conf_min=kl_conf_min,
+                kl_conf_max=kl_conf_max,
+            ).to(DEVICE)
 
             with autocast(device_type="cuda", dtype=torch.float16, enabled=AMP_ENABLED):
                 out = model(batch_boards_to_fused_token_ids(boards, DEVICE))
                 logits = out["policy_logits"]
                 value_logits = out["value_logits"]
-                hard_ce = F.cross_entropy(logits, best_moves)
-                kl = F.kl_div(F.log_softmax(logits, dim=-1), soft_targets, reduction="batchmean")
+                hard_ce, kl = compute_policy_losses(logits, best_moves, soft_targets, kl_weights)
                 value_loss = F.cross_entropy(value_logits, value_targets)
-                total_loss = ((1.0 - HARD_CE_WEIGHT) * kl + HARD_CE_WEIGHT * hard_ce + VALUE_LOSS_WEIGHT * value_loss) / ACCUM_STEPS
+                total_loss = ((1.0 - hard_ce_weight) * kl + hard_ce_weight * hard_ce + value_loss_weight * value_loss) / ACCUM_STEPS
 
             scaler.scale(total_loss).backward()
             step_loss += total_loss.item() * ACCUM_STEPS
@@ -461,16 +572,20 @@ def train_epoch(
         if UPLOAD_TO_HF and now - last_upload_time >= UPLOAD_INTERVAL_SEC:
             state["best_eval_loss"] = best_eval
             state["last_eval"] = last_eval_metrics
-            save_checkpoint(
-                LATEST_PATH,
-                build_resume_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    state=state,
-                    eval_fens=eval_fens,
-                ),
-            )
+            if SAVE_CHECKPOINTS:
+                if SAVE_WEIGHTS_ONLY_CHECKPOINTS:
+                    save_model_weights(LATEST_MODEL_PATH, model)
+                else:
+                    save_checkpoint(
+                        LATEST_PATH,
+                        build_resume_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            state=state,
+                            eval_fens=eval_fens,
+                        ),
+                    )
             heartbeat_status = build_status_payload(
                 state=state,
                 init_checkpoint=init_checkpoint,
@@ -483,7 +598,17 @@ def train_epoch(
             state["last_upload_time"] = last_upload_time
 
         if state["train_steps"] % SAVE_INTERVAL == 0 or step_idx == steps_per_epoch - 1:
-            eval_metrics = evaluate(model, eval_records)
+            eval_metrics = evaluate(
+                model,
+                eval_records,
+                teacher_temp=teacher_temp,
+                hard_ce_weight=hard_ce_weight,
+                value_loss_weight=value_loss_weight,
+                soft_top_k=soft_top_k,
+                kl_conf_scale=kl_conf_scale,
+                kl_conf_min=kl_conf_min,
+                kl_conf_max=kl_conf_max,
+            )
             log(
                 f"eval step={state['train_steps']} loss={eval_metrics['loss']:.4f} "
                 f"ce={eval_metrics['ce']:.4f} kl={eval_metrics['kl']:.4f} value={eval_metrics['value']:.4f} "
@@ -502,9 +627,15 @@ def train_epoch(
                 state=state,
                 eval_fens=eval_fens,
             )
-            save_checkpoint(LATEST_PATH, resume_payload)
-            if is_best:
-                save_checkpoint(BEST_STATE_PATH, resume_payload)
+            if SAVE_CHECKPOINTS:
+                if SAVE_WEIGHTS_ONLY_CHECKPOINTS:
+                    save_model_weights(LATEST_MODEL_PATH, model)
+                    if is_best:
+                        save_model_weights(BEST_PATH, model)
+                else:
+                    save_checkpoint(LATEST_PATH, resume_payload)
+                    if is_best:
+                        save_checkpoint(BEST_STATE_PATH, resume_payload)
             status_payload = build_status_payload(
                 state=state,
                 init_checkpoint=init_checkpoint,
@@ -523,14 +654,44 @@ def train_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="exp084 trainer for JSONL soft-target datasets")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--init-checkpoint", type=Path, default=None)
     parser.add_argument("--dataset-path", type=Path, default=None)
     parser.add_argument("--dataset-glob", type=str, default=None)
+    parser.add_argument("--hf-dataset-repo", type=str, default=None)
+    parser.add_argument("--hf-dataset-glob", type=str, default=HF_DATASET_GLOB)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--upload-interval-sec", type=int, default=UPLOAD_INTERVAL_SEC)
     parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--teacher-temp", type=float, default=TEACHER_TEMP)
+    parser.add_argument("--hard-ce-weight", type=float, default=HARD_CE_WEIGHT)
+    parser.add_argument("--value-loss-weight", type=float, default=VALUE_LOSS_WEIGHT)
+    parser.add_argument("--soft-top-k", type=int, default=SOFT_TOP_K)
+    parser.add_argument("--kl-conf-scale", type=float, default=KL_CONF_SCALE)
+    parser.add_argument("--kl-conf-min", type=float, default=KL_CONF_MIN)
+    parser.add_argument("--kl-conf-max", type=float, default=KL_CONF_MAX)
     parser.add_argument("--resume-from", choices=["latest", "best"], default="latest")
+    parser.add_argument("--no-upload-to-hf", action="store_true")
+    parser.add_argument("--no-save-checkpoints", action="store_true")
+    parser.add_argument("--save-final-only", action="store_true")
+    parser.add_argument("--save-weights-only-checkpoints", action="store_true")
     parser.add_argument("--reload-dataset-each-epoch", action="store_true")
     return parser.parse_args()
+
+
+def _download_hf_dataset_snapshot(repo_id: str, dataset_glob: str) -> list[Path]:
+    token = _hf_token_local()
+    from huggingface_hub import snapshot_download
+
+    snapshot_dir = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            allow_patterns=[dataset_glob],
+            token=token,
+        )
+    )
+    return sorted(path for path in snapshot_dir.glob(dataset_glob) if path.is_file())
 
 
 def resolve_dataset_paths(args: argparse.Namespace) -> list[Path]:
@@ -538,6 +699,8 @@ def resolve_dataset_paths(args: argparse.Namespace) -> list[Path]:
         paths = [args.dataset_path]
     elif args.dataset_glob:
         paths = sorted(Path().glob(args.dataset_glob))
+    elif args.hf_dataset_repo:
+        paths = _download_hf_dataset_snapshot(args.hf_dataset_repo, args.hf_dataset_glob)
     elif DEFAULT_DATASET_PATH.exists():
         paths = [DEFAULT_DATASET_PATH]
     else:
@@ -550,9 +713,23 @@ def resolve_dataset_paths(args: argparse.Namespace) -> list[Path]:
 
 
 def main() -> None:
-    global LOG_FILE, UPLOAD_INTERVAL_SEC
+    global OUTPUT_DIR, CHECKPOINT_DIR, LOG_PATH, CONFIG_PATH, STATUS_PATH, LATEST_PATH, BEST_STATE_PATH, LATEST_MODEL_PATH, BEST_PATH
+    global LOG_FILE, UPLOAD_INTERVAL_SEC, UPLOAD_TO_HF, SAVE_CHECKPOINTS, SAVE_FINAL_ONLY, SAVE_WEIGHTS_ONLY_CHECKPOINTS
     args = parse_args()
     UPLOAD_INTERVAL_SEC = args.upload_interval_sec
+    UPLOAD_TO_HF = UPLOAD_TO_HF and not args.no_upload_to_hf
+    SAVE_FINAL_ONLY = args.save_final_only
+    SAVE_WEIGHTS_ONLY_CHECKPOINTS = args.save_weights_only_checkpoints
+    SAVE_CHECKPOINTS = not args.no_save_checkpoints and not SAVE_FINAL_ONLY
+    OUTPUT_DIR = args.output_dir
+    CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+    LOG_PATH = OUTPUT_DIR / "exp084.log"
+    CONFIG_PATH = OUTPUT_DIR / "config.json"
+    STATUS_PATH = OUTPUT_DIR / "status.json"
+    LATEST_PATH = CHECKPOINT_DIR / "latest.pt"
+    BEST_STATE_PATH = CHECKPOINT_DIR / "best.pt"
+    LATEST_MODEL_PATH = OUTPUT_DIR / "latest_model.pt"
+    BEST_PATH = OUTPUT_DIR / "best_model.pt"
     random.seed(SEED)
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -567,7 +744,7 @@ def main() -> None:
     train_records, eval_records = stable_train_eval_split(records)
     eval_fens = {item["fen"] for item in eval_records}
 
-    init_checkpoint = _resolve_init_checkpoint(args.resume_from)
+    init_checkpoint = args.init_checkpoint.resolve() if args.init_checkpoint is not None else _resolve_init_checkpoint(args.resume_from)
     if init_checkpoint is None:
         raise FileNotFoundError("No initial checkpoint found locally or on Hugging Face for exp084.")
     model = load_model(init_checkpoint, DEVICE)
@@ -645,12 +822,22 @@ def main() -> None:
             "effective_batch": BATCH_SIZE * ACCUM_STEPS,
             "epochs": args.epochs,
             "lr": args.lr,
+            "teacher_temp": args.teacher_temp,
+            "soft_top_k": args.soft_top_k,
+            "kl_conf_scale": args.kl_conf_scale,
+            "kl_conf_min": args.kl_conf_min,
+            "kl_conf_max": args.kl_conf_max,
             "weight_decay": WEIGHT_DECAY,
             "grad_clip": GRAD_CLIP,
-            "hard_ce_weight": HARD_CE_WEIGHT,
-            "value_loss_weight": VALUE_LOSS_WEIGHT,
+            "hard_ce_weight": args.hard_ce_weight,
+            "value_loss_weight": args.value_loss_weight,
             "resume_from": args.resume_from,
+            "save_checkpoints": SAVE_CHECKPOINTS,
+            "save_final_only": SAVE_FINAL_ONLY,
+            "save_weights_only_checkpoints": SAVE_WEIGHTS_ONLY_CHECKPOINTS,
             "reload_dataset_each_epoch": args.reload_dataset_each_epoch,
+            "hf_dataset_repo": args.hf_dataset_repo,
+            "hf_dataset_glob": args.hf_dataset_glob if args.hf_dataset_repo else None,
             "device": str(DEVICE),
             "upload_to_hf": UPLOAD_TO_HF,
             "hf_repo_id": HF_REPO_ID if UPLOAD_TO_HF else None,
@@ -666,12 +853,34 @@ def main() -> None:
         log(f"gpu={torch.cuda.get_device_name(0)} vram_gb={torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}")
     log(f"dataset_records={len(records)} train={len(train_records)} eval={len(eval_records)} files={len(dataset_paths)}")
     log(f"effective_batch={BATCH_SIZE * ACCUM_STEPS} epochs={args.epochs}")
-    log(f"lr={args.lr} resume_from={args.resume_from} reload_dataset_each_epoch={args.reload_dataset_each_epoch}")
+    log(
+        f"lr={args.lr} teacher_temp={args.teacher_temp} hard_ce_weight={args.hard_ce_weight} "
+        f"soft_top_k={args.soft_top_k} kl_conf_scale={args.kl_conf_scale} resume_from={args.resume_from} "
+        f"reload_dataset_each_epoch={args.reload_dataset_each_epoch}"
+    )
     log(f"init_checkpoint={init_checkpoint}")
     if UPLOAD_TO_HF:
         log(f"hf_checkpoint_target={HF_REPO_ID}/{HF_PATH_PREFIX}")
+    if args.hf_dataset_repo:
+        log(f"hf_dataset_source={args.hf_dataset_repo}/{args.hf_dataset_glob}")
+    if not SAVE_CHECKPOINTS:
+        log("local_checkpoints=disabled")
+    if SAVE_FINAL_ONLY:
+        log("save_strategy=final_only")
+    if SAVE_WEIGHTS_ONLY_CHECKPOINTS:
+        log("save_strategy=weights_only")
 
-    initial_eval = evaluate(model, eval_records)
+    initial_eval = evaluate(
+        model,
+        eval_records,
+        teacher_temp=args.teacher_temp,
+        hard_ce_weight=args.hard_ce_weight,
+        value_loss_weight=args.value_loss_weight,
+        soft_top_k=args.soft_top_k,
+        kl_conf_scale=args.kl_conf_scale,
+        kl_conf_min=args.kl_conf_min,
+        kl_conf_max=args.kl_conf_max,
+    )
     log(
         f"initial_eval loss={initial_eval['loss']:.4f} ce={initial_eval['ce']:.4f} "
         f"kl={initial_eval['kl']:.4f} value={initial_eval['value']:.4f} "
@@ -679,16 +888,20 @@ def main() -> None:
     )
     state["best_eval_loss"] = min(state["best_eval_loss"], initial_eval["loss"])
     state["last_eval"] = initial_eval
-    save_checkpoint(
-        LATEST_PATH,
-        build_resume_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            state=state,
-            eval_fens=eval_fens,
-        ),
-    )
+    if SAVE_CHECKPOINTS:
+        if SAVE_WEIGHTS_ONLY_CHECKPOINTS:
+            save_model_weights(LATEST_MODEL_PATH, model)
+        else:
+            save_checkpoint(
+                LATEST_PATH,
+                build_resume_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    state=state,
+                    eval_fens=eval_fens,
+                ),
+            )
     atomic_write_json(
         STATUS_PATH,
         build_status_payload(
@@ -717,10 +930,36 @@ def main() -> None:
                 f"reloaded_dataset epoch={state['epoch']} records={len(records)} "
                 f"train={len(train_records)} eval={len(eval_records)} files={len(dataset_paths)}"
             )
-        train_epoch(model, optimizer, scaler, train_records, eval_records, eval_fens, state, init_checkpoint)
+        train_epoch(
+            model,
+            optimizer,
+            scaler,
+            train_records,
+            eval_records,
+            eval_fens,
+            state,
+            init_checkpoint,
+            teacher_temp=args.teacher_temp,
+            hard_ce_weight=args.hard_ce_weight,
+            value_loss_weight=args.value_loss_weight,
+            soft_top_k=args.soft_top_k,
+            kl_conf_scale=args.kl_conf_scale,
+            kl_conf_min=args.kl_conf_min,
+            kl_conf_max=args.kl_conf_max,
+        )
         state["epoch"] += 1
 
-    final_eval = evaluate(model, eval_records)
+    final_eval = evaluate(
+        model,
+        eval_records,
+        teacher_temp=args.teacher_temp,
+        hard_ce_weight=args.hard_ce_weight,
+        value_loss_weight=args.value_loss_weight,
+        soft_top_k=args.soft_top_k,
+        kl_conf_scale=args.kl_conf_scale,
+        kl_conf_min=args.kl_conf_min,
+        kl_conf_max=args.kl_conf_max,
+    )
     log(
         f"final_eval loss={final_eval['loss']:.4f} ce={final_eval['ce']:.4f} "
         f"kl={final_eval['kl']:.4f} value={final_eval['value']:.4f} "
@@ -736,9 +975,17 @@ def main() -> None:
         state=state,
         eval_fens=eval_fens,
     )
-    save_checkpoint(LATEST_PATH, final_resume_payload)
-    if final_is_best:
-        save_checkpoint(BEST_STATE_PATH, final_resume_payload)
+    if SAVE_CHECKPOINTS:
+        if SAVE_WEIGHTS_ONLY_CHECKPOINTS:
+            save_model_weights(LATEST_MODEL_PATH, model)
+            if final_is_best:
+                save_model_weights(BEST_PATH, model)
+        else:
+            save_checkpoint(LATEST_PATH, final_resume_payload)
+            if final_is_best:
+                save_checkpoint(BEST_STATE_PATH, final_resume_payload)
+    elif SAVE_FINAL_ONLY:
+        save_checkpoint(LATEST_PATH, final_resume_payload)
     final_status = build_status_payload(
         state=state,
         init_checkpoint=init_checkpoint,

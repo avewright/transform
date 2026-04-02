@@ -8,12 +8,15 @@ from pathlib import Path
 import chess
 import chess.engine
 import torch
+import torch.nn.functional as F
 
-from play import load_model, get_model_move
+from chess_features import batch_boards_to_fused_token_ids
+from chess_transformer_factory import build_model
 
 ROOT = Path(__file__).resolve().parent
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_CHECKPOINT = ROOT / "outputs" / "hf" / "chess-transformer-200m-latest" / "best_model.pt"
+DEFAULT_MODEL_CONFIG = None
 
 DEFAULT_OPENINGS = [
     [],
@@ -57,6 +60,53 @@ def resolve_stockfish_path() -> Path:
 SF = resolve_stockfish_path()
 
 
+def load_checkpoint_state(checkpoint_path: str | Path) -> dict:
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if "model_state_dict" in state:
+        state = state["model_state_dict"]
+    return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+
+
+def load_eval_model(checkpoint_path: str | Path, device: torch.device, model_config: str | None = None):
+    if model_config is None:
+        from play import load_model
+        return load_model(str(checkpoint_path), device)
+
+    model = build_model(model_config)
+    state = load_checkpoint_state(checkpoint_path)
+    model.load_state_dict(state)
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def get_model_move_generic(model, board: chess.Board, device: torch.device, temperature: float = 0.0):
+    from move_vocab import IDX_TO_UCI, index_to_move, legal_move_mask
+
+    board_input = batch_boards_to_fused_token_ids([board], device)
+    result = model(board_input)
+    logits = result["policy_logits"][0].float()
+    mask = legal_move_mask(board).to(device)
+    logits[~mask] = float("-inf")
+
+    if temperature <= 0:
+        move_idx = logits.argmax().item()
+    else:
+        probs = F.softmax(logits / temperature, dim=-1)
+        move_idx = torch.multinomial(probs, 1).item()
+
+    move = index_to_move(move_idx)
+    probs = F.softmax(logits, dim=-1)
+    topk = torch.topk(probs, min(5, mask.sum().item()))
+    top_moves = []
+    for idx, p in zip(topk.indices.tolist(), topk.values.tolist()):
+        top_moves.append((IDX_TO_UCI[idx], f"{p*100:.1f}%"))
+    wdl_logits = result["value_logits"][0].float()
+    wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
+    return move, {"top_moves": top_moves, "wdl": {"loss": wdl_probs[0], "draw": wdl_probs[1], "win": wdl_probs[2]}}
+
+
 def log(msg: str) -> None:
     print(msg, flush=True)
     with LOG.open("a", encoding="utf-8") as f:
@@ -84,6 +134,7 @@ def opening_name(opening: list[str]) -> str:
 def play_one(
     engine: chess.engine.SimpleEngine,
     model,
+    move_fn,
     sf_elo: int,
     model_color: chess.Color,
     opening: list[str],
@@ -98,7 +149,7 @@ def play_one(
 
     while not board.is_game_over(claim_draw=True) and len(board.move_stack) < ply_cap:
         if board.turn == model_color:
-            move, _ = get_model_move(model, board, DEVICE, temperature=0.0)
+            move, _ = move_fn(model, board, DEVICE, temperature=0.0)
         else:
             move = engine.play(board, chess.engine.Limit(time=movetime)).move
         if move not in board.legal_moves:
@@ -191,6 +242,7 @@ def summarize_results(sf_elo: int, results: list[dict]) -> dict:
 
 def eval_level(
     model,
+    move_fn,
     sf_elo: int,
     openings: list[list[str]],
     games_per_opening_per_color: int,
@@ -214,6 +266,7 @@ def eval_level(
                     result = play_one(
                         engine=engine,
                         model=model,
+                        move_fn=move_fn,
                         sf_elo=sf_elo,
                         model_color=color,
                         opening=opening,
@@ -300,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Robust Elo-style evaluation vs limited-strength Stockfish")
     parser.add_argument("checkpoint", nargs="?", default=str(DEFAULT_CHECKPOINT), help="Path to model checkpoint")
     parser.add_argument("out_prefix", nargs="?", default=None, help="Output file prefix; defaults to checkpoint parent name")
+    parser.add_argument("--model-config", type=str, default=DEFAULT_MODEL_CONFIG, help="Optional model config JSON for non-play.py architectures")
     parser.add_argument("--movetime", type=float, default=0.05, help="Stockfish move time in seconds")
     parser.add_argument("--ply-cap", type=int, default=160, help="Maximum plies per game before adjudicating as a draw")
     parser.add_argument(
@@ -344,11 +398,12 @@ def write_snapshot(
                 "config": {
                     "movetime": args.movetime,
                     "ply_cap": args.ply_cap,
-                    "games_per_opening_per_color": args.games_per_opening_per_color,
-                    "elos": args.elos,
-                    "openings": [opening_name(o) for o in DEFAULT_OPENINGS],
-                    "stop_after_bracket": args.stop_after_bracket,
-                },
+                "games_per_opening_per_color": args.games_per_opening_per_color,
+                "elos": args.elos,
+                "openings": [opening_name(o) for o in DEFAULT_OPENINGS],
+                "stop_after_bracket": args.stop_after_bracket,
+                "model_config": args.model_config,
+            },
                 "summaries": summaries,
                 "games": all_games,
                 "estimate": estimate,
@@ -385,10 +440,12 @@ def main() -> None:
                 "games_per_opening_per_color": args.games_per_opening_per_color,
                 "openings": [opening_name(o) for o in DEFAULT_OPENINGS],
                 "elos": elos,
+                "model_config": args.model_config,
             }
         )
     )
-    model = load_model(str(checkpoint), DEVICE)
+    model = load_eval_model(str(checkpoint), DEVICE, model_config=args.model_config)
+    move_fn = get_model_move_generic if args.model_config else __import__("play").get_model_move
 
     summaries = []
     all_games = []
@@ -396,6 +453,7 @@ def main() -> None:
         log(f"begin sf_elo={elo}")
         summary, results = eval_level(
             model=model,
+            move_fn=move_fn,
             sf_elo=elo,
             openings=DEFAULT_OPENINGS,
             games_per_opening_per_color=args.games_per_opening_per_color,

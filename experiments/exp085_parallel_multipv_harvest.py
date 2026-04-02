@@ -55,6 +55,8 @@ WRITER_FLUSH_INTERVAL = 100
 
 DEFAULT_SF_THREADS = 1
 DEFAULT_SF_HASH_MB = 128
+LABEL_MODE_MULTIPV = "multipv_topk"
+LABEL_MODE_ALL_LEGAL = "all_legal_moves"
 
 OPENINGS = [
     {"name": "startpos", "moves": []},
@@ -320,6 +322,95 @@ def label_position_multipv(
     }
 
 
+def label_position_all_legal(
+    board: chess.Board,
+    engine: chess.engine.SimpleEngine,
+    depth: int,
+    tau: float,
+) -> dict:
+    legal_moves = list(board.legal_moves)
+    num_legal = len(legal_moves)
+    infos = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=max(1, num_legal))
+    if isinstance(infos, dict):
+        infos = [infos]
+
+    move_values_by_uci: dict[str, dict] = {}
+    for info in infos:
+        pv = info.get("pv") or []
+        if not pv:
+            continue
+        move = pv[0]
+        uci = move.uci()
+        if uci in move_values_by_uci:
+            continue
+        cp, eval_type = score_to_cp(info["score"], board.turn)
+        move_values_by_uci[uci] = {
+            "uci": uci,
+            "cp": cp,
+            "eval_type": eval_type,
+            "pv": parse_pv(info),
+        }
+
+    fallback_count = 0
+    for move in legal_moves:
+        uci = move.uci()
+        if uci in move_values_by_uci:
+            continue
+        info = engine.analyse(
+            board,
+            chess.engine.Limit(depth=depth),
+            root_moves=[move],
+        )
+        cp, eval_type = score_to_cp(info["score"], board.turn)
+        pv = parse_pv(info) or [uci]
+        move_values_by_uci[uci] = {
+            "uci": uci,
+            "cp": cp,
+            "eval_type": eval_type,
+            "pv": pv,
+        }
+        fallback_count += 1
+
+    move_values = sorted(move_values_by_uci.values(), key=lambda item: item["cp"], reverse=True)
+    for rank, item in enumerate(move_values, start=1):
+        item["rank"] = rank
+
+    probs = softmax_probs([item["cp"] for item in move_values], tau)
+    soft_targets = []
+    for item, prob in zip(move_values, probs):
+        soft_targets.append(
+            {
+                "uci": item["uci"],
+                "prob": float(prob),
+                "cp": item["cp"],
+                "eval_type": item["eval_type"],
+                "rank": item["rank"],
+                "pv": item["pv"],
+            }
+        )
+
+    teacher_entropy = -sum(
+        target["prob"] * math.log(max(target["prob"], 1e-12))
+        for target in soft_targets
+    )
+    best_cp = move_values[0]["cp"]
+    second_cp = move_values[1]["cp"] if len(move_values) > 1 else best_cp
+    return {
+        "label_mode": LABEL_MODE_ALL_LEGAL,
+        "best_move": move_values[0]["uci"],
+        "best_cp": best_cp,
+        "value_target": cp_to_value_class(best_cp),
+        "soft_targets": soft_targets,
+        "num_legal": num_legal,
+        "num_labeled": len(move_values),
+        "unlabeled_legal": max(num_legal - len(move_values), 0),
+        "teacher_entropy": float(teacher_entropy),
+        "cp_gap_top1_top2": int(best_cp - second_cp),
+        "full_legal_coverage": len(move_values) == num_legal,
+        "fallback_single_move_calls": fallback_count,
+    }
+
+
 def create_board_from_opening(opening_moves: list[str]) -> chess.Board:
     board = chess.Board()
     for uci in opening_moves:
@@ -463,7 +554,39 @@ class ShardedJsonlWriter:
         self.current_handle = None
         self.lock = threading.Lock()
         self.pending_flush = 0
-        self._rotate()
+        self._resume_or_init()
+
+    def _count_records(self, path: Path) -> int:
+        with open(path, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+
+    def _resume_or_init(self) -> None:
+        existing = sorted(self.root.glob("positions_*.jsonl"))
+        if not existing:
+            self._rotate()
+            return
+
+        last_path = existing[-1]
+        try:
+            shard_num = int(last_path.stem.split("_")[1])
+        except Exception:
+            shard_num = len(existing)
+        last_count = self._count_records(last_path)
+
+        if last_count >= self.shard_records:
+            self.shard_index = shard_num
+            self.current_records = last_count
+            self.pending_flush = 0
+            self.current_path = None
+            self.current_handle = None
+            self._rotate()
+            return
+
+        self.shard_index = shard_num
+        self.current_records = last_count
+        self.pending_flush = 0
+        self.current_path = last_path
+        self.current_handle = open(self.current_path, "a", encoding="utf-8")
 
     def _rotate(self) -> None:
         if self.current_handle is not None:
@@ -661,15 +784,23 @@ def label_worker(
                 break
 
             board = chess.Board(task["fen"])
-            label = label_position_multipv(
-                board=board,
-                engine=engine,
-                depth=args.label_depth,
-                multipv=args.label_multipv,
-                tau=args.label_tau,
-            )
+            if args.label_mode == LABEL_MODE_ALL_LEGAL:
+                label = label_position_all_legal(
+                    board=board,
+                    engine=engine,
+                    depth=args.label_depth,
+                    tau=args.label_tau,
+                )
+            else:
+                label = label_position_multipv(
+                    board=board,
+                    engine=engine,
+                    depth=args.label_depth,
+                    multipv=args.label_multipv,
+                    tau=args.label_tau,
+                )
             record = {
-                "source": "sf_multipv_parallel_v1",
+                "source": "sf_full_legal_parallel_v1" if args.label_mode == LABEL_MODE_ALL_LEGAL else "sf_multipv_parallel_v1",
                 "created_at": task["created_at"],
                 "trajectory_id": task["trajectory_id"],
                 "worker_id": worker_id,
@@ -683,7 +814,7 @@ def label_worker(
                 "target_plies": task["target_plies"],
                 "move_history": task["move_history"],
                 "label_depth": args.label_depth,
-                "label_multipv": min(args.label_multipv, label["num_legal"]),
+                "label_multipv": min(args.label_multipv, label["num_legal"]) if args.label_mode != LABEL_MODE_ALL_LEGAL else label["num_legal"],
                 "label_tau": args.label_tau,
                 "play_depth": args.play_depth,
                 "play_multipv": args.play_multipv,
@@ -763,11 +894,12 @@ def write_manifest(args: argparse.Namespace) -> None:
         MANIFEST_PATH,
         {
             "created_at": utcnow_iso(),
-            "source": "exp085_parallel_multipv_harvest",
+            "source": "exp085_parallel_multipv_harvest" if args.label_mode != LABEL_MODE_ALL_LEGAL else "exp085_parallel_full_legal_harvest",
             "stockfish_path": str(STOCKFISH_PATH),
             "dataset_dir": str(DATASET_DIR),
             "db_path": str(DB_PATH),
             "config": {
+                "label_mode": args.label_mode,
                 "scheduler_count": args.scheduler_count,
                 "worker_count": args.worker_count,
                 "sf_threads": args.sf_threads,
@@ -822,6 +954,8 @@ def signal_handler(_signum, _frame) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Parallel Stockfish multipv soft-target harvester")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--label-mode", choices=[LABEL_MODE_MULTIPV, LABEL_MODE_ALL_LEGAL], default=LABEL_MODE_MULTIPV)
     parser.add_argument("--scheduler-count", type=int, default=8)
     parser.add_argument("--worker-count", type=int, default=96)
     parser.add_argument("--sf-threads", type=int, default=DEFAULT_SF_THREADS)
@@ -842,10 +976,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global LOG_FILE
+    global OUTPUT_DIR, DATASET_DIR, STATUS_PATH, MANIFEST_PATH, LOG_PATH, DB_PATH, LOG_FILE
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    OUTPUT_DIR = args.output_dir
+    DATASET_DIR = OUTPUT_DIR / "dataset"
+    STATUS_PATH = OUTPUT_DIR / "status.json"
+    MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
+    LOG_PATH = OUTPUT_DIR / "exp085.log"
+    DB_PATH = OUTPUT_DIR / "seen_positions.sqlite"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
@@ -857,13 +998,14 @@ def main() -> None:
         signal.signal(signal.SIGTERM, signal_handler)
 
     log("=" * 72)
-    log("exp085: parallel Stockfish multipv harvesting")
+    log("exp085: parallel Stockfish harvesting")
     log("=" * 72)
+    log(f"output_dir={OUTPUT_DIR}")
     log(
         f"scheduler_count={args.scheduler_count} worker_count={args.worker_count} "
         f"sf_threads={args.sf_threads} sf_hash_mb={args.sf_hash_mb}"
     )
-    log(f"label_depth={args.label_depth} label_multipv={args.label_multipv}")
+    log(f"label_mode={args.label_mode} label_depth={args.label_depth} label_multipv={args.label_multipv}")
     log(f"play_depth={args.play_depth} play_multipv={args.play_multipv} positions_per_lineage={args.positions_per_lineage}")
     if args.max_records > 0:
         log(f"max_records={args.max_records}")
