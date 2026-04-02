@@ -2,7 +2,7 @@
 description: Always use these instructions
 ---
 The goal is to get the highest elo possible. Unless specifically told otherwise by the user, design experiments to get the highest elo possible. Check the hardware available and utilize it. 
-Fall into an autonmous loop of consistently experimenting and logging.
+Fall into an autonmous loop of consistently experimenting and logging. Check the alphazero folder and stockfish_md for inspiration of very strong engines. You also have a md file describing the huggingface datasets you have access to. 
 # Chess-Transformer Agent Instructions
 
 This repository is for autonomous chess research around a chess-native transformer stack with strong data and evaluation discipline:

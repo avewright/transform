@@ -2,6 +2,109 @@
 
 This file is the running log for:
 
+## 2026-04-02
+
+### exp101 vs exp102 short comparison (200 steps, same init)
+
+**Setup:** Both from avewright/chess-transformer-200m-v2, LR=3e-5, batch=512, warmup=25, A40 46GB, ~340 pos/s.
+- exp101: policy CE + 0.25×value WDL (baseline)
+- exp102: policy CE + 0.25×value WDL + 0.10×(material MSE + phase CE + piece_count MSE)
+
+**EMA best (at step 100):**
+| Metric       | exp101 | exp102 | Delta  |
+|-------------|--------|--------|--------|
+| Policy top-1 | 0.1720 | 0.1756 | +0.36% |
+| Policy top-3 | 0.4316 | 0.4224 | -0.92% |
+| Value acc    | 0.7760 | 0.7768 | ~same  |
+| mat_mse      | N/A    | 0.0225 | rapid  |
+| phase_acc    | N/A    | 0.9200 | rapid  |
+
+**Conclusion:** Neutral on policy within noise. Aux heads learn rapidly (phase 34%→92%). Launched longer exp102 run (2000 steps, LR=2e-5, value_weight=0.35). If policy+value don't improve by step 1000, aux losses are not helping the trunk and should be dropped.
+
+### exp102 long run — RUNNING
+
+LR=2e-5, batch=512, warmup=50, value_weight=0.35, aux_weight=0.10. Init from HF v2 best.
+- Step 200: EMA acc=0.1668, top3=0.4196, val_acc=0.7772. Aux: mat_mse=0.0214(live), phase_acc=0.9120(live).
+
+### Hardware: A40 46GB pod, throughput ~338 pos/s at batch=256×accum=2
+
+---
+
+### exp102 long results (2000 steps, COMPLETED)
+
+LR=2e-5, batch=512, warmup=50, value_weight=0.35, aux_weight=0.10. Init from HF v2 best.
+- Cosine LR bug: period was estimated over full dataset (1.6M steps) instead of max_steps (2000), so LR was effectively constant.
+- Best live: 0.1704 @step800, then degraded to 0.1424 by step 2000.
+- Save bug found: best_model.pt always saved EMA even when live won → fixed.
+
+### exp101 long v2 (2000 steps, fixed cosine LR, COMPLETED)
+
+LR=2e-5, batch=512, warmup=50, value_weight=0.50. Init from HF v2 best.
+- Cosine LR fix: period = min(est_total_steps, max_steps). Much less degradation.
+- Best live: 0.1676 @step900 → final EMA 0.1604. 
+- **10K eval verification: acc=0.1726, top3=0.4244, val_acc=0.7811** (our strongest checkpoint)
+- Best checkpoint: outputs/exp101_long_v2/best_model.pt
+
+### exp103: LR sweep from best checkpoint (0.1726, 500 steps each)
+
+Three runs from exp101_v2 best, 10 files, batch=512, value_weight=0.50:
+
+| LR  | Step 100 EMA | Step 200 EMA | Best EMA | 10K Verified |
+|-----|-------------|-------------|----------|-------------|
+| 3e-6 | 0.1604 | 0.1672 | 0.1676 (unchanged) | N/A |
+| 8e-6 | **0.1700** | 0.1688 | 0.1700 | 0.1697 |
+| 2e-5 | 0.1660 | **0.1752** | 0.1752 | 0.1717 |
+
+**Key finding:** 2500-position eval has ~1.5% confidence interval. 10K eval shows exp101_v2 best (0.1726) is still our strongest checkpoint. EMA "gains" were partially noise.
+
+### exp104a: Cross-file shuffle from HF init (800 steps, STOPPED)
+
+Hypothesis: shuffling across 50 parquet files (12.6M positions) prevents distribution-shift degradation.
+- Init from HF v2 (0.1628 on 10K), LR=2e-5, batch=512, value_weight=0.50, no label smoothing.
+- Step 600 EMA: 0.1626 (matched init but didn't beat it).
+- **Conclusion: Init checkpoint was already trained on this same data. Re-training on same distribution provides minimal gains.** Stopped to free GPU.
+
+### exp105: Chess-relative attention bias (partial, ~325 steps)
+
+Added ChessRelativeBias module with learned per-head rank/file/diagonal/knight attention biases.
+- Zero-initialized new parameters for backward-compatible checkpoint loading (strict=False).
+- Init from exp101_v2 best (0.1710 on 10K with bias params), LR=8e-6, value_weight=0.25.
+- Step 200 EMA: 0.1677 (still warming up at step 300). Inconclusive — killed for pipeline.
+- Script: experiments/exp105_chess_bias.py
+
+### Dataset analysis
+
+- HF dataset: 3275 parquet files, ~832M positions, all game phases
+- top_moves field only has 1 move per position (all files checked) — **soft policy targets NOT feasible from this data**
+- Eval data: 80% openings, avg 31.2 legal moves, random baseline ~5%
+- 503GB RAM available → can load 100+ files into CPU for global shuffle
+
+### Key learnings
+
+1. **Cosine LR period must match max_steps**, not estimated full dataset steps.
+2. **EMA can mask true performance** — always verify best checkpoint on 10K+ eval.
+3. **Sequential parquet processing causes distribution shift** but is not the bottleneck when init was already trained on same data.
+4. **2500-position eval is too noisy for <1pp differences** — use 10K minimum.
+5. **Live model degrades rapidly at all LRs** while EMA sustains — characteristic of fine-tuning on already-learned data.
+6. The model is at ~17.3% top-1 with hard CE on single best-move labels. Further gains likely require architectural changes or loss function improvements.
+
+### Pipeline deployed (run_2hr_pipeline.sh)
+
+4-phase autonomous tmux script:
+1. exp105 chess bias (2000 steps from best)
+2. exp104b label smoothing (2000 steps from best)  
+3. exp106 continuation from winner (3000 steps, LR=3e-6)
+4. exp107 polish from overall best (3000 steps, LR=1e-6)
+Final comprehensive eval saves to outputs/pipeline_final_results.json.
+
+### Prioritized next steps (researched)
+
+1. ~~Cross-file shuffling~~ (tested, not the bottleneck from already-trained init)
+2. **Soft KL policy targets** — NOT possible with current HF data (only 1 move)
+3. **Chess-relative attention bias** — exp105 testing, code ready
+4. **Decoupled policy/value neck layers** — ~20 LOC, untested
+5. **Confidence-weighted loss** — weight by |cp|, ~15 LOC, untested
+
 ## 2026-04-01
 
 ### exp097: Alpha-Beta search — VALUE HEAD TOO WEAK — CRITICAL FINDING

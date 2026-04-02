@@ -53,14 +53,13 @@ from data_loader import (
 )
 
 # ── Paths ──
-# Use local non-OneDrive path to avoid file-locking issues
-OUTPUT_DIR = Path(r"C:\temp\chess_training\exp101")
-INIT_CHECKPOINT = Path("outputs/exp093_ema_curriculum_d8/ema_model.pt")
+OUTPUT_DIR = Path("/root/transform/outputs/exp101_hf_scale")
+INIT_CHECKPOINT = Path("outputs/hf_checkpoint/best_model.pt")
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 
 # ── Config ──
-BATCH_SIZE = 16            # optimal for RTX 4060 8GB (~31 pos/s)
-ACCUM_STEPS = 32           # effective batch = 512
+BATCH_SIZE = 128           # A40 46GB can handle larger batches
+ACCUM_STEPS = 4            # effective batch = 512
 LR = 5e-5                  # moderate LR — finetuning from strong checkpoint
 WARMUP_STEPS = 200         # short warmup since model is already trained
 MIN_LR_FRAC = 0.10         # cosine floor = 10% of peak
@@ -329,7 +328,7 @@ def log(msg):
         LOG_FILE.flush()
 
 
-def save_status(step, positions, best_acc, metrics=None, cursor=None):
+def save_status(out_dir, step, positions, best_acc, metrics=None, cursor=None):
     status = {
         "experiment": "exp101_hf_scale",
         "step": step,
@@ -341,10 +340,10 @@ def save_status(step, positions, best_acc, metrics=None, cursor=None):
         status["latest_eval"] = metrics
     if cursor:
         status["data_cursor"] = cursor
-    tmp = OUTPUT_DIR / "status.json.tmp"
+    tmp = out_dir / "status.json.tmp"
     with open(tmp, "w") as f:
         json.dump(status, f, indent=2)
-    os.replace(str(tmp), str(OUTPUT_DIR / "status.json"))
+    os.replace(str(tmp), str(out_dir / "status.json"))
 
 
 # ── Main training ──
@@ -361,8 +360,13 @@ def main():
     parser.add_argument("--accum-steps", type=int, default=ACCUM_STEPS)
     parser.add_argument("--value-weight", type=float, default=VALUE_WEIGHT)
     parser.add_argument("--ema-decay", type=float, default=EMA_DECAY)
+    parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS)
     parser.add_argument("--max-files", type=int, default=None,
                         help="Limit number of HF parquet files (for smoke tests)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Stop after this many optimizer steps")
+    parser.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL)
+    parser.add_argument("--save-interval", type=int, default=SAVE_INTERVAL)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest checkpoint in output-dir")
@@ -378,7 +382,8 @@ def main():
     log(f"  output_dir: {OUTPUT_DIR_ACTUAL}")
     log(f"  lr={args.lr}, batch={args.batch_size}, accum={args.accum_steps}")
     log(f"  value_weight={args.value_weight}, ema_decay={args.ema_decay}")
-    log(f"  max_files={args.max_files}, seed={args.seed}")
+    log(f"  max_files={args.max_files}, max_steps={args.max_steps}, seed={args.seed}")
+    log(f"  eval_interval={args.eval_interval}, save_interval={args.save_interval}")
     log(f"  device={DEVICE}")
 
     if DEVICE == "cuda":
@@ -454,7 +459,9 @@ def main():
     # Estimate total steps for LR schedule
     est_total_positions = loader.total_positions
     est_total_steps = est_total_positions // (args.batch_size * args.accum_steps)
-    log(f"  Estimated total steps: ~{est_total_steps:,}")
+    if args.max_steps:
+        est_total_steps = min(est_total_steps, args.max_steps)
+    log(f"  Estimated total steps: ~{est_total_steps:,} (cosine LR period)")
 
     # ── Training loop ──
     model.train()
@@ -519,7 +526,7 @@ def main():
         # Optimizer step
         if accum_count >= args.accum_steps:
             # LR schedule
-            lr = cosine_lr(global_step, est_total_steps, WARMUP_STEPS, args.lr, MIN_LR_FRAC)
+            lr = cosine_lr(global_step, est_total_steps, args.warmup_steps, args.lr, MIN_LR_FRAC)
             set_lr(optimizer, lr)
 
             if scaler:
@@ -546,6 +553,12 @@ def main():
             accum_count = 0
 
             # Heartbeat every step for first 5 steps
+            # Check max-steps early exit
+            if args.max_steps and global_step >= args.max_steps:
+                log(f"Reached --max-steps={args.max_steps}, stopping.")
+                SHUTDOWN_REQUESTED = True
+                break
+
             if global_step <= 5:
                 log(f"  [heartbeat] step={global_step} ce={running_ce/(log_count*args.accum_steps):.4f} "
                     f"pos={positions_seen:,}")
@@ -571,7 +584,7 @@ def main():
                 t_last_log = time.time()
 
             # Eval
-            if global_step % EVAL_INTERVAL == 0:
+            if global_step % args.eval_interval == 0:
                 log("Eval (live)...")
                 live_metrics = evaluate(model, eval_data, eval_tensors, DEVICE)
                 log(f"  live: acc={live_metrics['accuracy']:.4f} "
@@ -602,12 +615,12 @@ def main():
                         save_model_weights(OUTPUT_DIR_ACTUAL / "best_model.pt", model)
                     log(f"  NEW BEST: acc={best_acc:.4f} ({'ema' if is_ema_better else 'live'})")
 
-                save_status(global_step, positions_seen, best_acc,
+                save_status(OUTPUT_DIR_ACTUAL, global_step, positions_seen, best_acc,
                             metrics=best_metrics, cursor=loader.get_cursor())
                 model.train()
 
             # Save checkpoint
-            if global_step % SAVE_INTERVAL == 0:
+            if global_step % args.save_interval == 0:
                 save_model_weights(OUTPUT_DIR_ACTUAL / "latest_model.pt", model)
                 ema.save_weights(OUTPUT_DIR_ACTUAL / "ema_model.pt", model)
 
@@ -657,11 +670,11 @@ def main():
     log(f"  Final best accuracy: {best_acc:.4f}")
     log(f"  Phase accuracy (EMA): {final_ema['phase_accuracy']}")
 
-    save_status(global_step, positions_seen, best_acc,
+    save_status(OUTPUT_DIR_ACTUAL, global_step, positions_seen, best_acc,
                 metrics=best_final, cursor=loader.get_cursor())
 
-    LOG_FILE.close()
     log("Done.")
+    LOG_FILE.close()
 
 
 if __name__ == "__main__":

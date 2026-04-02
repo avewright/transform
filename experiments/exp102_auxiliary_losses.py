@@ -71,14 +71,13 @@ from data_loader import (
 )
 
 # ── Paths ──
-# Use local non-OneDrive path to avoid file-locking issues
-OUTPUT_DIR = Path(r"C:\temp\chess_training\exp102")
-INIT_CHECKPOINT = Path("outputs/exp093_ema_curriculum_d8/ema_model.pt")
+OUTPUT_DIR = Path("/root/transform/outputs/exp102_aux")
+INIT_CHECKPOINT = Path("outputs/hf_checkpoint/best_model.pt")
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 
 # ── Config ──
-BATCH_SIZE = 16
-ACCUM_STEPS = 32          # effective batch = 512
+BATCH_SIZE = 128
+ACCUM_STEPS = 4           # effective batch = 512
 LR = 3e-5
 WARMUP_STEPS = 200
 MIN_LR_FRAC = 0.10
@@ -477,8 +476,15 @@ def main():
     parser.add_argument("--value-weight", type=float, default=VALUE_WEIGHT)
     parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT)
     parser.add_argument("--ema-decay", type=float, default=EMA_DECAY)
+    parser.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS)
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Stop after this many optimizer steps")
+    parser.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL)
+    parser.add_argument("--save-interval", type=int, default=SAVE_INTERVAL)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint in output-dir")
     args = parser.parse_args()
 
     out = Path(args.output_dir)
@@ -487,8 +493,11 @@ def main():
 
     log("=" * 60)
     log("exp102: Auxiliary losses (material + phase + piece_count)")
+    log(f"  init_checkpoint: {args.init_checkpoint}")
     log(f"  lr={args.lr}, batch={args.batch_size}, accum={args.accum_steps}")
     log(f"  value_weight={args.value_weight}, aux_weight={args.aux_weight}")
+    log(f"  max_files={args.max_files}, max_steps={args.max_steps}, seed={args.seed}")
+    log(f"  eval_interval={args.eval_interval}, save_interval={args.save_interval}")
     log(f"  device={DEVICE}")
 
     # Load eval
@@ -506,6 +515,29 @@ def main():
     scaler = GradScaler('cuda') if DEVICE == "cuda" else None
     ema = EMAModel(model, decay=args.ema_decay)
 
+    # ── Resume state ──
+    global_step = 0
+    positions_seen = 0
+    best_acc = 0.0
+    resume_cursor = None
+
+    if args.resume:
+        resume_ckpt = out / "latest_checkpoint.pt"
+        if resume_ckpt.exists():
+            log(f"  Resuming from {resume_ckpt}...")
+            ckpt = torch.load(resume_ckpt, map_location=DEVICE, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if scaler and "scaler_state_dict" in ckpt:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            global_step = ckpt.get("global_step", 0)
+            positions_seen = ckpt.get("positions_seen", 0)
+            best_acc = ckpt.get("best_acc", 0.0)
+            resume_cursor = ckpt.get("data_cursor", None)
+            if "ema_shadow" in ckpt:
+                ema.shadow = ckpt["ema_shadow"]
+            log(f"  Resumed: step={global_step}, positions={positions_seen:,}, best_acc={best_acc:.4f}")
+
     # Initial eval
     log("Initial eval...")
     init_m = evaluate(model, eval_data, eval_tensors, DEVICE)
@@ -513,17 +545,20 @@ def main():
         f"val_acc={init_m['value_accuracy']:.4f}")
     log(f"  aux: mat_mse={init_m['material_mse']:.4f} phase_acc={init_m['aux_phase_accuracy']:.4f} "
         f"pcount_mse={init_m['piece_count_mse']:.4f}")
-    best_acc = init_m['accuracy']
+    if init_m['accuracy'] > best_acc:
+        best_acc = init_m['accuracy']
 
     # Streaming loader
     log("Creating streaming loader...")
     loader = AuxStreamingLoader(
         repo_id=HF_DATASET, batch_size=args.batch_size, encoder_type="fused",
         device=DEVICE, seed=args.seed, drop_last=True, file_pattern="src",
-        max_files=args.max_files,
+        max_files=args.max_files, resume_cursor=resume_cursor,
     )
     est_total_steps = loader.total_positions // (args.batch_size * args.accum_steps)
-    log(f"  Files: {loader.num_files}, est ~{est_total_steps:,} steps")
+    if args.max_steps:
+        est_total_steps = min(est_total_steps, args.max_steps)
+    log(f"  Files: {loader.num_files}, est ~{est_total_steps:,} steps (cosine LR period)")
 
     # Training loop
     model.train()
@@ -584,7 +619,7 @@ def main():
         running["loss"] += total_loss.item()
 
         if accum_count >= args.accum_steps:
-            lr = cosine_lr(global_step, est_total_steps, WARMUP_STEPS, args.lr, MIN_LR_FRAC)
+            lr = cosine_lr(global_step, est_total_steps, args.warmup_steps, args.lr, MIN_LR_FRAC)
             set_lr(optimizer, lr)
 
             if scaler:
@@ -608,6 +643,12 @@ def main():
             if global_step <= 3:
                 log(f"  [heartbeat] step={global_step} pos={positions_seen:,}")
 
+            # Check max-steps early exit
+            if args.max_steps and global_step >= args.max_steps:
+                log(f"Reached --max-steps={args.max_steps}, stopping.")
+                SHUTDOWN_REQUESTED = True
+                break
+
             if global_step % LOG_INTERVAL == 0 and log_count > 0:
                 n = log_count * args.accum_steps
                 elapsed = time.time() - t_last
@@ -620,7 +661,7 @@ def main():
                 log_count = 0
                 t_last = time.time()
 
-            if global_step % EVAL_INTERVAL == 0:
+            if global_step % args.eval_interval == 0:
                 log("Eval...")
                 m = evaluate(model, eval_data, eval_tensors, DEVICE)
                 log(f"  live: acc={m['accuracy']:.4f} top3={m['top3_accuracy']:.4f} "
@@ -641,15 +682,34 @@ def main():
                     best_m = m
                 if best_m['accuracy'] > best_acc:
                     best_acc = best_m['accuracy']
-                    ema.save_weights(out / "best_model.pt", model)
+                    if best_m is em:
+                        ema.save_weights(out / "best_model.pt", model)
+                    else:
+                        save_model_weights(out / "best_model.pt", model)
                     log(f"  NEW BEST: {best_acc:.4f}")
                 save_status(out, global_step, positions_seen, best_acc,
                             metrics=best_m, cursor=loader.get_cursor())
                 model.train()
 
-            if global_step % SAVE_INTERVAL == 0:
+            if global_step % args.save_interval == 0:
                 save_model_weights(out / "latest_model.pt", model)
                 ema.save_weights(out / "ema_model.pt", model)
+
+                # Full resumable checkpoint
+                ckpt = {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "global_step": global_step,
+                    "positions_seen": positions_seen,
+                    "best_acc": best_acc,
+                    "data_cursor": loader.get_cursor(),
+                    "ema_shadow": ema.shadow,
+                }
+                if scaler:
+                    ckpt["scaler_state_dict"] = scaler.state_dict()
+                tmp = out / "latest_checkpoint.pt.tmp"
+                torch.save(ckpt, tmp)
+                os.replace(str(tmp), str(out / "latest_checkpoint.pt"))
 
     # Final
     log(f"Done. {global_step} steps, {positions_seen:,} positions")
