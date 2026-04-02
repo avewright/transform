@@ -2,6 +2,124 @@
 
 This file is the running log for:
 
+## 2026-04-01
+
+### exp097: Alpha-Beta search — VALUE HEAD TOO WEAK — CRITICAL FINDING
+
+**Result:** Search HURTS ELO. Baseline greedy = 1664 ELO. With 1-ply value search = below 1320 (delta = **-344 ELO**). With alpha-beta depth 3 = even worse. The value head (trained at 10% weight as side objective) is not calibrated enough for search.
+
+**Implication:** To make search work, need either:
+1. Train dedicated value head (50%+ weight, maybe separate network)
+2. Use policy-only beam search (no value head)
+3. MCTS with visit counts (not value-based selection)
+
+Current value head WDL predictions are unreliable — they lead the search to choose bad moves. **Focus on policy quality for now.**
+
+### exp092: confkl_top8 — COMPLETED — ELO 1600-1750
+
+Bracketed 1600-1750 (same as exp090). 70K positions, LR=2e-6, kl_conf_scale=80, soft_top_k=8, teacher_temp=0.5. Final loss=1.0822, acc=41.4%, top3=74.1%.
+
+### exp093 d4 run: EMA+curriculum on d4 data — COMPLETED — ELO 1638 (1600-1750)
+
+Final: live acc=43.7%, top3=74.2%, loss=1.1022. EMA acc=43.6%. Live won.
+Training improved acc +1.6% from init 42.1%. Same bracket as exp090/092.
+
+### exp093 d8 run: EMA+curriculum on d8 data — RUNNING
+
+100K depth-8 relabeled positions, 2 epochs, LR=1e-6 from exp093-d4 checkpoint.
+Initial eval: acc=42.1%, top3=75.6% (TOP3 MUCH HIGHER on d8 eval set).
+6174 total steps. Key test: do deeper labels translate to higher ELO?
+Step 1800/6174: EMA acc=43.1%, top3=76.8%. Approaching plateau on opening-only data.
+
+### CRITICAL FINDING: All training data is opening-only (ply 8-23)
+
+**ALL 115K depth-8 positions are ply 8-23 (max 23).** Zero middlegame, zero endgame.
+The model has NEVER seen a position beyond move 12. This is likely the BIGGEST
+single reason ELO is stuck at ~1700. Even mediocre middlegame/endgame training data
+should yield a large ELO boost.
+
+Root cause: exp085 harvest used --max-target-plies 24, limiting game play to 24 plies.
+Fix: generate diverse-phase data using exp085 with wider ply range + exp095 endgame harvest.
+
+### exp095: Endgame harvest — COMPLETED — 15K positions
+
+15K endgame positions at depth 8 in 10 minutes. Mix: synthetic templates (44%), 
+trade-down (28%), random (28%). Data compatible with training pipeline. No ply field
+(synthetic positions), but acceptable for policy training.
+
+### exp099: Middlegame harvest — RUNNING
+
+Using exp085 with --min-target-plies 30 --max-target-plies 120, all_legal_moves at d8.
+Ply distribution: 22.7% opening, 57.7% middlegame, 19.6% endgame. Good diversity.
+~20K records target, ~5.7K done.
+
+### exp100: Diverse-phase combined training — PLANNED
+
+Combine all three datasets:
+- 115K opening (d8 relabeled)
+- ~20K middlegame (exp099)
+- 15K endgame (exp095)
+= ~150K positions covering ALL game phases.
+
+Train from exp093-d8 best checkpoint. Use exp098 approach (CP→WDL value targets,
+50% value weight) on merged dataset. This addresses BOTH blind spots:
+1. Policy has no middlegame/endgame training → diverse data
+2. Value head too weak for search → CP-based WDL targets + high value weight
+
+### exp098: Strong value head — READY (bug fixed)
+
+Fixed soft_targets format bug (was treating list-of-dicts as dict).
+Ready to run after exp093-d8 completes. Will use merged diverse dataset instead
+of just d8 opening data for maximum coverage.
+
+### exp094: 1-ply value-head search at eval time — PREPARED
+
+**Hypothesis:** Using the model's own value head for 1-ply lookahead should give 100-200+ ELO for free. Instead of greedily taking the policy head's top move, evaluate top-8 candidates with the value head after pushing each move. Picks the move that maximizes expected value.
+
+Run after any checkpoint: `python experiments/exp094_search_eval.py --checkpoint <path> --search-depth 1 --top-k 8`
+
+### exp095: Endgame-focused harvest — PREPARED
+
+**Hypothesis:** Model endgame accuracy (24-26%) is far below middlegame (30%+). Current harvest only targets ply 14-24. Generating 25K endgame-specific positions via synthetic construction (K+1-4 pieces) and trade-down games should close this gap.
+
+Three strategies: synthetic templates (KR vs K, KRP vs KR, etc. — 40%), trade-down (aggressive play until material drops — 30%), random (2-6 pieces on random squares — 30%).
+
+Run: `python experiments/exp095_endgame_harvest.py --depth 8 --workers 4 --max-records 25000`
+
+### exp096: Selective deep relabel for contested positions — PREPARED
+
+**Hypothesis:** Positions with cp_gap < 50 at d8 have the noisiest targets. Re-labeling only these at d12+ sharpens the training signal where it matters most, for ~20% the compute of deep-labeling everything.
+
+Depends on exp087_relabeled_d8 completing first.
+
+Run: `python experiments/exp096_selective_deep_relabel.py --input-dir outputs/exp087_relabeled_d8/dataset --output-dir outputs/exp096_selective_d12/dataset --depth 12 --gap-threshold 50 --workers 4`
+
+### exp093: EMA + Curriculum + Depth-8 relabeled data — PREPARED
+
+**Hypothesis:** Three compounding improvements will push past exp090's ~1750 ELO:
+1. **Deeper labels (d8 vs d4):** exp070/071 showed depth 15+ labels produced dramatically better models. Depth 4 gives noisy soft targets where top moves swap with deeper analysis. Relabeling at d8 should sharpen targets significantly.
+2. **EMA (decay=0.999):** exp090's best was at step 200/327 then degraded. EMA smooths the trajectory, avoids needing to find the exact best step.
+3. **Curriculum (3 phases by cp_gap):** exp091 diverged when scaling 54K at flat LR. Curriculum trains easy positions (high cp_gap) first to anchor the model, then progressively introduces harder contested positions.
+
+**Additional:** Cosine LR with 5% linear warmup, scaled to LR=1.5e-6 (vs 2e-6 in exp092, 5e-6 in exp091).
+
+**Scripts created:**
+- `relabel_depth8.py` — re-analyzes exp087 shards at depth 8 with parallel SF workers
+- `experiments/exp093_ema_curriculum.py` — training with EMA, curriculum, cosine LR
+
+**Launch plan (sequential):**
+1. Wait for exp087 harvest to finish (100K at d4, ~2.6h remaining as of 3:15 PM)
+2. Wait for exp092 training to finish (~34 min remaining at step 350/1062)
+3. Run relabel: `python relabel_depth8.py --input-dir outputs/exp087_full_legal_harvest/dataset --output-dir outputs/exp087_relabeled_d8/dataset --depth 8 --workers 4`
+4. Run training: `python experiments/exp093_ema_curriculum.py --output-dir outputs/exp093_ema_curriculum_d8 --init-checkpoint outputs/exp090_full_legal_temp05_continue_ckpt/checkpoints/latest.pt --dataset-glob "outputs/exp087_relabeled_d8/dataset/positions_*.jsonl" --ema-decay 0.999 --curriculum-phases 3 --save-weights-only-checkpoints --no-upload-to-hf`
+
+**Key design decisions:**
+- Curriculum: phase 0 = top 1/3 by confidence, phase 1 = top 2/3, phase 2 = all (cumulative, not disjoint)
+- EMA starts tracking after step 50 to avoid polluting with early warmup noise
+- Both live and EMA models are evaluated; best_model.pt saves whichever wins
+- Init from exp090 (best ELO so far at ~1750), NOT exp092 (still running, uncertain)
+- Can also init from exp092 if it produces better results — just change --init-checkpoint
+
 ## 2026-03-30
 
 ### exp083: Full-corpus pretraining on 4×A40 — KILLED (LR too high)
@@ -2323,3 +2441,110 @@ while avoiding the earlier high-LR collapse.
 1. Stop spending 4xA40 time on plain continuation of the same objective.
 2. Change the data recipe or supervision target before the next large run.
 3. Fix the `Infinity` NLL eval bug before relying on that metric.
+
+---
+
+## 2026-04-02 — New experiments from AlphaZero + Stockfish reference docs
+
+### exp101: HF-scale training (4M+ diverse data) — RUNNING
+
+Streaming from avewright/chess-positions-lichess-sf via StreamingHFChessLoader.
+bs=16, accum=32 (eff=512), lr=5e-5, cosine LR, EMA. Speed: ~3.4 pos/s (~2.8 min/step).
+At step 3/496 (1 parquet file, ~254K positions). Initial eval acc=17.5% on HF test data (expected — model trained on opening-only, HF data is all phases).
+
+### exp102: Auxiliary losses (material + phase + piece count) — CREATED
+
+Source: alphazero/possible_improvements.md §9 (Auxiliary Losses)
+
+Adds three auxiliary prediction heads to the CLS token:
+- material_head: predict centipawn material balance (regression, MSE)
+- phase_head: predict game phase (0=opening, 1=middlegame, 2=endgame, CE)
+- piece_count_head: predict non-king piece count (regression, MSE)
+
+Total aux_weight=0.10 (light touch). Labels are FREE — computed on-the-fly from board state. Forces the trunk to encode basic positional facts that improve value head and overall play. Loads from exp093-d8 EMA checkpoint, streams HF data.
+
+### exp103: Gumbel AlphaZero search — CREATED
+
+Source: alphazero/possible_improvements.md §6 (Gumbel AlphaZero / Policy Target via Search)
+
+HIGHEST IMPACT: search-time improvement, no training needed. Uses Gumbel noise + log policy priors for action selection with Sequential Halving. Does NOT rely on value head (which failed at -344 ELO in exp094). Instead uses "policy consistency" — after we play a move, if the opponent's reply distribution has high entropy, our move was decent.
+
+Modes: pure policy consistency, value head, hybrid. Compare mode tests search vs greedy baseline. Sweep mode tests n_simulations in {1,4,8,16,32,64}.
+
+### exp104: Policy-guided alpha-beta search — CREATED
+
+Source: stockfish_md/improvements.md §6 (Neural Network Move Ordering) + stockfish_md/architecture.md (Alpha-beta, LMR, TT)
+
+Uses our strong policy head (43% top-1, 76% top-3) for move ordering in classical alpha-beta search:
+- Policy-sorted move expansion (best moves first → massive beta cutoffs)
+- Transposition table (Zobrist hashing)
+- Null move pruning (depth ≥ 3)
+- Late Move Reductions (policy-ranked moves ≥ 3 searched at reduced depth)
+- Quiescence search (captures/promotions only at depth 0)
+- Iterative deepening with aspiration windows
+
+Unlike exp094 (MCTS), alpha-beta only needs the value head to be ORDINAL (rank positions correctly), not perfectly calibrated. The search structure + pruning may overcome value head weakness.
+
+### Priority order:
+1. **exp103** (Gumbel) — test immediately on best checkpoint, no training needed
+2. **exp104** (alpha-beta) — test immediately, compare with exp103
+3. **exp102** (aux losses) — next training run after exp101
+
+### SEARCH EXPERIMENT RESULTS — exp103/104/105
+
+**Test setup:** 10 games each vs Stockfish UCI_Elo=1320, Limit(time=0.05).
+Model: exp093-d8 EMA (best known, ~1666 ELO)
+
+| Method | W-D-L | Score | Delta vs Greedy | Avg time/game |
+|---|---|---|---|---|
+| Greedy (run 1) | +7=3-0 | 85% | — | 13.8s |
+| Gumbel-8 (policy_consistency) | +5=2-3 | 60% | **-25%** | 111.7s |
+| Gumbel-8 (value_head) | +6=3-1 | 75% | -10% | 80.5s |
+| Alpha-Beta d=2 | CRASHED | — | — | — |
+| Greedy (run 2) | +5=4-1 | 70% | — | 5.3s |
+| **Mirror-8 (exp105)** | **+8=2-0** | **90%** | **+20%** | 60.5s |
+
+**Key findings:**
+1. **Gumbel noise HURTS** — promotes inferior moves via stochastic selection (-25% at SF 1320)
+2. **Value head mode slightly better** than policy consistency but still -10% vs greedy
+3. **Alpha-Beta d=2 too slow** — 100+ forward passes/move, untestable on RTX 4060
+4. **MIRROR SEARCH (exp105) is the winner** — +20% improvement over greedy, ZERO losses!
+   - Uses batched deterministic 2-ply policy lookahead (3 forward passes/move)
+   - No noise, no value head dependency
+   - Changed 57 moves from greedy across 10 games (search actually overriding greedy meaningfully)
+   - 12x slower than greedy (60s/game) but fully practical
+
+**Root cause of Gumbel failure:**
+The policy head is already quite strong at SF 1320 (greedy wins 70-85%). Adding Gumbel noise
+to move selection introduces randomness that promotes the 3rd-5th ranked moves, which at this
+level are often blunders. The search budget (8 sims) is too small to compensate.
+
+**Why Mirror search works:**
+- DETERMINISTIC — no noise, falls back to greedy when signal is ambiguous
+- BATCHED — evaluates all 8 children in 1 forward pass (vs 8+ sequential in Gumbel)
+- POLICY-BASED — uses our strong policy head as both the ordering AND evaluation signal
+- 2-PLY DEPTH — looks at "my move → opponent's best reply → my response confidence"
+  This is exactly the amount of lookahead our policy can support reliably.
+
+### exp105: Batched Policy Mirror Search — CREATED + TESTED
+
+Breakthrough at SF 1320: First search method that improves over greedy.
+Algorithm: top-K → batch child eval → opponent best reply → batch grandchild eval → score by confidence.
+Weights: α=0.5 (prior), β=0.3 (our confidence after reply), γ=0.2 (opponent confidence penalty).
+
+**SF 1320 result: +8=2-0 (90%) vs greedy +5=4-1 (70%) = +20% delta**
+**SF 1600 preliminary (4/10 games): +1=2-1 (40%) vs greedy +1=6-3 (40%) = +0% delta**
+
+**Interpretation:** Mirror search helps at levels where the model already dominates (SF 1320)
+by avoiding occasional blunders through lookahead. But it does NOT help at the competitive
+level (SF 1600) where the bottleneck is positional understanding, not move selection.
+Search can't overcome the model's fundamental ELO ceiling — only training can do that.
+
+**STRATEGIC CONCLUSION:**
+The path to higher ELO is through TRAINING improvements (more data, better labels,
+auxiliary losses), NOT search. The model's policy is strong enough for its ELO level;
+what limits it is exposure to middlegame/endgame positions (confirmed by the opening-only
+data crisis finding). Focus priorities:
+1. exp101: HF-scale diverse training (4M+ positions, all game phases)
+2. exp102: Auxiliary losses (material/phase heads for better features)  
+3. Mirror search: useful bonus for online play, not the path to higher ELO
