@@ -201,9 +201,10 @@ class NNEvaluator:
         inp = batch_boards_to_fused_token_ids([board], self.device)
         result = self.model(inp)
 
-        # Value
+        # WDL is White-absolute: [P(W wins), P(draw), P(W loses)]
         wdl = F.softmax(result["value_logits"][0].float(), dim=-1)
-        value = (wdl[2] - wdl[0]).item()  # win - loss
+        white_value = (wdl[0] - wdl[2]).item()
+        value = white_value if board.turn == chess.WHITE else -white_value
 
         # Policy (sorted by prob)
         logits = result["policy_logits"][0].float()

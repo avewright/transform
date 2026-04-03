@@ -145,8 +145,10 @@ class PolicyAlphaBetaSearcher:
         result = self.model(board_input)
 
         wdl = F.softmax(result["value_logits"][0].float(), dim=-1)
-        # Score from white's perspective: win - loss
-        score = (wdl[2] - wdl[0]).item()
+        # WDL is White-absolute: [P(W wins), P(draw), P(W loses)]
+        # Convert to side-to-move perspective
+        white_score = (wdl[0] - wdl[2]).item()
+        score = white_score if board.turn == chess.WHITE else -white_score
 
         self._eval_cache[fen] = score
         if len(self._eval_cache) > 500_000:
@@ -526,7 +528,7 @@ def main():
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--root-k", type=int, default=10)
     parser.add_argument("--child-k", type=int, default=6)
-    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
     parser.add_argument("--sf-levels", type=str, default="1320,1450,1600,1750")
     parser.add_argument("--n-games", type=int, default=30)
     parser.add_argument("--no-null-move", action="store_true")

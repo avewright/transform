@@ -120,12 +120,10 @@ class GumbelSearcher:
         logits[~mask] = float("-inf")
 
         wdl = F.softmax(result["value_logits"][0].float(), dim=-1)
-        # Value from perspective of side to move: win - loss
-        # value_logits are [loss, draw, win] from white's perspective
-        if board.turn == chess.WHITE:
-            value = wdl[2] - wdl[0]  # win - loss
-        else:
-            value = wdl[0] - wdl[2]  # loss - win (from black's perspective, "loss" means white lost = good for black)
+        # WDL is White-absolute: [P(W wins), P(draw), P(W loses)]
+        # Convert to side-to-move perspective
+        white_value = wdl[0] - wdl[2]
+        value = white_value if board.turn == chess.WHITE else -white_value
 
         self.stats["nodes_expanded"] += 1
         return logits, value.item(), mask
@@ -414,7 +412,7 @@ def main():
     parser.add_argument("--value-mode", choices=["policy_consistency", "value_head", "hybrid"], 
                         default="policy_consistency")
     parser.add_argument("--c-scale", type=float, default=1.0)
-    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
     parser.add_argument("--sf-levels", type=str, default="1320,1450,1600,1750")
     parser.add_argument("--n-games", type=int, default=30)
     args = parser.parse_args()

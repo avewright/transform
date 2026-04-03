@@ -147,9 +147,10 @@ def get_model_move(model, board: chess.Board, device: torch.device,
     wdl_logits = result["value_logits"][0].float()
     wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
 
+    # Model WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
     return move, {
         "top_moves": top_moves,
-        "wdl": {"loss": wdl_probs[0], "draw": wdl_probs[1], "win": wdl_probs[2]},
+        "wdl": {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]},
     }
 
 

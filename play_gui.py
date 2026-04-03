@@ -461,15 +461,10 @@ def api_move():
     top_moves = [[IDX_TO_UCI[i], f"{p*100:.1f}%"]
                  for i, p in zip(topk.indices.tolist(), topk.values.tolist())]
 
-    # WDL — from side-to-move perspective.
-    # If black to move, model's "win" = black winning. Flip for display.
+    # WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
     wdl_logits = result["value_logits"][0].float()
     wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
-    if board.turn == chess.BLACK:
-        # Model outputs [loss, draw, win] from side-to-move. Flip for white-perspective.
-        wdl = {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}
-    else:
-        wdl = {"win": wdl_probs[2], "draw": wdl_probs[1], "loss": wdl_probs[0]}
+    wdl = {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}
 
     return jsonify({
         "move": move.uci(),

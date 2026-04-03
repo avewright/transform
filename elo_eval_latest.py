@@ -7,6 +7,7 @@ from pathlib import Path
 
 import chess
 import chess.engine
+import chess.syzygy
 import torch
 import torch.nn.functional as F
 
@@ -17,6 +18,53 @@ ROOT = Path(__file__).resolve().parent
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_CHECKPOINT = ROOT / "outputs" / "hf" / "chess-transformer-200m-latest" / "best_model.pt"
 DEFAULT_MODEL_CONFIG = None
+
+# Syzygy tablebase for perfect endgame play
+SYZYGY_DIR = ROOT / "syzygy"
+SYZYGY_TB = None
+SYZYGY_MAX_PIECES = 5
+
+def init_syzygy():
+    """Initialize Syzygy tablebase if available."""
+    global SYZYGY_TB
+    if SYZYGY_DIR.exists() and any(SYZYGY_DIR.glob("*.rtbw")):
+        try:
+            SYZYGY_TB = chess.syzygy.open_tablebase(str(SYZYGY_DIR))
+        except Exception:
+            SYZYGY_TB = None
+
+def get_syzygy_move(board: chess.Board) -> chess.Move | None:
+    """Look up best move from Syzygy tables. Returns None if not available."""
+    if SYZYGY_TB is None:
+        return None
+    if len(board.piece_map()) > SYZYGY_MAX_PIECES:
+        return None
+    try:
+        best_move = None
+        best_wdl = -3
+        best_dtz = 0
+        for move in board.legal_moves:
+            board.push(move)
+            try:
+                wdl = -SYZYGY_TB.probe_wdl(board)
+                dtz = -SYZYGY_TB.probe_dtz(board)
+                # Prefer winning moves, then draws, then losses
+                # Among winning moves, prefer shorter DTZ (faster win)
+                # Among losing moves, prefer longer DTZ (slower loss)
+                if wdl > best_wdl or (wdl == best_wdl and (
+                    (wdl > 0 and dtz < best_dtz) or
+                    (wdl < 0 and dtz > best_dtz) or
+                    (wdl == 0 and abs(dtz) < abs(best_dtz))
+                )):
+                    best_move = move
+                    best_wdl = wdl
+                    best_dtz = dtz
+            except Exception:
+                pass
+            board.pop()
+        return best_move
+    except Exception:
+        return None
 
 DEFAULT_OPENINGS = [
     [],
@@ -104,7 +152,8 @@ def get_model_move_generic(model, board: chess.Board, device: torch.device, temp
         top_moves.append((IDX_TO_UCI[idx], f"{p*100:.1f}%"))
     wdl_logits = result["value_logits"][0].float()
     wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
-    return move, {"top_moves": top_moves, "wdl": {"loss": wdl_probs[0], "draw": wdl_probs[1], "win": wdl_probs[2]}}
+    # Model WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
+    return move, {"top_moves": top_moves, "wdl": {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}}
 
 
 def log(msg: str) -> None:
@@ -149,7 +198,12 @@ def play_one(
 
     while not board.is_game_over(claim_draw=True) and len(board.move_stack) < ply_cap:
         if board.turn == model_color:
-            move, _ = move_fn(model, board, DEVICE, temperature=0.0)
+            # Try Syzygy tablebase first for perfect endgame play
+            tb_move = get_syzygy_move(board)
+            if tb_move is not None:
+                move = tb_move
+            else:
+                move, _ = move_fn(model, board, DEVICE, temperature=0.0)
         else:
             move = engine.play(board, chess.engine.Limit(time=movetime)).move
         if move not in board.legal_moves:
@@ -380,6 +434,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stop after the first bracketed 50%% interval instead of running all requested levels",
     )
+    parser.add_argument(
+        "--no-syzygy",
+        action="store_true",
+        help="Disable Syzygy tablebase probing during games",
+    )
     return parser.parse_args()
 
 
@@ -446,6 +505,14 @@ def main() -> None:
     )
     model = load_eval_model(str(checkpoint), DEVICE, model_config=args.model_config)
     move_fn = get_model_move_generic if args.model_config else __import__("play").get_model_move
+
+    # Initialize Syzygy tablebases for perfect endgame play
+    if not args.no_syzygy:
+        init_syzygy()
+    if SYZYGY_TB is not None:
+        log(f"Syzygy tablebases loaded from {SYZYGY_DIR} (up to {SYZYGY_MAX_PIECES} pieces)")
+    else:
+        log("Syzygy tablebases not available" + (" (disabled)" if args.no_syzygy else ""))
 
     summaries = []
     all_games = []

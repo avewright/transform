@@ -121,8 +121,10 @@ def board_value(model, board: chess.Board, device: torch.device) -> float:
     inp = batch_boards_to_fused_token_ids([board], device)
     result = model(inp)
     wdl = F.softmax(result["value_logits"][0].float(), dim=-1)
-    # WDL order: [loss, draw, win]
-    return (wdl[2] - wdl[0]).item()
+    # WDL is White-absolute: [P(W wins), P(draw), P(W loses)]
+    # Convert to side-to-move perspective
+    white_value = (wdl[0] - wdl[2]).item()
+    return white_value if board.turn == chess.WHITE else -white_value
 
 
 @torch.no_grad()
@@ -175,7 +177,7 @@ def search_move_depth1(
         "search_depth": 1,
         "candidates_evaluated": len(candidates),
         "top_candidates": candidates[:5],
-        "wdl": {"loss": wdl[0], "draw": wdl[1], "win": wdl[2]},
+        "wdl": {"win": wdl[0], "draw": wdl[1], "loss": wdl[2]},
         "chosen_value": round(best_value, 4),
     }
 
@@ -259,7 +261,7 @@ def search_move_depth2(
         "search_depth": 2,
         "candidates_evaluated": len(candidates),
         "top_candidates": candidates[:5],
-        "wdl": {"loss": wdl[0], "draw": wdl[1], "win": wdl[2]},
+        "wdl": {"win": wdl[0], "draw": wdl[1], "loss": wdl[2]},
         "chosen_value": round(best_value, 4),
     }
 
@@ -276,7 +278,7 @@ def greedy_move(model, board, device, temperature=0.0):
     move = index_to_move(move_idx)
     wdl_logits = result["value_logits"][0].float()
     wdl = F.softmax(wdl_logits, dim=-1).tolist()
-    return move, {"wdl": {"loss": wdl[0], "draw": wdl[1], "win": wdl[2]}}
+    return move, {"wdl": {"win": wdl[0], "draw": wdl[1], "loss": wdl[2]}}
 
 
 # ---------------------------------------------------------------------------

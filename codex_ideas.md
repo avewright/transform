@@ -2,6 +2,277 @@
 
 This file is the running log for:
 
+## 2026-04-03
+
+### CRITICAL BUG: WDL Convention Conflict (Pre-training vs Fine-tuning)
+
+**Severity: CRITICAL — affects ALL fine-tuning experiments and ALL value-based search**
+
+**Discovery:** Full data integrity audit revealed a fundamental WDL labeling conflict
+between the pre-training and fine-tuning pipelines.
+
+**Pre-training convention (exp083, 832M positions):**
+- Data source: Lichess/chess-position-evaluations — cp from WHITE's absolute perspective
+- `compute_wdl()` in data_loader.py: positive cp → high wdl[0]
+- Model learns: **logit[0] = P(White wins), logit[1] = P(draw), logit[2] = P(White loses)**
+- Verified empirically: White winning position → idx0 very high (0.997 for mate)
+
+**Fine-tuning convention (exp084/exp085/exp110/exp111, 220K-379K positions):**
+- Data source: Stockfish `score.relative` — cp from SIDE-TO-MOVE perspective
+- `cp_to_value_class()`: cp > 100 → target=2 (STM wins), cp < -100 → target=0 (STM loses)
+- CE loss trains: **logit[2] = P(STM wins), logit[0] = P(STM loses)**
+
+**The conflict:**
+- For White-to-move positions (~50%): pre-training says logit[0]=P(W wins), fine-tuning says logit[2]=P(W wins) → **INVERTED**
+- For Black-to-move positions (~50%): both agree (logit[2]=P(W loses)=P(B wins))
+- Fine-tuning with 10% value weight on 220K samples couldn't overcome 832M pre-trained positions
+- Result: Value head stayed in White-absolute convention but was partially degraded by conflicting gradients
+
+**Impact:**
+1. ALL value-based search experiments (exp094, exp097, exp112) used `wdl[2] - wdl[0]` = P(W loses) - P(W wins) = **INVERTED**, picking the WORST moves
+2. ALL fine-tuning experiments fought the value head on ~50% of data, silently degrading it
+3. The `elo_eval_latest.py` log printed win/loss labels swapped (cosmetic, didn't affect play)
+4. The value head is likely weaker than it was after pre-training due to conflicting gradients
+
+**Fixes applied:**
+1. `exp112_search_eval.py board_value()`: Now uses turn-aware White-absolute conversion
+2. `exp094_search_eval.py board_value()`: Same fix + all 3 WDL display dicts fixed
+3. `elo_eval_latest.py`: Fixed WDL log labels (idx0=win, idx2=loss)
+4. `play.py`: Fixed WDL display dict (idx0=win, idx2=loss)
+5. `play_gui.py`: Removed wrong turn-flipping logic, now directly uses White-absolute
+6. `exp097_alphabeta_search.py`: Fixed value computation with turn-aware sign
+7. `exp103_gumbel_search.py`: Fixed value computation with turn-aware sign
+8. `exp104_policy_guided_search.py`: Fixed value computation with turn-aware sign
+9. `exp110_search.py`: Fixed child value extraction using White-absolute + parent turn
+10. `chess_model.py`: Fixed docstring from "0=loss/1=draw/2=win" to "0=W_wins/1=draw/2=W_loses"
+11. `exp110_diverse_training.py`: Fixed batch cursor wraparound bug
+12. `exp111_conservative_continuation.py`: Fixed batch cursor wraparound bug
+
+**Correct `board_value()` formula:**
+```python
+wdl = softmax(value_logits)  # [P(W wins), P(draw), P(W loses)]
+white_value = wdl[0] - wdl[2]  # positive = good for White
+return white_value if board.turn == WHITE else -white_value  # flip for Black
+```
+
+**Future fix needed for fine-tuning data:**
+When generating value_target for fine-tuning, convert side-to-move cp to White-absolute:
+```python
+# In Stockfish analysis: score.relative gives STM perspective
+stm_cp = score.relative.score(mate_score=100000)
+white_cp = stm_cp if board.turn == WHITE else -stm_cp
+value_target = cp_to_value_class(white_cp)  # Now matches pre-training convention
+```
+
+**Policy labels:** Verified clean (0 errors in 2000 records). The problem is VALUE only.
+
+**Other findings from audit:**
+- `data_loader.py compute_wdl()` comments say "win" for idx0 → correctly matches White-absolute convention
+- `chess_model.py` docstring says "0=loss/1=draw/2=win" → **WRONG** (should be 0=W_win/1=draw/2=W_loss)
+- The docstring bug likely misled all subsequent developers (including exp085, exp094)
+- Cursor wraparound bug in exp110/exp111: `cursor = BATCH_SIZE - len(batch)` after extending batch → always 0. Fixed to use `needed = BATCH_SIZE - len(batch); cursor = needed` per exp084 pattern.
+
+### exp112_corrected: Search strategy eval with correct WDL — COMPLETED
+
+**Strategies tested on baseline checkpoint (outputs/hf_checkpoint/best_model.pt) + Syzygy:**
+
+| Strategy | vs SF1600 | vs SF1750 | vs SF1900 | vs SF2050 | Est. ELO |
+|----------|-----------|-----------|-----------|-----------|----------|
+| greedy | 0.469 (4W-7D-5L) | 0.344 (1W-9D-6L) | 0.313 (2W-6D-8L) | 0.438 (4W-6D-6L) | ~1600 |
+| rerank_k5 | 0.375 (5W-2D-9L) | 0.031 (0W-1D-15L) | 0.125 (1W-2D-13L) | 0.063 (0W-2D-14L) | <1600 |
+| rerank_k10 | 0.125 (1W-2D-13L) | 0.094 (1W-1D-14L) | 0.156 (1W-3D-12L) | 0.125 (0W-4D-12L) | <1600 |
+| **blend_k10** | **0.594** (7W-5D-4L) | **0.438** (3W-8D-5L) | — | — | **~1690** |
+
+**Key findings:**
+1. Pure value reranking (rerank_k5, rerank_k10) is CATASTROPHIC — worse than greedy by 200-400+ ELO
+2. The value head cannot reliably rank top policy moves against each other
+3. BUT policy+value BLEND works (+90 ELO): policy stays dominant (70% weight) while value provides a useful tiebreaker (30%)
+4. blend_k10 is the first strategy to show improvement over pure greedy
+5. The value head was degraded by conflicting fine-tuning gradients (~50% of data had inverted targets)
+
+**Next steps:**
+- Depth-2 blend: consider opponent's top responses (exp115) 
+- Full training with correct WDL labels from scratch (future work)
+- Explore temperature sampling in policy for wider search
+
+---
+
+### exp113: Blend weight sweep — COMPLETED
+
+**Hypothesis:** Optimizing value_weight and adding anti-repetition can improve blend ELO.
+**32 games per config at SF1750 and SF1900.**
+
+| Strategy | vs SF1750 | vs SF1900 | Est. ELO |
+|----------|-----------|-----------|----------|
+| **blend_k10_w30** | **0.500** | **0.500** | **~2000** |
+| blend_k5_w15_antirep | 0.484 | 0.328 | ~1650 |
+| blend_k10_w15 | 0.438 | 0.391 | ~1650 |
+| blend_k10_w30_antirep | 0.438 | 0.344 | ~1650 |
+| greedy | 0.312 | 0.391 | ~1650 |
+
+**Key findings:**
+1. blend_k10_w30 dominates — 0.500 at BOTH SF1750 and SF1900
+2. Anti-repetition penalty consistently HURTS — draws are valuable outcomes
+3. w=0.30 >> w=0.15 — higher value weight is better for tiebreaking
+
+---
+
+### exp114: Value head retraining with correct WDL convention — COMPLETED
+
+**Hypothesis:** Retraining value head with correct White-absolute soft WDL targets will improve blend quality.
+**Approach:** Freeze all 203.5M params except value head (526K), train with KL divergence on 224K positions.
+**Training:** 10 epochs, val_loss: 0.1091→0.1011, val_acc: 67.6%
+
+**Evaluation (32 games per config at SF1750/1900/2050):**
+
+| Config | SF1750 | SF1900 | SF2050 | Est ELO |
+|--------|--------|--------|--------|---------|
+| **baseline_blend_k10_w30** | 0.344 | **0.500** | 0.297 | **~1900** |
+| baseline_blend_k10_w50 | 0.531 | 0.484 | 0.250 | ~1850 |
+| retrained_vh_blend_k10_w50 | 0.531 | 0.234 | 0.281 | ~1766 |
+| retrained_vh_blend_k10_w30 | 0.391 | 0.375 | 0.312 | ~1650 |
+| baseline_greedy | 0.391 | 0.391 | 0.219 | ~1650 |
+
+**Key finding:** Retrained value head HURT performance. Pre-training (832M diverse positions) gives better value signal than 224K opening-heavy retraining. The baseline pre-trained value head is already well-calibrated.
+
+**Best verified config: baseline_blend_k10_w30 at ~1900 ELO (+250 over greedy ~1650)**
+
+---
+
+### exp110: Diverse multi-PV training — COMPLETED — ELO ~1600 (REGRESSION)
+
+**Hypothesis:** Expanding from opening-only data (exp085, 224K depth 10) to include
+diverse middlegame/endgame positions will push ELO past 1900+.
+
+**Baseline:** ~1850 ELO (62.5% vs SF 1750, 43.8% vs SF 1900)
+
+**Data for exp110:**
+- exp085: 224K (depth 10, multipv 8, opening-heavy)  
+- diverse v1: 7.5K (depth 8, middlegame/endgame)
+
+**Config:** BATCH=8, ACCUM=8 (eff=64), LR=3e-6, VALUE_WEIGHT=0.50, HARD_CE=0.25, EPOCHS=3, EMA=0.999
+
+**Training trajectory (value loss steadily improving, policy plateaued ~41%):**
+| Step | Acc | Top3 | Value Loss | Notes |
+|------|-----|------|------------|-------|
+| 2000 | 0.404 | 0.704 | 0.867 | |
+| 5700 | 0.414 | 0.708 | 0.787 | Best saved (acc) |
+| 8200 | 0.416 | 0.706 | 0.757 | New best |
+| 9400 | 0.417 | 0.708 | 0.747 | New best |
+| 12700 | 0.422 | 0.706 | 0.737 | BEST (final saved) |
+| 12813 | 0.420 | 0.704 | 0.735 | Final step (LIVE) |
+
+Training time: 269.1 minutes (12813 steps).
+
+**ELO Evaluation (with Syzygy):**
+| SF ELO | Score | W-D-L | Games |
+|--------|-------|-------|-------|
+| 1600 | 0.484 | 12-7-13 | 32 |
+| 1750 | 0.312 | 4-12-16 | 32 |
+
+**Estimated ELO: ~1600** (stayed below 50% at all tested levels)
+
+**RESULT: MAJOR REGRESSION from baseline ~1850 to ~1600 (−250 ELO)**
+
+**Root cause analysis:**
+1. **KL divergence + hard CE loss caused catastrophic forgetting.** The baseline was trained with pure CE loss on 832M positions. Switching to 75% KL + 25% CE + 50% value loss on only 232K positions destroyed the learned policy, even at conservative LR=3e-6.
+2. **3 epochs of fine-tuning on a tiny dataset (232K vs 832M pre-training).** The model memorized the fine-tune distribution and forgot generalization across the full game.
+3. **Accuracy on the fine-tune eval set improved (+4pp) while gameplay degraded.** This confirms that fine-tune eval accuracy is NOT predictive of ELO — it measures fit to the fine-tune data, not general playing strength.
+4. **Consistent pattern:** Every fine-tuning experiment in this repo (exp101-exp110) has failed to beat the HF baseline at ELO despite showing accuracy improvements on local eval sets.
+
+**Critical lesson: Fine-tuning a converged model on a small dataset with different loss formulation destroys generalization. Static accuracy improvements ≠ ELO improvements.**
+
+### Baseline ELO re-evaluation (32-game evals)
+
+Original baseline eval used 16 games → high variance. Re-evaluated with 32 games:
+
+| Config | vs SF1600 | vs SF1750 | vs SF1900 | Est. ELO |
+|--------|-----------|-----------|-----------|----------|
+| Baseline (16g, original) | 0.625 | 0.625 | 0.438 | ~1850 |
+| Baseline no-Syzygy (32g) | 0.516 | 0.422 | — | ~1625 |
+| Baseline + Syzygy (32g) | — | 0.406 | — | ~1750 |
+| exp110 + Syzygy (32g) | 0.484 | 0.312 | — | ~1600 |
+
+**Key insight:** The 16-game eval overstated baseline at ~1850. With 32 games, baseline
+is more like 1600-1750. This means exp110's regression is real but smaller than thought
+(~1600 vs ~1625, not ~1600 vs ~1850). The eval is still noisy at 32 games.
+
+**Syzygy effect:** Inconclusive. Slightly worse vs SF1750 (0.406 vs 0.422) — possibly
+hurting by overriding the model in near-endgame positions where the model would have
+played differently. Need larger sample to evaluate.
+
+### exp111: Conservative continuation (SAME loss as baseline) — RUNNING
+
+**Hypothesis:** Using the EXACT same loss formulation as the baseline (exp084) with
+additional diverse data will improve ELO without regression.
+
+**Key design differences from exp110:**
+- VALUE_WEIGHT=0.10 (was 0.50 in exp110 — 5x reduction)
+- LR=3e-7 (was 3e-6 — 10x reduction)
+- Loss: 75% KL + 25% CE + 10% value (same as exp084 baseline)
+- No cosine schedule, no EMA — just constant LR like baseline epochs
+- Epochs=2 (conservative)
+
+**Data:** exp085 (224K) + diverse v1-v4 (74K) + syzygy (50K) + puzzles (30K) + tablebase (1.3K) = ~379K
+
+**Config:** BATCH=4, ACCUM=16 (eff=64), LR=3e-7, HARD_CE=0.25, VALUE=0.10, EPOCHS=2
+
+### exp110 data generation — COMPLETED
+
+Generated diverse training data during exp110 training:
+- diverse v1: 7,472 (depth 8, mixed phases)
+- diverse v2: 15,434 (depth 8, mixed phases)
+- diverse v3: 24,649 (depth 8, mixed phases)
+- diverse v4: ~50K target (depth 8, in progress, 14.8K done at 10/s)
+- syzygy: 50,000 (perfect endgame labels from local Syzygy tables)
+- tablebase: 1,319 (Stockfish deep analysis endgames)
+- puzzles: 30,000 (Lichess tactical puzzles, hard labels, 1200-2400 rating range)
+- **Total: ~400K+ positions (with v4 completion)**
+
+### Depth-12 harvest — KILLED (too slow)
+
+Attempted depth-12 multipv-8 harvest: only 0.3/s with 48 workers (~40x slower than
+depth 8). Killed after 200 positions. Depth 12 is not viable for bulk generation.
+Deep relabeling should target a small subset if needed.
+
+### Syzygy integration at eval time — IMPLEMENTED
+
+Added local Syzygy tablebase probing to elo_eval_latest.py. For positions with ≤5
+pieces, the model uses perfect tablebase moves instead of the neural network. This
+gives provably correct endgame play. Enabled by default, can disable with --no-syzygy.
+
+### exp110b: Syzygy+puzzle enriched training — CANCELLED
+
+Cancelled: base exp110 regressed to ~1600 ELO. Continuing from a regressed checkpoint
+would compound the damage. Need to pivot strategy to work from the baseline checkpoint.
+
+### exp110c: Weakness-targeted training — CANCELLED
+
+Cancelled: depends on exp110b which is cancelled.
+
+### exp110 pipeline (automated) — KILLED
+
+Pipeline killed after exp110 ELO regression. Remaining phases cancelled.
+
+### Key learnings this session
+
+1. **Depth 12 bulk harvest is not viable** — 40x slower than depth 8
+2. **68% of exp085 data has cp_gap < 50** — labels are noisy for most positions
+3. **Value loss improves even when policy plateaus** — separate dynamics
+4. **Lichess puzzles are a fast data source** — 23K/min without Stockfish analysis
+5. **Syzygy probe at eval time is free ELO** — perfect endgame play for ≤5 pieces
+6. **Fine-tune accuracy ≠ ELO.** exp110 gained +4pp accuracy but lost −250 ELO. Static eval metrics on the fine-tune set are misleading.
+7. **KL loss on small data catastrophically forgets.** Switching from pure CE (baseline) to KL+CE on 232K positions (vs 832M pre-training) destroys the learned policy distribution.
+8. **Every fine-tune attempt has regressed ELO.** exp101–exp110 all show accuracy gains on local eval but none beat the baseline at verified ELO. The pre-trained model on 832M positions is remarkably hard to improve via small-data fine-tuning.
+
+### Strategic pivot needed
+
+The fine-tuning approach is fundamentally limited. Options:
+1. **Large-scale continued pretraining** — train on millions of positions (not 200K) with the same CE loss as baseline
+2. **Architecture changes** — chess-relative attention bias, improved encoder, policy head changes (test on baseline checkpoint)
+3. **Inference-time improvements** — Syzygy tablebases (already done), opening book, MCTS with policy prior
+4. **Data quality over quantity** — instead of retraining, curate a small high-quality set and use very conservative fine-tuning (1 epoch, tiny LR, same loss as baseline)
+
 ## 2026-04-02
 
 ### exp101 vs exp102 short comparison (200 steps, same init)

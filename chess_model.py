@@ -386,7 +386,7 @@ class ChessModel(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(self.hidden_size, 256),
             nn.ReLU(),
-            nn.Linear(256, 3),  # win/draw/loss
+            nn.Linear(256, 3),  # White-absolute: [P(W wins), P(draw), P(W loses)]
         )
 
     def forward(
@@ -400,7 +400,8 @@ class ChessModel(nn.Module):
         Args:
             board_input: (B, 18, 8, 8) planes for CNN, or dict of token IDs for learned encoder
             move_targets: (B,) move vocabulary indices (for training)
-            value_targets: (B,) value labels 0=loss/1=draw/2=win (for training)
+            value_targets: (B,) value labels — White-absolute: 0=W_wins/1=draw/2=W_loses
+                          (matches pre-training convention from Lichess data)
             legal_masks: (B, VOCAB_SIZE) bool mask of legal moves (for inference)
         """
         if isinstance(board_input, dict):
