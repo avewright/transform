@@ -1,8 +1,8 @@
 ---
 description: Always use these instructions
 ---
-The goal is to get the highest elo possible. Unless specifically told otherwise by the user, design experiments to get the highest elo possible. Check the hardware available and utilize it. 
-Fall into an autonmous loop of consistently experimenting and logging. Check the alphazero folder and stockfish_md for inspiration of very strong engines. You also have a md file describing the huggingface datasets you have access to. 
+The goal is to maximize verified Elo as efficiently as possible. Unless specifically told otherwise by the user, design experiments to get the highest Elo possible while respecting that compute and wall-clock time cost money. Check the hardware available and use it efficiently, not just aggressively.
+Fall into an autonomous loop of consistently experimenting, pruning weak ideas early, and logging durable results. Check the alphazero folder and stockfish_md for inspiration of very strong engines. You also have a md file describing the huggingface datasets you have access to.
 # Chess-Transformer Agent Instructions
 
 This repository is for autonomous chess research around a chess-native transformer stack with strong data and evaluation discipline:
@@ -11,7 +11,7 @@ This repository is for autonomous chess research around a chess-native transform
 - controlled architecture ablations (encoder, policy head, search-aware heads)
 - evaluation on move quality, gameplay, and search-time utility
 
-The agent should behave like an autonomous research loop operator, not a generic coding assistant.
+The agent should behave like an autonomous research loop operator, not a generic coding assistant. It should proactively choose the next experiment, run the cheapest meaningful test first, monitor results, and stop wasting compute on weak directions.
 
 ## First Steps For Every Session
 
@@ -31,10 +31,11 @@ The agent should behave like an autonomous research loop operator, not a generic
 
 ## Repository Purpose
 
-The goal is to improve chess-playing behavior of the base model through repeated experimental loops.
+The goal is to improve chess-playing behavior of the base model through repeated experimental loops, with verified Elo as the top-line outcome.
 
 LOOP FOREVER:
     - check current state and best results
+    - anchor on the current best verified Elo checkpoint and evaluation gauntlet
     - hypothesize changes that would improve performance:
         - how can the encoder learn and provide as much information and context without loss?
         - what model architecture/pipeline would enhance the chess model the most?
@@ -42,7 +43,9 @@ LOOP FOREVER:
         - to do this, feel free to reference research (arXiv)
     - create an experiment file
     - start with a cheap falsification run before large compute
-    - with a standard metric, test your hypothesis.
+    - with a standard metric, test your hypothesis
+    - promote only if the result improves verified Elo or clearly improves the research harness
+    - kill or pause runs quickly when early results show they are unlikely to beat baseline
     - regardless of the result, log the result with durable artifacts
     - Repeat
 
@@ -82,16 +85,19 @@ Use this order unless the user explicitly redirects:
 
 ## Success Metrics
 
-Prefer metrics that reflect chess usefulness, not just code execution:
+Prefer metrics that reflect chess usefulness, not just code execution. Use them in this order:
 
+- verified Elo on a fixed, comparable gauntlet against prior checkpoints and fixed Stockfish settings
+- gameplay score vs fixed Stockfish depths or Elo settings
 - legal move rate
 - move accuracy on labeled positions
 - top-3 accuracy
 - mean SF rank of target move
 - phase-sliced accuracy (opening/middlegame/endgame)
-- gameplay score vs fixed Stockfish depths
 - robustness across seeds
 - evaluation throughput per unit compute
+
+Static metrics such as top-1, top-3, and value accuracy are screening metrics, not the final promotion criterion. Do not treat a checkpoint as a real improvement until it survives a comparable Elo evaluation.
 
 If a new metric is introduced, document exactly how it is computed and where it is reported.
 
@@ -99,15 +105,18 @@ If a new metric is introduced, document exactly how it is computed and where it 
 
 1. One hypothesis per experiment.
 2. Keep quick tests cheap before running larger jobs.
-3. Preserve reproducibility:
+3. Assume compute is expensive. Prefer the experiment with the best expected Elo gain per GPU-hour or wall-clock hour.
+4. Preserve reproducibility:
    - set seeds
    - log command lines
    - save configs with outputs
-4. Prefer additive changes over destructive rewrites.
-5. Do not claim improvement from anecdotal game samples alone.
-6. If an experiment changes training behavior, also verify evaluation still works.
-7. For architecture comparisons, keep data, steps, optimizer, and eval fixed.
-8. Treat <2pp top-1 gains as provisional unless replicated.
+5. Prefer additive changes over destructive rewrites.
+6. Do not claim improvement from anecdotal game samples alone.
+7. If an experiment changes training behavior, also verify evaluation still works.
+8. For architecture comparisons, keep data, steps, optimizer, and eval fixed.
+9. Treat <2pp top-1 gains as provisional unless replicated.
+10. Kill experiments early when they are clearly off-baseline, unstable, or wasteful.
+11. Prefer reusing the strongest known checkpoint over retraining large baselines from scratch unless training from scratch is the variable under test.
 
 ## Experiment Contract
 
@@ -119,6 +128,7 @@ Every new experiment must record:
 - seed or seeds used
 - train sample count and eval sample count
 - runtime and device
+- estimated or actual compute cost in GPU-hours / wall-clock time when meaningful
 - exact command used
 - whether the result is preliminary (single seed) or replicated
 
@@ -135,6 +145,8 @@ Outputs should include failure cases, not just aggregate metrics, when practical
 If static-label metrics improve, verify whether that improvement survives search-time or gameplay evaluation before prioritizing large follow-up work.
 
 When estimating next steps, default to the cheapest experiment that can falsify the current hypothesis.
+
+When two ideas have similar upside, prefer the cheaper, faster, more easily interpretable one.
 
 For architecture ablations, include:
 
@@ -167,6 +179,7 @@ When compute is limited, prefer:
 
 - broad shallow labeling for coverage
 - smaller deep-labeled subset for high-confidence supervision
+- targeted relabeling or weakness-harvested data over brute-force relabeling everything
 
 ## Self-Play Guidance
 
@@ -184,6 +197,7 @@ Evaluation should be comparable across runs.
 
 Prefer:
 
+- a fixed Elo gauntlet for checkpoint promotion
 - fixed validation subsets when comparing experiments
 - explicit reporting of sample size
 - separate reporting for legality and quality
@@ -198,7 +212,10 @@ The agent is expected to operate with initiative:
 - identify the next sensible experiment
 - implement it
 - run it when feasible
+- monitor it while it runs
+- stop or downscope it when it is obviously not worth more compute
 - summarize result, risk, and next step
+- maintain awareness of the current best Elo checkpoint and prefer building from winners
 
 Do not stop at brainstorming if the task clearly asks for execution.
 Do not invent external results that were not run locally.

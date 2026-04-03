@@ -97,7 +97,7 @@ def resolve_stockfish_path() -> Path:
         [
             Path("/usr/games/stockfish"),
             Path("/usr/bin/stockfish"),
-            Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe"),
+            Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2"),
         ]
     )
     for candidate in candidates:

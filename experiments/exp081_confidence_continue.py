@@ -43,7 +43,7 @@ from move_vocab import (
 # ---- Paths ----
 OUTPUT_DIR = Path("outputs/exp081_confidence_continue")
 CHECKPOINT_PATH = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 CACHED_DATA_PATH = Path("data/lichess_sf_cached_200k.jsonl")
 
 # ---- Dataset config ----

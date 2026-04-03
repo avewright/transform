@@ -12,7 +12,7 @@ from move_vocab import IDX_TO_UCI, index_to_move, legal_move_mask
 from chess_features import batch_boards_to_fused_token_ids
 
 DEVICE = torch.device('cuda')
-SF_PATH = 'stockfish/stockfish/stockfish-windows-x86-64-avx2.exe'
+SF_PATH = 'stockfish/stockfish/stockfish-ubuntu-x86-64-avx2'
 CHECKPOINT = 'outputs/exp093_ema_curriculum_d8/ema_model.pt'
 N_GAMES = 10
 SF_ELO = 1320

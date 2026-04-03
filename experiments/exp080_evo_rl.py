@@ -53,7 +53,7 @@ OUTPUT_DIR = Path("outputs/exp080_evo_rl")
 CHECKPOINT_PATH = Path("outputs/exp079_fast_continued/best_model.pt")
 if not CHECKPOINT_PATH.exists():
     CHECKPOINT_PATH = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 
 # ---- Population config ----
 POPULATION_SIZE = 5

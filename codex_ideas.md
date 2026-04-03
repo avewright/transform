@@ -139,6 +139,50 @@ value_target = cp_to_value_class(white_cp)  # Now matches pre-training conventio
 
 ---
 
+### exp115: Depth-2 minimax blend — COMPLETED
+
+**Hypothesis:** Looking one move deeper (opponent's top responses) improves blend quality.
+
+| Config | vs SF1900 | vs SF2050 | Est ELO |
+|--------|-----------|-----------|---------|
+| depth2_k10_opp5_w30 | 0.531 | 0.203 | ~1914 |
+| depth1_k10_w30 | 0.500 | 0.219 | ~1900 |
+| depth2_k10_opp3_w30 | 0.438 | 0.328 | ~1800 |
+
+**Conclusion:** Depth-2 is marginal, within noise. Not worth the extra compute.
+
+---
+
+### exp116: Fine-tune with correct value_target (LR=5e-6) — COMPLETED — REGRESSION
+
+**Hypothesis:** Fixing the value_target convention (swap 0↔2 for White-to-move FENs) during fine-tuning will improve the value head and boost blend ELO.
+
+**Training (LR=5e-6, killed at step 475/3471 due to KL divergence growth):**
+- Value accuracy White improved: 58.6% → 69.2% (+10.6pp)
+- Value accuracy Black improved: 63.3% → 69.2% (+5.9pp)  
+- BUT: KL divergence grew rapidly (0.78→1.50), indicating policy distribution shift
+- Policy CE degraded: 1.95→2.55 (training), 1.92→2.03 (eval)
+
+**Evaluation (32 games per config, step 400 checkpoint):**
+
+| Config | SF1900 | SF2050 |
+|--------|--------|--------|
+| baseline_greedy | 0.359 | 0.359 |
+| baseline_blend_k10_w30 | 0.375 | 0.375 |
+| exp116_greedy | 0.344 | 0.312 |
+| exp116_blend_k10_w30 | 0.344 | 0.297 |
+
+**Key findings:**
+1. exp116 is uniformly WORSE than baseline — LR=5e-6 is too aggressive (same as exp084)
+2. Value head improvement does NOT compensate for policy degradation
+3. Baseline blend (0.375) only marginally better than greedy (0.359) in this run
+4. Previous 0.500 vs SF1900 for blend was likely a lucky sample (high variance with 32 games)
+5. True model ELO is probably ~1700-1800 range, not ~1900 as previously estimated
+
+**exp116b planned:** Retry with LR=5e-7 (10x lower), 500 steps, best model saved by policy CE
+
+---
+
 ### exp110: Diverse multi-PV training — COMPLETED — ELO ~1600 (REGRESSION)
 
 **Hypothesis:** Expanding from opening-only data (exp085, 224K depth 10) to include

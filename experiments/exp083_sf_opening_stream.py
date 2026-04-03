@@ -46,7 +46,7 @@ LOG_PATH = OUTPUT_DIR / "exp083.log"
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
 DEFAULT_CONFIG_PATH = Path("configs/chess_transformer_16l_p256_no_pos.json")
 DEFAULT_INIT_CHECKPOINT = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 
 TRAIN_BATCH = 4
 TRAIN_ACCUM = 16

@@ -35,7 +35,7 @@ from move_vocab import VOCAB_SIZE, IDX_TO_UCI, UCI_TO_IDX, index_to_move, legal_
 
 OUTPUT_DIR = Path("outputs/exp082_sf_game_softloop")
 CHECKPOINT_PATH = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 
 TRAIN_BATCH = 4
 TRAIN_ACCUM = 16

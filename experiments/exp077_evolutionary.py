@@ -68,7 +68,7 @@ from move_vocab import (
 # ---- Paths ----
 OUTPUT_DIR = Path("outputs/exp077_evolutionary")
 CHECKPOINT_PATH = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 
 # ---- Population config ----
 POPULATION_SIZE = 6           # Number of variants per generation

@@ -414,7 +414,7 @@ def main():
     parser.add_argument("--beta", type=float, default=0.3, help="weight for our post-reply confidence")
     parser.add_argument("--gamma", type=float, default=0.2, help="weight for opponent confidence (penalty)")
     parser.add_argument("--use-value", action="store_true", help="also use value head (risky)")
-    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+    parser.add_argument("--sf-path", type=str, default="stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
     parser.add_argument("--sf-levels", type=str, default="1320,1450,1600,1750")
     parser.add_argument("--sf-level", type=int, default=1320)
     parser.add_argument("--n-games", type=int, default=10)

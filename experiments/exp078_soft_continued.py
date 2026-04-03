@@ -51,7 +51,7 @@ from move_vocab import (
 # ---- Paths ----
 OUTPUT_DIR = Path("outputs/exp078_soft_continued")
 CHECKPOINT_PATH = Path("outputs/hf/chess-transformer-200m-latest/best_model.pt")
-STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-windows-x86-64-avx2.exe")
+STOCKFISH_PATH = Path("stockfish/stockfish/stockfish-ubuntu-x86-64-avx2")
 
 # ---- Dataset config ----
 MAIN_REPO = "avewright/chess-positions"              # 47.5K, multi-PV
