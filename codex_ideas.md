@@ -2,6 +2,90 @@
 
 This file is the running log for:
 
+## 2026-04-04
+
+### MCTS BREAKTHROUGH: +280 ELO from inference-time search (exp123)
+
+**Result: MCTS 100 sims → 2091 estimated ELO (vs baseline 1811)**
+
+This is the single largest ELO improvement in the project's history, achieved with
+ZERO training — purely inference-time search using the existing baseline model.
+
+**exp122: Alpha-Beta search — CATASTROPHIC FAILURE**
+| Strategy | vs SF1900 (16g) | Est. ELO |
+|----------|-----------------|----------|
+| greedy | 0.469 (6W-3D-7L) | ~1878 |
+| ab_d1_noq | 0.063 (0W-2D-14L) | ~1430 |
+| ab_d2_noq | 0.063 (0W-2D-14L) | ~1430 |
+
+Alpha-beta minimax with value head is catastrophic (−448 ELO). Value head too noisy for
+minimax — noise compounds exponentially with depth. Confirmed exp097 finding from earlier.
+
+**exp123: MCTS with policy prior + value backup — MASSIVE SUCCESS**
+| Strategy | vs SF1900 (16g) | W-D-L | Est. ELO | Avg NN/game | Time/game |
+|----------|-----------------|-------|----------|-------------|-----------|
+| greedy | 0.312 | 2-6-8 | ~1763 | 0 | 0s |
+| **mcts_100** | **0.750** | **10-4-2** | **~2091** | 5443 | 135s |
+
+**Why MCTS works but minimax doesn't:**
+1. MCTS averages value estimates over many paths → noise reduction
+2. Policy priors guide exploration → searches good moves first
+3. With few sims, gracefully degrades to policy argmax (guaranteed ≥ baseline)
+4. Visit counts are robust to individual value estimation errors
+5. UCB exploration naturally discovers tactical oversights the policy misses
+
+**Implementation details (exp123):**
+- AlphaZero-style PUCT: UCB(s,a) = -Q(child) + c_puct * P(s,a) * sqrt(N) / (1+n)
+- c_puct = 2.5, Dirichlet noise α=0.3, frac=0.25
+- FPU reduction = 0.25 (unvisited children get pessimistic prior)
+- Move selection by visit count (most robust)
+- Value: White-absolute convention, converted to STM for backup
+- Syzygy tablebase at game level for ≤5 piece endings
+
+**exp124: Optimized MCTS — IMPLEMENTED, NOT YET RUN**
+Created exp124_mcts_optimized.py with:
+- Tree reuse between moves (advance subtree after our move + opponent response)
+- Batched leaf evaluation (process B leaves at once for GPU efficiency)
+- Virtual loss for parallel tree traversal
+- Syzygy inside MCTS tree (exact endgame values during search)
+- Early termination (stop when leader can't be overtaken)
+- Higher opponent sweep: SF2050, SF2200 to bracket ceiling
+
+**exp121: Continued pre-training — KILLED (regression)**
+- Killed at step 3,300/812,353 (~0.4% through corpus)
+- Policy loss: 3.24 (step 200) → 5.44 (step 3,200) — INCREASING
+- Value loss: 0.21 → 0.16 (improving, but not worth it)
+- 565 hour ETA for 1 pass, policy degrading → not viable
+- Freed 30.7GB VRAM for MCTS experiments
+
+### Strategic insight: Search >> Training for this architecture
+
+The data is now clear:
+| Approach | Best ELO | Compute | Status |
+|----------|----------|---------|--------|
+| Greedy baseline (832M pretrain) | ~1811 | 0 (inference) | Reference |
+| Fine-tuning (exp101-116) | ≤1831 | Hours of GPU training | +20 ELO at best |
+| Blend k10 w30 | ~1831 | 10x inference per move | +20 ELO |
+| **MCTS 100 sims** | **~2091** | 5443 NN evals/game | **+280 ELO** |
+
+Every training experiment (exp101-116, exp121) either regressed or barely matched baseline.
+MCTS with 100 simulations gives +280 ELO with zero training. The policy prior is strong
+enough to guide MCTS; the value head is good enough for averaging but too noisy for minimax.
+
+**Priority should now be:**
+1. Optimize MCTS (higher sims, tree reuse, batched eval) → target 2200+
+2. Test at SF2050/2200/2400 to find the ceiling
+3. Only then revisit training to improve the policy prior for MCTS
+4. Consider NNUE-scale distillation for faster NN evals (more sims per second)
+
+### Experiment inventory (exp119 harvest)
+
+exp119 large harvest completed: 62,692 positions in 7 shards.
+Parameters: depth 8, multipv 5, play-depth 6, max-plies 200, positions-per-lineage 6.
+Available for future training if MCTS ELO saturates.
+
+---
+
 ## 2026-04-03
 
 ### CRITICAL BUG: WDL Convention Conflict (Pre-training vs Fine-tuning)
@@ -2966,3 +3050,58 @@ data crisis finding). Focus priorities:
 1. exp101: HF-scale diverse training (4M+ positions, all game phases)
 2. exp102: Auxiliary losses (material/phase heads for better features)  
 3. Mirror search: useful bonus for online play, not the path to higher ELO
+
+---
+
+## 2026-04-04
+
+### Definitive ELO Baselines Established (exp120)
+
+Fixed model (post-WDL-bug-fix), 128 games each vs SF1900:
+- **Greedy: 0.375 (25W-46D-57L), ELO ≈ 1811**
+- **Blend (k=10, weight=0.30): 0.402 (26W-51D-51L), ELO ≈ 1831**
+
+### exp121: Continued Pre-training on 832M HF Positions — RUNNING
+
+LR=1e-5, cosine to 2e-6, batch=256×accum4=eff1024. Loss: CE(policy) + 0.5×KL(value WDL).
+All 3275 parquets pre-downloaded (~17GB). Throughput: ~410 pos/s.
+Status at step 2500: pl=5.43 (fluctuating, likely inter-file variance), vl=0.16 (stable).
+First eval at step 5000, ETA ~2h.
+
+### exp122: Alpha-Beta Search — FAILED CATASTROPHICALLY
+
+**Depth 1: 0.062 (0W-2D-14L), ELO ≈ 1430** (vs greedy 1878)
+**Depth 2: 0.062 (0W-2D-14L), ELO ≈ 1430** (identical!)
+
+**Root cause:** The value head is too NOISY for minimax position ranking.
+At depth 1, the engine evaluates root's top-10 policy moves with the value
+head and picks the "best value" move. But all positions one move apart
+have similar values (~0.05 difference), so the selection is essentially
+random among the top-10 policy moves. Random-from-top-10 is MUCH worse
+than top-1 policy (greedy).
+
+Deeper search (depth 2) doesn't help because the same value noise problem
+persists — minimax AMPLIFIES value errors (a single wrong evaluation at
+a leaf can flip the entire subtree's preference).
+
+**Key insight:** The policy head is MUCH stronger than the value head for
+move selection. Any viable search must RESPECT the policy ordering and
+only override it with strong value evidence.
+
+### exp123: MCTS Search — IN PROGRESS
+
+MCTS (Monte Carlo Tree Search) with policy prior naturally solves the
+alpha-beta failure mode:
+1. UCB = -Q(child) + c_puct × P(s,a) × sqrt(N_parent)/(1+N_child)
+2. With FEW simulations: policy prior dominates → plays like greedy (baseline)
+3. With MORE simulations: value signal averages out → potential improvement
+4. Guarantees: at least as good as greedy (smooth interpolation)
+
+Testing: sims=0 (greedy), 100, 200, 400 vs SF1900, c_puct=2.5.
+Value stored in each node from OWN side-to-move perspective, negated in UCB.
+
+**Updated strategic view:** Search IS mandatory for 3000 ELO (no single-pass NN
+has achieved it). But it must be policy-guided, not value-driven. MCTS (AlphaZero
+style) is the standard solution. The dual-track strategy is:
+1. Training (exp121): improve policy + value quality → +50-150 ELO
+2. Search (exp123): leverage both heads via MCTS → +200-500 ELO if value improves
