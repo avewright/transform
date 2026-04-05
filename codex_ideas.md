@@ -2861,6 +2861,58 @@ The value head needs Stockfish centipawn targets, not game-outcome WDL.
 - CI lower bound at 800 sims = 0.562 ≈ 1943 ELO > SF1900 even at 95% CI
 - 1600 sims test RUNNING — expect ~2180 ELO if scaling continues
 
+## 2026-04-05 Session 7 — Engine Defaults, Checkpoint Standardization, Path to 2500+
+
+### Infrastructure Hardening
+- **Engine default sims**: 200 → 800 (validated 2077 ELO). Removed adaptive `compute_sims()` from the `go` default path — that heuristic was the worst local result (~1645 ELO, exp125). Fixed sims are strictly better for this policy quality.
+- **Checkpoint standardization**: ALL experiment scripts now reference `outputs/exp100_diverse_training/best_model.pt` instead of exp142/143 (which caused catastrophic forgetting). Files fixed: exp126, exp144, exp145, exp146, exp146b, exp147, exp148b.
+- **SpatialPolicyHead optimization**: Already landed in session 4 (project-then-gather). Every experiment since session 4 has the ~37% inference speedup baked in. No further code change needed.
+- **Git push**: Full commit with all experiments exp125-148b pushed to remote.
+
+### 1600-sim 32-game Validation (IN PROGRESS)
+Re-running exp148b with 1600 sims, 32 games vs SF1900. Previous run killed at 5/32 (2W-3D-0L ≈ 2047). Running on HF checkpoint (exp100).
+
+### Formed Opinions — Agent Research Assessment
+
+**The Core Problem**: 14% top-1 policy accuracy is the single bottleneck. All search improvements converge to the same ELO ceiling for a given sim count. Sims scale at ~+100 ELO per doubling, but that's pure compute cost with diminishing returns.
+
+**Why Fine-Tuning Always Failed (exp112-116, exp137, exp142, exp143, exp147)**:
+The model was pre-trained on ~832M positions (from `avewright/chess-positions-lichess-sf`). Its 204M parameters encode a rich representation of chess tuned to that distribution. Fine-tuning on 10M positions from the same dataset but at different mixture/selection causes destructive interference. The internal representations are overfit to the 832M pre-training distribution — any significant LR allows the new gradient signal to corrupt old knowledge. This is NOT a data quality issue — it's a distribution shift + capacity utilization problem.
+
+**The Correct Next Step is From-Scratch Training on 10M+**:
+- Ruoss et al. 2024: 270M on 10M → 2895 ELO WITHOUT search. Our architecture is comparable.
+- From-scratch avoids the catastrophic forgetting problem entirely.
+- 10M positions × 3 epochs at ~98 pos/s ≈ 85 hours (3.5 days). Feasible.
+- Expected: If policy reaches 30%+ top-1, MCTS at 200 sims → 2300+ ELO; at 800 sims → 2500+.
+- Risk: May underperform Ruoss due to dataset differences (their 10M may be more carefully curated). But even 25% top-1 would be a massive improvement.
+
+**The Attention-Weighted Training Idea (User Suggestion)**:
+User proposed training with attention mechanism targets on finished game moves — assessing how good each move was given other moves, the game outcome, and moves leading up to it.
+
+This maps to three possible implementations of increasing ambition:
+1. **Move-quality auxiliary loss** (most practical): Add a secondary head that predicts centipawn-loss of the played move (how much worse than best). Already available from Stockfish labels in the training data. This teaches the model to distinguish critical vs. routine positions.
+2. **Game-context position weighting**: Weight training loss by move significance — positions where the played move caused large evaluation swings get higher gradient magnitude. Focuses learning on positions that actually matter for winning/losing.
+3. **Game-sequence transformer** (ambitious): Process entire game sequences instead of individual positions. Attention naturally learns which prior moves inform current position evaluation. Requires architecture change.
+
+Assessment: Options 1 and 2 are compatible with from-scratch training as auxiliary objectives. Option 1 (move-quality head) is the cleanest — it adds a richer training signal without architecture changes. The Stockfish centipawn labels already contain this information implicitly (difference between best and played move scores). Could add as `move_quality_loss = MSE(pred_cp_loss, actual_cp_loss)`. This is similar to KataGo's auxiliary objectives which saved 50x training compute.
+
+**Priority Stack (My Opinion)**:
+| # | Action | Expected ELO Gain | Time |
+|---|--------|-------------------|------|
+| 1 | 1600-sim validation (RUNNING) | +50-100 over 800 sims | 2 hrs |
+| 2 | From-scratch 204M on 10M | +400-800 over current | 3.5 days |
+| 3 | Add move-quality auxiliary loss to #2 | +50-100 above baseline #2 | +0 extra time |
+| 4 | Once #2 converges, 800-1600 sim eval | Quantifies #2 gains | 2-4 hrs |
+| 5 | Self-play expert iteration (large-scale) | +100-300 if policy is 30%+ | Days |
+
+**What to NOT do** (validated dead ends at current policy quality):
+- Fine-tuning from the current checkpoint (always forgetting)
+- Gumbel MCTS (needs 50%+ policy)
+- Tree reuse (neutral/negative)
+- Low c_puct (catastrophic — needs strong policy for exploitation)
+- Hybrid NNUE-transformer (NNUE policy quality insufficient)
+- Expert iteration from small self-play sets (<10K positions)
+
 ### Architecture discovery: Model is fully custom 204M
 - NOT Qwen-based as previously thought — pure nn.TransformerEncoder
 - FusedBoardEncoder → 256d → project to 1024d → 16L/16H transformer
