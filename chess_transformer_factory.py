@@ -76,10 +76,13 @@ class SpatialPolicyHead(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, cls_hidden: torch.Tensor) -> torch.Tensor:
         sq_hidden = hidden_states[:, self.n_ctx:self.n_ctx + 64, :]
-        from_feats = sq_hidden[:, self.from_sqs, :]
-        to_feats = sq_hidden[:, self.to_sqs, :]
+        # Project all 64 squares first (cheap), then gather per-move (smaller dim)
+        all_from = self.from_proj(sq_hidden)              # (B, 64, head_dim)
+        all_to = self.to_proj(sq_hidden)                  # (B, 64, head_dim)
+        from_feats = all_from[:, self.from_sqs, :]        # (B, V, head_dim)
+        to_feats = all_to[:, self.to_sqs, :]              # (B, V, head_dim)
         combined = (
-            self.from_proj(from_feats) * self.to_proj(to_feats)
+            from_feats * to_feats
             + self.global_proj(cls_hidden).unsqueeze(1)
             + self.promo_embed(self.promo_types).unsqueeze(0)
         )

@@ -1,0 +1,20 @@
+{
+  "name": "chess-transformer-16l-p256-no-pos",
+  "model": {
+    "encoder_dim": 256,
+    "hidden_dim": 1024,
+    "num_layers": 16,
+    "num_heads": 16,
+    "ffn_ratio": 4,
+    "dropout": 0.1,
+    "policy_head_dim": 256,
+    "value_hidden": 512,
+    "use_pos_embed": false,
+    "n_ctx_tokens": 4
+  },
+  "notes": [
+    "Matches the active 16-layer fused-board transformer depth.",
+    "Shrinks the spatial policy head from 512 to 256.",
+    "Removes the extra learned transformer-level pos_embed while keeping square embeddings in FusedBoardEncoder."
+  ]
+}

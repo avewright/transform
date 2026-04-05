@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from chess_features import batch_boards_to_fused_token_ids
 from chess_transformer_factory import build_model
+from opening_book import get_book_move
 
 ROOT = Path(__file__).resolve().parent
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,6 +203,9 @@ def play_one(
             tb_move = get_syzygy_move(board)
             if tb_move is not None:
                 move = tb_move
+            # Try opening book for principled opening play
+            elif (book_move := get_book_move(board)) is not None:
+                move = book_move
             else:
                 move, _ = move_fn(model, board, DEVICE, temperature=0.0)
         else:
