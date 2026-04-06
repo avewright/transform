@@ -263,8 +263,7 @@ def main():
 
     loader = ShardedChessLoader(
         SHARD_DIR, batch_size=args.batch_size,
-        eval_path=SHARD_DIR / "eval.pt", hflip=True,
-        include_cp=True,
+        hflip=True, include_cp=True,
     )
     steps_per_epoch = len(loader) // args.accum_steps
     total_steps = steps_per_epoch * args.epochs
