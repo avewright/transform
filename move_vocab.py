@@ -47,19 +47,46 @@ VOCAB_SIZE = len(IDX_TO_UCI)
 
 def move_to_index(move: chess.Move) -> int:
     """Convert a chess.Move to vocabulary index."""
-    return UCI_TO_IDX[move.uci()]
+    uci = move.uci()
+    if uci in UCI_TO_IDX:
+        return UCI_TO_IDX[uci]
+    # Castling: python-chess may use e1g1, data uses e1h1
+    if uci in _CASTLE_STD_TO_960:
+        return UCI_TO_IDX[_CASTLE_STD_TO_960[uci]]
+    raise KeyError(f"Move {uci} not in vocabulary")
 
 
 def index_to_move(idx: int) -> chess.Move:
-    """Convert a vocabulary index to a chess.Move."""
-    return chess.Move.from_uci(IDX_TO_UCI[idx])
+    """Convert a vocabulary index to a chess.Move.
+
+    Handles king-to-rook castling indices by converting to standard UCI.
+    """
+    uci = IDX_TO_UCI[idx]
+    if uci in _CASTLE_960_TO_STD:
+        uci = _CASTLE_960_TO_STD[uci]
+    return chess.Move.from_uci(uci)
+
+
+# Castling: python-chess uses king-to-target (e1g1), but Stockfish/data uses
+# king-to-rook (e1h1). Map both directions so we handle either format.
+_CASTLE_STD_TO_960 = {"e1g1": "e1h1", "e1c1": "e1a1", "e8g8": "e8h8", "e8c8": "e8a8"}
+_CASTLE_960_TO_STD = {v: k for k, v in _CASTLE_STD_TO_960.items()}
 
 
 def legal_move_mask(board: chess.Board) -> torch.Tensor:
-    """Create a boolean mask over the move vocabulary for legal moves."""
+    """Create a boolean mask over the move vocabulary for legal moves.
+
+    Handles castling in both UCI formats (king-to-target e1g1 AND
+    king-to-rook e1h1) since training data uses king-to-rook style.
+    """
     mask = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
     for move in board.legal_moves:
         uci = move.uci()
         if uci in UCI_TO_IDX:
             mask[UCI_TO_IDX[uci]] = True
+        # Also enable the king-to-rook variant for castling moves
+        if uci in _CASTLE_STD_TO_960:
+            alt = _CASTLE_STD_TO_960[uci]
+            if alt in UCI_TO_IDX:
+                mask[UCI_TO_IDX[alt]] = True
     return mask

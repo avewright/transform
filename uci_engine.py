@@ -37,7 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chess_features import batch_boards_to_fused_token_ids
 from chess_transformer_factory import build_model, ChessTransformerConfig
-from move_vocab import VOCAB_SIZE, index_to_move, legal_move_mask, move_to_index
+from move_vocab import (VOCAB_SIZE, index_to_move, legal_move_mask,
+                        move_to_index, UCI_TO_IDX,
+                        _CASTLE_STD_TO_960)
 from opening_book import get_book_move
 
 ROOT = Path(__file__).resolve().parent
@@ -221,7 +223,14 @@ class MCTSSearch:
             policy = {}
             for m in board.legal_moves:
                 idx = move_to_index(m)
-                policy[m] = probs[idx].item()
+                p = probs[idx].item()
+                # Castling: combine probability from both UCI formats
+                # (model trained on e1h1 but python-chess uses e1g1)
+                uci = m.uci()
+                if uci in _CASTLE_STD_TO_960:
+                    alt_idx = UCI_TO_IDX[_CASTLE_STD_TO_960[uci]]
+                    p += probs[alt_idx].item()
+                policy[m] = p
             # Value: White-absolute → side-to-move
             wdl = F.softmax(r["value_logits"][i].float(), dim=-1)
             white_val = (wdl[0] - wdl[2]).item()

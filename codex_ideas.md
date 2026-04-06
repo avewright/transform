@@ -2,6 +2,64 @@
 
 This file is the running log for:
 
+## 2026-04-06 Session (continued) — hflip augmentation + MCTS early-stop + exp153
+
+### Implemented: Horizontal Flip Data Augmentation
+
+Added to `data_loader.py`: when `ShardedChessLoader(hflip=True)`, 50% of positions
+per shard are randomly mirrored left-to-right. Mirror tables for all 5504 moves
+verified with round-trip test (double flip == identity for all moves).
+
+This doubles effective data variety at zero compute cost. Applied AFTER epoch 1
+(clean training) in exp153 to avoid confusing early learning.
+
+### Implemented: MCTS Stability Early-Stop
+
+Added to `uci_engine.py` `_run_sims()`: if top move has >70% visits after using
+25% of budget AND lead exceeds 15% of max_sims, stop early. This saves ~30-50%
+search time on positions where the best move is clearly dominant. No ELO loss
+expected on clear positions; gains come from faster time-to-move.
+
+### Created: exp153_hflip_continue.py
+
+Starts from exp149's epoch_1 checkpoint, continues with hflip=True for epochs 2-3.
+Continues exp149's cosine LR schedule (no restart). Optimizer state preserved.
+
+**Will launch when exp149 completes epoch 1 (~step 106K, ~18h from session start).**
+
+### Active Processes
+
+- exp149 training: step ~38,200/318,900 at 89 pos/s (GPU, running)
+- Soft target generation: shard 0, 1M positions, 4 SF workers depth=6 (CPU, in progress)
+- step 38K eval: 16.36% top-1, 41.28% top-3, 73.22% value (5K; remember 20K shows ~+1.5pp)
+
+### exp152 Assessment: DEPRIORITIZED
+
+exp152 (trajectory-level value attention) is interesting research but poor ELO/hour:
+
+1. **Only improves value, not policy** — policy is the bottleneck at 18.12% top-1.
+   Value at 68.66% is adequate. Even +3pp value → maybe +20-40 ELO vs +100-200
+   from equivalent policy improvement.
+2. **MCTS integration is architecturally awkward** — during search, MCTS explores
+   hypothetical positions (not actual game trajectory). Trajectory model needs real
+   game history, but each MCTS leaf is speculative. Would need root-only usage
+   (tiny benefit) or per-path context (extremely expensive).
+3. **GPU-hungry data generation** — 200 games at 100 sims eats hours of GPU time
+   that should go to exp149 training.
+4. **Small training set** — 15K positions from 200 games is noisy for 8M params.
+5. **When it might matter**: If policy reaches 30%+ and value becomes the bottleneck,
+   or for time-control play with resignation/continuation decisions.
+
+**Verdict**: Revisit after hitting policy plateau. Focus on policy quality now.
+
+### Next Steps (priority ordered)
+
+1. **Analyze model error patterns** — what types of positions does the model get wrong?
+2. **When soft targets complete**: verify companion file, prepare for exp151
+3. **When exp149 epoch 1 done**: 20K eval + ELO gauntlet, then launch exp153
+4. **If exp153 shows improvement**: apply hflip to exp149 restart
+5. **Validate MCTS early-stop**: play 16 games at high sims, compare move quality
+
 ## 2026-04-06 Session — Trajectory-Level Attention for Value Learning (exp152)
 
 ### Hypothesis

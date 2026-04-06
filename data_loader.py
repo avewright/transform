@@ -1600,7 +1600,11 @@ class ShardedChessLoader:
                     shard_mi = mi
 
                     ca = shard["castling"].clone()
-                    ca[flip_mask] = hflip_castling(ca[flip_mask]).to(ca.dtype)
+                    # Zero castling rights for flipped positions: after hflip
+                    # the king is on d-file, not e-file, so castling flags are
+                    # inconsistent. Zeroing is safe — the flipped position just
+                    # looks like a post-castling game.
+                    ca[flip_mask] = 0
                     shard_ca = ca
 
                     ep = shard["ep_square"].clone()
