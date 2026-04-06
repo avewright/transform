@@ -119,10 +119,13 @@ def run_gauntlet(model, sf_elo, sims, games, c_puct=2.5, use_book=True):
                     move = bm
                 else:
                     move, info = mcts.search(board, max_sims=sims)
-                mcts.root = None
+                # Advance tree past our move so opponent's subtree is at root
+                mcts.advance_tree(move)
                 board.push(move)
             else:
                 sf_move = sf.play(board, chess.engine.Limit(time=0.05)).move
+                # Advance tree past opponent's move for inter-move tree reuse
+                mcts.advance_tree(sf_move)
                 board.push(sf_move)
 
         o = board.outcome(claim_draw=True)

@@ -760,6 +760,9 @@ class UCIEngine:
         self.board = chess.Board()
         self.ponder = False
         self.debug = False
+        # Track how many half-moves the tree root has been advanced through
+        # so _cmd_position only advances for NEW moves (opponent's response).
+        self._tree_ply = 0
         self._load_model()
 
     def _load_model(self):
@@ -852,6 +855,7 @@ class UCIEngine:
     def _cmd_ucinewgame(self):
         self.search.new_game()
         self.board = chess.Board()
+        self._tree_ply = 0
 
     def _cmd_position(self, tokens):
         self.search.stop_pondering()
@@ -867,15 +871,32 @@ class UCIEngine:
                 fen_parts.append(tokens[idx])
                 idx += 1
             self.board = chess.Board(" ".join(fen_parts))
+            # FEN position → tree may not match, reset
+            self._tree_ply = 0
+            self.search.root = None
 
+        moves = []
         if idx < len(tokens) and tokens[idx] == "moves":
             idx += 1
-            prev_board = self.board.copy()
-            for uci in tokens[idx:]:
-                move = chess.Move.from_uci(uci)
-                # Advance search tree for tree reuse
-                self.search.advance_tree(move)
-                self.board.push(move)
+            moves = tokens[idx:]
+
+        # Apply all moves to the board
+        for uci in moves:
+            self.board.push(chess.Move.from_uci(uci))
+
+        # Tree reuse: only advance through moves the tree hasn't seen yet.
+        # _tree_ply tracks how far the tree root was advanced by previous
+        # _cmd_go (our move) calls. Here we advance for new moves only
+        # (typically the opponent's response).
+        if len(moves) < self._tree_ply:
+            # Position has fewer moves than tree expects → stale tree
+            # (e.g., new game without ucinewgame, or analysis position)
+            self.search.root = None
+            self._tree_ply = 0
+        for uci in moves[self._tree_ply:]:
+            move = chess.Move.from_uci(uci)
+            self.search.advance_tree(move)
+        self._tree_ply = len(moves)
 
     def _cmd_go(self, tokens):
         self.search.stop_pondering()
@@ -971,8 +992,10 @@ class UCIEngine:
 
         self._send(f"bestmove {best_move.uci()}{ponder_uci}")
 
-        # Advance tree for next search
+        # Advance tree past our move for inter-move tree reuse.
+        # _cmd_position will then advance only through new moves (opponent's reply).
         self.search.advance_tree(best_move)
+        self._tree_ply = len(self.board.move_stack) + 1  # +1 for our move
 
         # Start pondering on predicted opponent move
         if self.ponder and ponder_uci:
