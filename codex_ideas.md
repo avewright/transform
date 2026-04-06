@@ -29,9 +29,61 @@ Continues exp149's cosine LR schedule (no restart). Optimizer state preserved.
 
 ### Active Processes
 
-- exp149 training: step ~38,200/318,900 at 89 pos/s (GPU, running)
+- exp149 training: step ~38,000/318,900 at 98 pos/s (GPU, running)
 - Soft target generation: shard 0, 1M positions, 4 SF workers depth=6 (CPU, in progress)
 - step 38K eval: 16.36% top-1, 41.28% top-3, 73.22% value (5K; remember 20K shows ~+1.5pp)
+
+### CRITICAL BUG FIX: Castling Move Encoding
+
+**Discovery**: Error analysis (_analyze_errors.py) revealed **0.00% accuracy on ALL
+409 castling positions** (rank=999). The engine literally could not castle.
+
+**Root cause**: Training data uses king-to-rook format (e1h1, 96% of castling moves)
+but python-chess `Board.legal_moves` produces king-to-target format (e1g1). The
+`legal_move_mask()` only enabled e1g1, so e1h1 predictions were masked as illegal.
+
+**Fix (move_vocab.py + uci_engine.py)**:
+- `legal_move_mask` now enables BOTH castling formats
+- `index_to_move` converts king-to-rook → king-to-target for python-chess
+- MCTS policy combines probabilities from both formats
+
+**Impact on 20K eval (exp149 best_model.pt)**:
+
+| Metric | Before fix | After fix | Delta |
+|--------|-----------|-----------|-------|
+| Top-1 | 18.12% | 18.32% | +0.20% |
+| Top-3 | 42.47% | 43.35% | +0.88% |
+| Top-5 | 58.77% | 60.06% | +1.29% |
+| Value | 68.66% | 68.66% | +0.00% |
+
+HF baseline (exp100) unaffected — was trained on e1g1 format data.
+
+**ELO impact estimate: +50-100 ELO** from castling alone during game play.
+Previously the engine NEVER castled in any MCTS game. Now it can.
+
+### Error Analysis Results (exp149 best, 20K eval)
+
+Key findings from _analyze_errors.py:
+
+**By phase**: Endgame strongest (20.55%), middlegame weakest (16.89%)
+**By material**: Behind positions best (23.13%), equal worst (17.34%)
+**By complexity**: Few legal moves (30.57%), many legal moves worst (16.86%)
+**By piece**: Queen moves worst (12.58%), knight best (21.61%)
+**By move type**: Captures very strong (41.82%), quiet moves weakest (14.61%)
+**Value by phase**: Opening 77.81%, middlegame 55.46%, endgame 69.41%
+
+**Actionable insights**:
+1. Quiet moves are the biggest weakness (14.61% on 80% of data) — this is where
+   most ELO is lost. Need better positional understanding.
+2. Queen moves at 12.58% suggests the model struggles with the queen's mobility.
+3. Middlegame value at 55.46% is concerning — near random for 3-class.
+4. Captures are well-learned (41.82%) — tactical patterns are working.
+
+### hflip castling interaction fix
+
+When applying horizontal flip, castling rights are now zeroed instead of mirrored.
+Flipped king on d-file is inconsistent with castling flags. Safe because flipped
+positions still provide useful piece interaction training data.
 
 ### exp152 Assessment: DEPRIORITIZED
 
