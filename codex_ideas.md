@@ -2,6 +2,115 @@
 
 This file is the running log for:
 
+## 2026-04-06 Session — Smaller Model + Deep Search Analysis
+
+### User suggestion: smaller transformer with deeper attention-based search
+
+**Verdict: NOT recommended as primary path. Keep 204M, but adopt insights.**
+
+Research analysis (Ruoss 2024, KataGo, Gumbel AZ, Lc0 scaling):
+- Evaluation quality dominates search quantity at any sim budget
+- Ruoss 270M transformer with ZERO search = 2895 Elo (Lichess blitz)
+- Empirical: doubling MCTS sims ≈ +50-70 Elo, but halving model quality ≈ -250-350 Elo
+- A 50M model with 4× sims would score ~100-200 Elo BELOW 204M at 1× sims
+- AlphaZero went bigger nets + same sims, never the reverse
+
+**What the research DOES support (smaller model for search):**
+1. **NNUE distillation** (priority #3 in queue): train <1M param network from 204M outputs,
+   runs at 60M+ pos/sec on CPU, enables depth-30+ alpha-beta
+2. **Gumbel MCTS**: near-optimal play at 1-100 sims, no c_puct tuning needed
+3. **Adaptive sim budget**: 20 sims for forced moves, 2000 for complex positions
+4. **Internalized search**: Our 16 layers already learn some search-like reasoning.
+   Ruoss used ~24-30 layers. Going deeper helps ONLY if model is otherwise well-trained.
+
+**When to revisit**: After exp149 completes training and reaches >2100 Elo.
+Then NNUE distillation becomes the right "small model + deep search" approach.
+
+### exp149 crashed + restarted
+
+Training died between step 41,975 and 42,000 — likely OOM from running 3 CPU-heavy
+processes simultaneously (value analysis + 4-worker soft targets + training). Lost
+~975 steps from latest checkpoint at step 41K. Restarted at 14:08 from step 41K.
+
+New eval at step 41K: 17.14% top-1, 41.96% top-3, 71.18% value.
+Restarted soft targets with 1 worker only to prevent future OOM.
+
+### Updated eval table (5K eval)
+
+| Step | Top-1 | Top-3 | Value | Notes |
+|------|-------|-------|-------|-------|
+| 33K | 15.96% | 40.62% | 72.82% | |
+| 34K | 16.56% | 40.46% | 70.30% | |
+| 35K | 15.88% | 40.48% | 68.46% | |
+| 36K | 16.56% | 41.02% | 71.34% | |
+| 37K | 17.20% | 41.48% | 71.08% | best top-1 (5K) |
+| 38K | 16.36% | 41.28% | 73.22% | |
+| 39K | 16.52% | 41.36% | 71.62% | |
+| 40K | 16.46% | 42.36% | 72.44% | best top-3 |
+| 41K | 17.14% | 41.96% | 71.18% | strong top-1 |
+
+Top-3 trend: 40.62% → 42.36% over 7K steps (~+0.25pp per 1K steps).
+Top-1 oscillates but with upward trend. Value noisy in 68-73% range.
+
+## 2026-04-06 Session (continued) — Pooled value head + soft targets at scale
+
+### exp155: Pooled Value Head Architecture
+
+Key insight from value analysis: the current value head reads ONLY the CLS token
+(1024-dim). The policy head reads ALL 64 square tokens + CLS. This asymmetry
+means the value head has a lossy bottleneck — it can't see local piece interactions.
+
+**New PooledValueHead**: CLS (1024) + mean(64 squares) (1024) → 2048-dim input
+- MLP: Linear(2048,512) → ReLU → Linear(512,256) → ReLU → Linear(256,3)
+- Adds only 0.65M params (204.0M → 204.7M)
+- Config: `ChessTransformerConfig(value_head_type="pool")`
+
+Design choices for exp155:
+- **value_weight=1.0** (doubled from 0.5): directly address value bottleneck
+- **5× LR multiplier for value head**: new head trains from scratch while trunk fine-tunes
+- **hflip=True**: same as exp153 baseline for fair comparison
+- **Fresh optimizer**: param groups changed, trunk adapts quickly anyway
+
+Comparison matrix (all continue from exp149 epoch_1):
+| Exp | hflip | Value Head | value_weight | LR multiplier |
+|-----|-------|-----------|-------------|--------------|
+| 153 | Yes | CLS (default) | 0.5 | 1× |
+| 154 | Yes | CLS + cp_aux | 0.5 | 1× |
+| 155 | Yes | Pooled | 1.0 | 5× (value head) |
+
+### Soft Target Generation: Shard 0 Full (1M positions)
+
+Restarted with 4 workers (~400 pos/s combined) after 50K test succeeded.
+File: outputs/exp139_massive_train/shards/shard_00000_soft.pt
+Format: soft_indices (N,5) int16, soft_cp (N,5) int16
+50K test showed: 49,993/50,000 valid (100%), avg 4.94 PVs per position.
+
+### exp149 Training: Step 40K Eval
+
+| Step | Top-1 | Top-3 | Value | Notes |
+|------|-------|-------|-------|-------|
+| 33K | 15.96% | 40.62% | 72.82% | |
+| 34K | 16.56% | 40.46% | 70.30% | |
+| 35K | 15.88% | 40.48% | 68.46% | noisy dip |
+| 36K | 16.56% | 41.02% | 71.34% | |
+| 37K | 17.20% | 41.48% | 71.08% | best top-1 (5K) |
+| 38K | 16.36% | 41.28% | 73.22% | |
+| 39K | 16.52% | 41.36% | 71.62% | |
+| 40K | 16.46% | 42.36% | 72.44% | best top-3! |
+
+Top-3 is steadily improving: 40.62% → 42.36% over 7K steps. Top-1 is noisy but
+the model IS learning. Value fluctuates 68-73% (5K eval noise). At step 106K
+(epoch 1), we expect meaningful gains across all metrics.
+
+### Value Head Research (from alphazero/possible_improvements.md)
+
+Top actionable ideas:
+1. **Pool all squares for value** (implemented in exp155)
+2. **GradNorm / dynamic loss weighting** (deferred — simple multiplier first)
+3. **Deeper value neck** (implemented in exp155 — 3-layer vs 2-layer MLP)
+4. **Auxiliary losses (cp, material, phase)** (exp154 has cp auxiliary)
+5. **Phase-bucketed value heads** (future — need value analysis results first)
+
 ## 2026-04-06 Session (continued) — ELO gauntlet + encoding audit + soft target fix
 
 ### ELO Gauntlet: exp149 step 37K vs SF1900 at 100 sims

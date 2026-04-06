@@ -25,6 +25,7 @@ class ChessTransformerConfig:
     value_hidden: int = 512
     use_pos_embed: bool = True
     n_ctx_tokens: int = 4
+    value_head_type: str = "cls"  # "cls" (CLS only) or "pool" (CLS + mean pool)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ChessTransformerConfig":
@@ -89,6 +90,28 @@ class SpatialPolicyHead(nn.Module):
         return self.score_proj(F.relu(combined)).squeeze(-1)
 
 
+class PooledValueHead(nn.Module):
+    """Value head that reads CLS + mean-pooled square tokens for richer input."""
+    def __init__(self, hidden_dim: int, value_hidden: int = 512, n_ctx_tokens: int = 4):
+        super().__init__()
+        self.n_ctx = n_ctx_tokens
+        # Input is CLS (hidden_dim) + mean pool of 64 squares (hidden_dim) = 2*hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, value_hidden),
+            nn.ReLU(),
+            nn.Linear(value_hidden, value_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(value_hidden // 2, 3),
+        )
+
+    def forward(self, hidden: torch.Tensor, cls_hidden: torch.Tensor) -> torch.Tensor:
+        # hidden: (B, 1+ctx+64, hidden_dim), cls_hidden: (B, hidden_dim)
+        sq_hidden = hidden[:, self.n_ctx:self.n_ctx + 64, :]  # (B, 64, hidden_dim)
+        pool = sq_hidden.mean(dim=1)  # (B, hidden_dim)
+        combined = torch.cat([cls_hidden, pool], dim=-1)  # (B, 2*hidden_dim)
+        return self.mlp(combined)
+
+
 class ChessTransformer(nn.Module):
     def __init__(self, config: ChessTransformerConfig):
         super().__init__()
@@ -117,11 +140,18 @@ class ChessTransformer(nn.Module):
             n_ctx_tokens=config.n_ctx_tokens,
             head_dim=config.policy_head_dim,
         )
-        self.value_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.value_hidden),
-            nn.ReLU(),
-            nn.Linear(config.value_hidden, 3),
-        )
+        if config.value_head_type == "pool":
+            self.value_head = PooledValueHead(
+                config.hidden_dim, config.value_hidden, config.n_ctx_tokens
+            )
+            self._pool_value = True
+        else:
+            self.value_head = nn.Sequential(
+                nn.Linear(config.hidden_dim, config.value_hidden),
+                nn.ReLU(),
+                nn.Linear(config.value_hidden, 3),
+            )
+            self._pool_value = False
 
     def forward(self, board_input: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         hidden = self.input_proj(self.encoder(board_input))
@@ -131,9 +161,13 @@ class ChessTransformer(nn.Module):
             hidden = hidden + self.pos_embed
         hidden = self.norm(self.transformer(hidden))
         cls_hidden = hidden[:, 0, :]
+        value_logits = (
+            self.value_head(hidden, cls_hidden) if self._pool_value
+            else self.value_head(cls_hidden)
+        )
         return {
             "policy_logits": self.policy_head(hidden, cls_hidden),
-            "value_logits": self.value_head(cls_hidden),
+            "value_logits": value_logits,
             "cls_hidden": cls_hidden,
         }
 
