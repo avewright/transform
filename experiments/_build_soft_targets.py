@@ -17,7 +17,7 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -154,22 +154,31 @@ def process_shard(shard_path, depth, pvs, workers, max_positions=None):
     t0 = time.time()
     all_results = []
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(analyze_chunk, chunk, depth, pvs, SF_PATH): i
-            for i, chunk in enumerate(chunks)
-        }
-        done = 0
-        for future in as_completed(futures):
-            chunk_results = future.result()
-            all_results.extend(chunk_results)
-            done += 1
-            elapsed = time.time() - t0
-            rate = sum(1 for _ in all_results) / elapsed if elapsed > 0 else 0
-            eta = (n - len(all_results)) / rate if rate > 0 else 0
-            print(f"    chunk {done}/{len(chunks)} done "
-                  f"({len(all_results):,}/{n:,} positions, "
-                  f"{rate:.0f} pos/s, ETA {eta:.0f}s)")
+    if workers <= 1:
+        # Single-threaded: call directly in main process (avoids subprocess issues)
+        chunk_results = analyze_chunk(fens, depth, pvs, SF_PATH)
+        all_results.extend(chunk_results)
+        elapsed = time.time() - t0
+        rate = len(all_results) / elapsed if elapsed > 0 else 0
+        print(f"    done ({len(all_results):,}/{n:,} positions, "
+              f"{rate:.0f} pos/s)")
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(analyze_chunk, chunk, depth, pvs, SF_PATH): i
+                for i, chunk in enumerate(chunks)
+            }
+            done = 0
+            for future in as_completed(futures):
+                chunk_results = future.result()
+                all_results.extend(chunk_results)
+                done += 1
+                elapsed = time.time() - t0
+                rate = sum(1 for _ in all_results) / elapsed if elapsed > 0 else 0
+                eta = (n - len(all_results)) / rate if rate > 0 else 0
+                print(f"    chunk {done}/{len(chunks)} done "
+                      f"({len(all_results):,}/{n:,} positions, "
+                      f"{rate:.0f} pos/s, ETA {eta:.0f}s)")
 
     elapsed = time.time() - t0
     print(f"  Analysis complete: {len(all_results):,} positions in {elapsed:.1f}s "

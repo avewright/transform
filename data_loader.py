@@ -1464,13 +1464,15 @@ class ShardedChessLoader:
 
     def __init__(self, shard_dir, batch_size, encoder_type="fused",
                  device="cpu", seed=42, drop_last=True, skip_positions=0,
-                 expected_shards=None, start_shard=0, hflip=False):
+                 expected_shards=None, start_shard=0, hflip=False,
+                 include_cp=False):
         self.shard_dir = Path(shard_dir)
         self.batch_size = batch_size
         self.encoder_type = encoder_type
         self.device = device
         self.seed = seed
         self.hflip = hflip
+        self.include_cp = include_cp
         self.drop_last = drop_last
         self.skip_positions = skip_positions
         self.epoch = 0
@@ -1628,6 +1630,7 @@ class ShardedChessLoader:
             ep_file = ep_square_to_file(shard_ep.long())
             move_idx = shard_mi.long()
             wdl = compute_wdl(shard["cp"], shard["mate"])
+            cp_vals = shard["cp"].float() if self.include_cp else None
             del shard, shard_ba, shard_mi, shard_ca, shard_ep
 
             # Shuffle within shard
@@ -1658,12 +1661,14 @@ class ShardedChessLoader:
                     batch_input["fused_ids"] = fused[idx].to(self.device)
                 if self.encoder_type in ("baseline", "both"):
                     pass  # extend when needed
+                if cp_vals is not None:
+                    batch_input["cp"] = cp_vals[idx].to(self.device)
 
                 yield (batch_input,
                        move_idx[idx].to(self.device),
                        wdl[idx].float().to(self.device))
 
-            del fused, turn, castling_t, ep_file, move_idx, wdl
+            del fused, turn, castling_t, ep_file, move_idx, wdl, cp_vals
 
 
 # ── CLI: Build cache manually ──

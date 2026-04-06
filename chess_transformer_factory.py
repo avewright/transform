@@ -134,6 +134,7 @@ class ChessTransformer(nn.Module):
         return {
             "policy_logits": self.policy_head(hidden, cls_hidden),
             "value_logits": self.value_head(cls_hidden),
+            "cls_hidden": cls_hidden,
         }
 
 
