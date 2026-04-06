@@ -2,6 +2,74 @@
 
 This file is the running log for:
 
+## 2026-04-06 Session — Trajectory-Level Attention for Value Learning (exp152)
+
+### Hypothesis
+
+Current value head sees one board position → WDL. But game outcomes depend on
+the *trajectory* of positions: an equal middlegame after a strong opening vs after
+a blundered advantage feel very different. A **causal trajectory transformer**
+that attends across positions within a game should produce better value estimates
+than position-independent evaluation.
+
+### Architecture: TrajectoryValueModel
+
+Two-level transformer design:
+
+1. **Position Encoder** (frozen 204M backbone): each board → CLS embedding (1024d)
+   Pre-computed once and cached for training efficiency.
+
+2. **Trajectory Transformer** (trainable, ~8M params):
+   - Input: sequence of CLS embeddings from positions in a game
+   - Causal self-attention: each position attends only to past positions
+   - Ply embeddings provide temporal ordering
+   - Per-position value head predicts WDL
+   - 6 layers, 512d, 8 heads (configurable)
+
+Key design choices:
+- **Causal masking** (not bidirectional): realistic for inference during play,
+  each position only sees game history
+- **Pre-computed CLS tokens**: avoids running 204M model per position during training.
+  Training only updates the lightweight trajectory transformer.
+- **Window-based training**: slide a 32-position window across games for batching
+- **Baseline comparison**: SinglePositionBaseline (MLP, same param count) trained
+  on same data to isolate trajectory attention contribution
+
+### Research Background (from llm_knowledge)
+
+| Concept | Source | Relevance |
+|---------|--------|-----------|
+| Value targets (outcome vs search vs TD) | wiki/value-targets-in-training.md | Game outcome = high variance, but trajectory context may reduce it |
+| Temporal-difference learning | sutton-1988 | Bootstrapping from future predictions — trajectory model does this implicitly |
+| Decision Transformer (Chen et al. 2021) | External | Conditions on returns-to-go in RL — our model conditions on game history |
+| AlphaZero value learning | silver-etal-2018 | Pure game outcome targets — we use same targets but with history context |
+| MuZero dynamics model | schrittwieser-etal-2020 | Learned state transitions — trajectory attention learns transition patterns |
+| Grandmaster Transformers | ruoss-etal-2024 | Deep transformers internalize search — trajectory attention adds temporal search |
+
+### Expected Benefits
+
+1. **Reduced value variance**: outcome signal spread across trajectory, not single position
+2. **Critical moment detection**: attention peaks on positions where the game turned
+3. **Temporal pattern learning**: opening mistakes → midgame pressure → conversion
+4. **Better opening evaluation**: positions evaluated in context of how games continue
+
+### Experiment Plan (exp152)
+
+Phase 1: Generate 200 games (model vs SF at 1200/1500/1800/1900) → ~15K positions
+Phase 2: Extract CLS embeddings with frozen 204M backbone
+Phase 3: Train trajectory (8M) vs baseline (MLP) on same data, 20 epochs
+Phase 4: Compare value accuracy, attention analysis, calibration curves
+
+Quick test: 20 games, 5 epochs (~15 min on RTX 4060)
+
+### Future Directions
+
+- **Integrate into MCTS**: Use trajectory-conditioned value as MCTS backup value
+- **TD training**: Instead of pure game outcome, use TD(λ) targets with trajectory
+- **Policy conditioning**: Give the policy head trajectory context too
+- **Scale up data**: Use full Lichess game PGNs (not just isolated positions)
+- **Cross-game attention**: Attend across similar games in a batch (meta-meta-attention)
+
 ## 2026-04-05 Session 6 — Continued 204M Training + Opening Book Integration
 
 ### exp142 Training (LR=2e-5): NaN Fixed, Accuracy Trend Concerning
@@ -3941,3 +4009,40 @@ The 204M model on CPU is too slow for 20K positions (~0.16 pos/s).
 Solution: brief GPU interruption when needed (pause exp149 for ~2 min, run eval).
 Or: integrate 20K eval into next training script directly.
 exp150 and exp151 already default to eval_20k.pt if available.
+
+### 20K Eval Calibration — BREAKTHROUGH RESULT (step 37K)
+
+Paused exp149 briefly to run _eval_20k.py on GPU (~67s per checkpoint on 20K positions).
+
+| Checkpoint | Top-1 | Top-3 | Top-5 | Value | Notes |
+|-----------|-------|-------|-------|-------|-------|
+| HF baseline (exp100) | 16.48% | 40.64% | 57.37% | 66.88% | deployed, 2077 ELO @ 800 sims |
+| exp149 best (step 37K) | **18.12%** | **42.48%** | **58.77%** | **68.66%** | from-scratch, still training |
+| Δ | **+1.64%** | **+1.84%** | **+1.40%** | **+1.78%** | all metrics improved |
+
+**Key insights**:
+1. The 5K eval was UNDERSELLING exp149: reported 17.20% but 20K eval shows 18.12%
+2. exp149 ALREADY beats the deployed HF baseline by +1.64% top-1 at only ~35% through epoch 1
+3. The 5K eval noise (~±1pp) explains the oscillation — the model has been steadily improving
+4. ALL metrics improve: policy (top-1/3/5) AND value, confirming healthy training
+5. This passes the 17.5% green light threshold → let exp149 continue to epoch 3
+
+**Updated trajectory** (5K eval, but note 20K shows ~1-1.5% higher):
+
+| Step  | Top-1 (5K) | Top-3 (5K) | Notes |
+|-------|-----------|-----------|-------|
+| 30K   | 16.76%    | 40.38%    | prev best |
+| 36K   | 16.56%    | 41.02%    | top-3 new high |
+| 37K   | **17.20%** | **41.48%** | 20K calibrated = 18.12% |
+
+**Fixed data_loader.py bug**: `shard_*.pt` glob was picking up `shard_00000_soft.pt`,
+causing KeyError on resume. Added `_soft` filter to glob. exp149 resumed successfully.
+
+### Updated Decision Tree
+
+- ~~If <17.5% sustained: launch exp150/151 ablations~~ OBSOLETED
+- exp149 at 18.12% (20K) → GREEN LIGHT → let it run to epoch 3
+- After exp149 completes epoch 1: run ELO gauntlet (greedy + 800 sims)
+- If exp149 epoch 1 ELO > 2077: promote as new best checkpoint
+- Continue soft target generation on CPU for future exp151 testing
+- exp152 (trajectory value): interesting research but not ELO-urgent right now

@@ -1416,12 +1416,16 @@ class ShardedChessLoader:
         self.epoch = 0
         self.expected_shards = expected_shards
 
+        def _data_shards(d):
+            return sorted(f for f in d.glob("shard_*.pt")
+                          if "_soft" not in f.stem)
+
         if expected_shards is not None:
             # Dynamic mode: wait for first shard, scan sizes lazily
             self._wait_for_shard(0)
-            self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+            self.shard_files = _data_shards(self.shard_dir)
         else:
-            self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+            self.shard_files = _data_shards(self.shard_dir)
         if not self.shard_files and expected_shards is None:
             raise FileNotFoundError(f"No shard_*.pt in {shard_dir}")
 
@@ -1473,7 +1477,8 @@ class ShardedChessLoader:
 
     def update_total(self):
         """Refresh total_positions from shard sizes (call after all shards ready)."""
-        self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+        self.shard_files = sorted(f for f in self.shard_dir.glob("shard_*.pt")
+                                   if "_soft" not in f.stem)
         # Scan any new shards not yet counted
         for i in range(len(self._shard_sizes), len(self.shard_files)):
             data = torch.load(self.shard_files[i], map_location="cpu", weights_only=True)
@@ -1500,7 +1505,8 @@ class ShardedChessLoader:
             if self.expected_shards is not None:
                 shard_path = self._wait_for_shard(si)
                 if si >= len(self.shard_files):
-                    self.shard_files = sorted(self.shard_dir.glob("shard_*.pt"))
+                    self.shard_files = sorted(f for f in self.shard_dir.glob("shard_*.pt")
+                                               if "_soft" not in f.stem)
                 if si >= len(self._shard_sizes):
                     data = torch.load(shard_path, map_location="cpu", weights_only=True)
                     n = data["board_array"].shape[0]
