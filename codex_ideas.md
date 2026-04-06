@@ -2,6 +2,56 @@
 
 This file is the running log for:
 
+## 2026-04-06 Session (continued) — ELO gauntlet + encoding audit + soft target fix
+
+### ELO Gauntlet: exp149 step 37K vs SF1900 at 100 sims
+
+**Result: 1506 ELO (1W-1D-14L, score 0.094, CI95 [0.022, 0.323])**
+
+This is ~340 ELO below the HF baseline (exp100 ~1845 at 100 sims). Expected —
+the model is only 12% through training (step 37K/319K). The value head at 55%
+middlegame accuracy cannot guide MCTS effectively at 100 sims.
+
+**Key insight: VALUE HEAD QUALITY is the primary bottleneck for MCTS ELO, not
+raw policy accuracy.** exp149 has better policy (18.32% vs 16.48% top-1) but
+much worse game play because the value estimates are uncalibrated.
+
+Implication: Don't ELO test again until at least epoch 1 (step 106K, ~70 more
+hours). Focus on training. The model WILL improve as value head trains longer.
+
+### Encoding Audit: Clean
+
+Checked 50K training data positions for move encoding correctness:
+- 0 errors across all move types (quiet, capture, promotion, en passant, castling)
+- No other castling-like encoding bugs exist
+- Training data move indices decode to legal python-chess moves in all cases
+
+### Quiet Move Deep Analysis
+
+Quiet positions (80.9% of data, 14.61% accuracy) profile:
+- Average 29.2 legal moves, median 31 (chance = 3.3%, model = 14.6% = 4.4× random)
+- 40.2% have 30-40 legal moves (complex middlegame)
+- Target piece distribution: Pawn 30.8%, Knight 16.7%, Bishop 16.1%, King 13.8%, Rook 11.4%, Queen 11.2%
+- 67.3% of quiet moves are distance 1-2 (nearby, subtle maneuvers)
+- For MCTS: top-5 accuracy is 60.06% — search compensates significantly
+
+Soft targets directly address the quiet move information bottleneck: with 30 legal
+moves and a hard one-hot label, 29/30 reasonable moves get zero credit. Multi-PV
+soft targets give partial credit.
+
+### Soft Target Fix: chess.engine replaces stockfish package
+
+The `stockfish` Python package had multiprocessing issues on Windows (workers stuck
+with no SF subprocesses). Replaced `analyze_chunk` with `chess.engine.SimpleEngine`
+from python-chess, which is proven reliable in the ELO gauntlet.
+
+50K positions now generating with --workers 1 as initial test.
+
+### Active Processes (updated)
+
+- exp149 training: step ~39,000/318,900 at 99 pos/s (GPU, running, terminal c1a7b247)
+- Soft target generation: shard 0, 50K positions, 1 worker (CPU, terminal 0d8456f6)
+
 ## 2026-04-06 Session (continued) — hflip augmentation + MCTS early-stop + exp153
 
 ### Implemented: Horizontal Flip Data Augmentation
