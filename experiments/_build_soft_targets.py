@@ -71,46 +71,51 @@ def board_array_to_fen(ba_row, turn_val, castling_val, ep_val):
 
 
 def analyze_chunk(chunk_data, depth, pvs, sf_path):
-    """Analyze a chunk of FENs with Stockfish. Runs in a worker process."""
-    from stockfish import Stockfish
+    """Analyze a chunk of FENs with Stockfish using chess.engine (reliable)."""
+    import chess
+    import chess.engine
 
-    sf = Stockfish(path=sf_path, depth=depth,
-                   parameters={"Threads": 1, "Hash": 64})
+    engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+    engine.configure({"Threads": 1, "Hash": 64})
 
     results = []
     for idx, fen in chunk_data:
         try:
-            sf.set_fen_position(fen)
-            top_moves = sf.get_top_moves(pvs)
-            if not top_moves:
+            board = chess.Board(fen)
+            infos = engine.analyse(
+                board,
+                chess.engine.Limit(depth=depth),
+                multipv=pvs,
+            )
+            if not infos:
                 results.append((idx, [], []))
                 continue
 
             indices = []
             cp_vals = []
-            for m in top_moves:
-                uci = m["Move"]
+            for info in infos:
+                pv = info.get("pv")
+                if not pv:
+                    continue
+                uci = pv[0].uci()
                 if uci not in UCI_TO_IDX:
                     continue
                 move_idx = UCI_TO_IDX[uci]
-                if m.get("Mate") is not None:
-                    mate_val = m["Mate"]
-                    cp = 30000 if mate_val > 0 else -30000
+                score = info.get("score")
+                if score is not None:
+                    cp_score = score.white().score(mate_score=30000)
+                    if cp_score is None:
+                        cp_score = 0
                 else:
-                    cp = m.get("Centipawn", 0)
+                    cp_score = 0
                 indices.append(move_idx)
-                cp_vals.append(cp)
+                cp_vals.append(cp_score)
 
             results.append((idx, indices, cp_vals))
         except Exception:
-            # Stockfish crash — reinit and skip
-            try:
-                sf = Stockfish(path=sf_path, depth=depth,
-                               parameters={"Threads": 1, "Hash": 64})
-            except Exception:
-                pass
             results.append((idx, [], []))
 
+    engine.quit()
     return results
 
 
