@@ -51,18 +51,17 @@ sys.path.insert(0, str(ROOT))
 
 from chess_transformer_factory import ChessTransformerConfig, build_model
 from data_loader import (
-    ShardedChessLoader, board_array_to_fused, ep_square_to_file, compute_wdl,
-    load_eval_data, run_eval,
+    board_array_to_fused, ep_square_to_file, compute_wdl,
 )
-from move_vocab import VOCAB_SIZE
+from move_vocab import VOCAB_SIZE, IDX_TO_UCI, move_to_index, legal_move_mask
 
 OUTPUT_DIR = ROOT / "outputs" / "exp151_soft_policy"
 SHARD_DIR = ROOT / "outputs" / "exp139_massive_train" / "shards"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODEL_CONFIG = ChessTransformerConfig(
     encoder_dim=256, hidden_dim=1024, num_layers=16, num_heads=16,
-    ffn_ratio=4, num_encoder_blocks=4, policy_head_dim=512,
-    spatial_policy=True,
+    ffn_ratio=4, policy_head_dim=512,
 )
 
 SHUTDOWN = False
@@ -71,6 +70,115 @@ def _handler(sig, frame):
     SHUTDOWN = True
 signal.signal(signal.SIGINT, _handler)
 signal.signal(signal.SIGTERM, _handler)
+
+
+# ── Eval functions (inline, same as exp149) ──
+
+PIECE_CHARS = ".PNBRQKpnbrqk"
+
+def _board_array_to_fen(ba_row, turn_val, castling_val, ep_val):
+    fen_rows = []
+    for rank in range(7, -1, -1):
+        row = ""
+        empty = 0
+        for file_idx in range(8):
+            sq = rank * 8 + file_idx
+            p = int(ba_row[sq])
+            if p == 0:
+                empty += 1
+            else:
+                if empty > 0:
+                    row += str(empty)
+                    empty = 0
+                row += PIECE_CHARS[p]
+        if empty > 0:
+            row += str(empty)
+        fen_rows.append(row)
+    board_str = "/".join(fen_rows)
+    turn_str = "w" if int(turn_val) == 0 else "b"
+    cv = int(castling_val)
+    castle_str = ""
+    if cv & 8: castle_str += "K"
+    if cv & 4: castle_str += "Q"
+    if cv & 2: castle_str += "k"
+    if cv & 1: castle_str += "q"
+    if not castle_str: castle_str = "-"
+    ev = int(ep_val)
+    if 0 <= ev < 64:
+        ep_str = chr(ord('a') + ev % 8) + str(ev // 8 + 1)
+    else:
+        ep_str = "-"
+    return f"{board_str} {turn_str} {castle_str} {ep_str} 0 1"
+
+
+def load_eval_data(eval_path):
+    import chess
+    raw = torch.load(eval_path, map_location="cpu", weights_only=False)
+    eval_data = []
+    surviving = []
+    wdl = compute_wdl(raw["cp"], raw["mate"])
+    for i in range(raw["board_array"].shape[0]):
+        try:
+            fen = _board_array_to_fen(
+                raw["board_array"][i], raw["turn"][i],
+                raw["castling"][i], raw["ep_square"][i])
+            board = chess.Board(fen)
+            uci = IDX_TO_UCI[raw["move_idx"][i].item()]
+            move = chess.Move.from_uci(uci)
+            if move not in board.legal_moves:
+                continue
+            eval_data.append({"board": board, "move": move,
+                              "wdl": (wdl[i, 0].item(), wdl[i, 1].item(), wdl[i, 2].item())})
+            surviving.append(i)
+        except Exception:
+            continue
+    idx = torch.tensor(surviving, dtype=torch.long)
+    eval_tensors = {
+        "turn": raw["turn"][idx].long(),
+        "castling": raw["castling"][idx].long(),
+        "ep_file": ep_square_to_file(raw["ep_square"][idx].long()),
+        "fused_ids": board_array_to_fused(raw["board_array"][idx]),
+    }
+    return eval_data, eval_tensors
+
+
+def run_eval(model, eval_data, eval_tensors, batch_size=32):
+    model.eval()
+    correct = top3 = val_correct = total = 0
+    with torch.no_grad():
+        for i in range(0, len(eval_data), batch_size):
+            chunk = eval_data[i:i + batch_size]
+            n = len(chunk)
+            idx = slice(i, i + n)
+            batch_input = {
+                "fused_ids": eval_tensors["fused_ids"][idx].to(DEVICE),
+                "turn": eval_tensors["turn"][idx].to(DEVICE),
+                "castling": eval_tensors["castling"][idx].to(DEVICE),
+                "ep_file": eval_tensors["ep_file"][idx].to(DEVICE),
+            }
+            with autocast('cuda', dtype=torch.float16):
+                result = model(batch_input)
+            logits = result["policy_logits"].float()
+            value_logits = result["value_logits"].float()
+            for j, d in enumerate(chunk):
+                board, true_move = d["board"], d["move"]
+                l = logits[j].clone()
+                mask = legal_move_mask(board).to(DEVICE)
+                l[~mask] = float("-inf")
+                true_idx = move_to_index(true_move)
+                if l.argmax().item() == true_idx:
+                    correct += 1
+                topk = l.topk(min(3, l.shape[0])).indices.tolist()
+                if true_idx in topk:
+                    top3 += 1
+                vp = F.softmax(value_logits[j], dim=-1)
+                pred_class = vp.argmax().item()
+                wdl = d["wdl"]
+                true_class = max(range(3), key=lambda k: wdl[k])
+                if pred_class == true_class:
+                    val_correct += 1
+                total += 1
+    return correct / max(total, 1), top3 / max(total, 1), val_correct / max(total, 1)
 
 
 # ── Ablation configs ──
