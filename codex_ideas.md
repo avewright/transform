@@ -3785,3 +3785,102 @@ Even with weaker per-eval quality, 60x more search should break the ~1845 ceilin
 2. **Self-play policy improvement**: MCTS visit distributions as training targets
 3. **Fresh training on 50-100M positions**: Not fine-tuning, fresh init. Avoid forgetting.
 4. **Architecture change**: More layers (24+) for deeper reasoning. Requires full retrain.
+
+---
+
+## 2026-04-06 Session 7 — Engine Defaults + Sim Scaling + exp149 Launch
+
+### Engine Hardening
+
+- Fixed `uci_engine.py` default_sims from 200 → 800 (matching verified 2077 ELO config)
+- Removed adaptive `compute_sims()` that was capping at ~1645 ELO
+- Standardized checkpoint paths across 7 experiment scripts to `exp100_diverse_training/best_model.pt`
+- Git committed + pushed 51 files
+
+### 1600-Sim Validation
+
+| Sims | ELO   | W-D-L    | Δ over prev |
+|------|-------|----------|-------------|
+| 200  | 1889  | —        | —           |
+| 400  | 1955  | —        | +66         |
+| 800  | 2077  | 20W-7D-5L| +122       |
+| 1600 | 2106  | 22W-5D-5L| +29        |
+
+**Key finding**: 1600 sims = only +29 ELO over 800 sims. Strong diminishing returns.
+Policy quality is the bottleneck, not sim count. Focus on training, not search.
+
+### exp149 Launched — 204M From Scratch
+
+Config: Random init, LR=2e-4, warmup=2000, cosine decay, label_smoothing=0.1,
+weight_decay=0.1, betas=(0.9, 0.95), grad_clip=1.0, bs=24, accum=4 (eff_bs=96).
+Data: 10.1M positions (11 shards from exp139).
+Hardware: RTX 4060 8GB, ~97 pos/s, ~3.9 days for 3 epochs.
+
+Early progress through step 25K: best 16.18% top-1 at step 22K (HF baseline: 12.84%).
+
+---
+
+## 2026-04-06 Session 8 — exp149 Monitoring + Eval Infrastructure + Ablation Prep
+
+### exp149 Trajectory (through step 35K)
+
+| Step  | Top-1   | Top-3   | Value   | Notes |
+|-------|---------|---------|---------|-------|
+| 1K    | 9.62%   | 25.70%  | 65.20%  | —     |
+| 5K    | 12.56%  | 32.22%  | 67.36%  | —     |
+| 10K   | 14.22%  | 34.88%  | 67.84%  | —     |
+| 15K   | 15.10%  | 36.20%  | 70.82%  | —     |
+| 20K   | 15.32%  | 37.36%  | 70.26%  | —     |
+| 25K   | 16.18%  | 39.06%  | 71.00%  | —     |
+| 30K   | **16.76%** | **40.38%** | 71.72% | **best so far** |
+| 35K   | 15.88%  | 40.48%  | 68.46%  | dip (noise?) |
+
+Best: 16.76% at step 30K (on 5K eval). HF baseline: 12.84%.
+Old fine-tuning peak (exp137): 17.16%. Not yet broken past this.
+Epoch 1 ends at step ~105K (~19 hours from step 35K).
+
+**Assessment**: Healthy training curve, still climbing. Top-3 improving steadily (40%+).
+The 5K eval is noisy (±1pp). Need >17.5% sustained over 2-3 evals for confidence.
+
+### Eval Infrastructure Improvements
+
+1. **Built 20K eval set** (eval_20k.pt): merged 5K original + 15K from shard 10.
+   Expected noise reduction from ±1pp to ±0.5pp (4x more samples, √4 = 2x reduction).
+   File: `outputs/exp139_massive_train/shards/eval_20k.pt` (1.6 MB, 20K positions).
+
+2. **Created `_eval_20k.py`**: Quick checkpoint comparison script.
+   Reports top-1, top-3, top-5, value accuracy. Supports --cpu flag for eval
+   while GPU is occupied by training.
+
+3. **Created `_build_eval_20k.py`**: Build script for 20K eval (already run).
+
+### exp150 Ablation Sweep (Ready for Launch)
+
+**Rationale**: Top-3 and value improve strongly while exact top-1 lags → model learns
+move families but not exact best moves. Possible over-regularization.
+
+Created `exp150_ablation_sweep.py` — short ablation harness:
+- Resumes from exp149 epoch_1.pt (or latest.pt)
+- Runs 5K steps per ablation (~1.5h each)
+- Evals on 20K positions
+- Compares against control (unchanged settings)
+
+| Name    | Change                        | Hypothesis |
+|---------|-------------------------------|------------|
+| control | baseline (no change)          | reference  |
+| A       | label_smoothing: 0.1 → 0.0    | sharper exact-move signal |
+| B       | label_smoothing: 0.1 → 0.02   | mild smoothing balance |
+| C       | weight_decay: 0.1 → 0.01      | less L2 regularization |
+| D       | weight_decay: 0.1 → 0.03      | moderate weight decay reduction |
+| E       | value_weight: 0.5 → 0.25      | more gradient budget for policy |
+
+**Decision rule**: Launch when exp149 epoch 1 completes OR if top-1 clearly plateaus
+below 17.5% on the 20K eval for 10+ consecutive checkpoints.
+
+### Paths Forward (Updated)
+
+1. **Let exp149 run** → monitor → at epoch 1 (~step 105K), evaluate on 20K
+2. If <17.5% sustained: launch exp150 ablations one at a time
+3. If >17.5% sustained: let exp149 continue to epoch 3
+4. Next big lever after policy: search-side improvements (only after >18% top-1)
+5. Multi-PV / soft policy targets as bigger bet if basic recipe stalls
