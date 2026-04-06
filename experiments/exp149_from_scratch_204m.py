@@ -480,4 +480,29 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    MAX_RETRIES = 5
+    for _attempt in range(MAX_RETRIES):
+        try:
+            main()
+            break  # Clean exit
+        except Exception as e:
+            err_str = f"{type(e).__name__}: {e}"
+            if "CUDA" in err_str.upper() or "Accelerator" in type(e).__name__:
+                log(f"\n{'='*60}")
+                log(f"CUDA/Accelerator error (attempt {_attempt+1}/{MAX_RETRIES}): {e}")
+                log(f"Retrying from latest checkpoint in 10s...")
+                log(f"{'='*60}")
+                traceback.print_exc()
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                time.sleep(10)
+                if "--resume" not in sys.argv:
+                    sys.argv.append("--resume")
+            else:
+                raise
+    else:
+        log(f"FATAL: {MAX_RETRIES} CUDA retries exhausted. Giving up.")
