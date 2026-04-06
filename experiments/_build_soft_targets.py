@@ -112,10 +112,21 @@ def analyze_chunk(chunk_data, depth, pvs, sf_path):
                 cp_vals.append(cp_score)
 
             results.append((idx, indices, cp_vals))
+        except chess.engine.EngineTerminatedError:
+            # Engine crashed — restart and retry this position
+            try:
+                engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+                engine.configure({"Threads": 1, "Hash": 64})
+            except Exception:
+                pass
+            results.append((idx, [], []))
         except Exception:
             results.append((idx, [], []))
 
-    engine.quit()
+    try:
+        engine.quit()
+    except Exception:
+        pass
     return results
 
 
