@@ -4315,3 +4315,69 @@ causing KeyError on resume. Added `_soft` filter to glob. exp149 resumed success
 - If exp149 epoch 1 ELO > 2077: promote as new best checkpoint
 - Continue soft target generation on CPU for future exp151 testing
 - exp152 (trajectory value): interesting research but not ELO-urgent right now
+
+---
+
+## 2026-04-06 Session 9 — Tree Reuse Bug Fix + Training Crash Recovery
+
+### CRITICAL BUG: Inter-Move Tree Reuse Was Broken (commit 678ba07)
+
+**Bug**: `_cmd_go` in the UCI engine called `advance_tree(best_move)` after sending
+bestmove, advancing the tree root past our move. But the next `_cmd_position`
+replays ALL moves from startpos, calling `advance_tree(e2e4)` when root was already
+at the e4 position. e2e4 is NOT in root.children → root=None → **entire tree lost
+every single move**.
+
+**Evidence**: The gauntlet script (`_elo_gauntlet.py`) had `mcts.root = None` after
+every search — confirming tree reuse was known to be broken and intentionally disabled.
+
+**Fix**: Track `_tree_ply` = number of half-moves the tree root has been advanced through.
+`_cmd_position` only advances for moves beyond `_tree_ply` (typically just the opponent's
+response). Edge cases handled: FEN positions reset tree, stale trees detected, pondering
+updated.
+
+**Gauntlet fix**: Replaced `mcts.root = None` with proper `advance_tree(our_move)` +
+`advance_tree(opponent_move)` for full inter-move tree reuse.
+
+**Expected ELO impact**: +10-30 at 800 sims (pre-expanded subtrees with policy priors
+and partial Q estimates from previous search). Will validate when training reaches
+a stable checkpoint.
+
+### MCTS Engine Audit — Other Findings
+
+Commissioned thorough audit of uci_engine.py, move_vocab.py, opening_book.py.
+
+**False positive from audit**: FPU reduction was flagged as "inverted in losing positions."
+Analysis showed this was a sign error in the auditor's math:
+- Winning (parent_q=+0.7): fpu = -0.7 - 0.25 = -0.95 → correctly discourages unvisited ✓
+- Losing (parent_q=-0.7): fpu = +0.7 - 0.25 = +0.45 → correctly encourages exploration ✓
+
+**Other audit findings (not implemented, low priority)**:
+- Syzygy expansion uses uniform priors → could weight best TB move higher (~5 ELO)
+- Early termination thresholds could be slightly more aggressive (~5-10 ELO, risky)
+- c_puct could be adaptive based on legal move count (research idea, high risk)
+
+### Training Crash Recovery — Step 42,150
+
+**Cause**: `torch.AcceleratorError: CUDA error: unknown error` at step 42,150
+(14:35). This was a random GPU driver glitch, NOT OOM. nvidia-smi reported 17 TB
+memory used (bogus driver value). No gauntlet was running at the time.
+
+**Recovery**: Killed stale processes, GPU driver self-recovered. Restarted from
+step 42,000 checkpoint (150 steps / ~3 min lost).
+
+**Training speed improvement**: 72-77 pos/s → 93-97 pos/s after restart. Likely
+fresh CUDA context (old one may have been degraded before the error).
+
+| Step  | Top-1 (5K) | Top-3 (5K) | Value | Speed | Notes |
+|-------|-----------|-----------|-------|-------|-------|
+| 41K   | 17.14%    | 41.96%    | 71.18%| 70-77 | with CPU contention |
+| 42K   | 16.34%    | 41.90%    | 71.36%| 77    | last before crash |
+| 42K+  | —         | —         | —     | 93-97 | post-recovery, clean GPU |
+
+### Background Processes (updated)
+
+- Terminal 0645758e: exp149 training (GPU), step 42,025+, 93-97 pos/s
+- PID 41508: soft targets shard 0, 33+ min running, SF analysis phase
+- Next eval: step 43K (5K eval, ~15 min)
+- Epoch 1: ~step 106K, ETA ~3.2 days at 93 pos/s
