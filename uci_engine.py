@@ -396,10 +396,9 @@ class MCTSSearch:
                 if scratch.is_game_over(claim_draw=True):
                     outcome = scratch.outcome(claim_draw=True)
                     if outcome is None or outcome.winner is None:
-                        leaf_value = 0.0
-                    elif outcome.winner == scratch.turn:
-                        leaf_value = 1.0
+                        leaf_value = 0.0  # draw / stalemate
                     else:
+                        # Checkmate: winner is opponent of scratch.turn (the mated side)
                         leaf_value = -1.0
                     value = leaf_value
                     for n in reversed(path):
@@ -840,7 +839,7 @@ class UCIEngine:
             if name.lower() == "defaultsims":
                 self.default_sims = int(value)
                 self.time_manager.default_sims = int(value)
-            elif name.lower() == "cputc":
+            elif name.lower() == "cpuct":
                 self.search.c_puct = float(value)
             elif name.lower() == "ponder":
                 self.ponder = value.lower() == "true"
