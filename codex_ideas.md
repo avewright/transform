@@ -3834,13 +3834,17 @@ Early progress through step 25K: best 16.18% top-1 at step 22K (HF baseline: 12.
 | 25K   | 16.18%  | 39.06%  | 71.00%  | —     |
 | 30K   | **16.76%** | **40.38%** | 71.72% | **best so far** |
 | 35K   | 15.88%  | 40.48%  | 68.46%  | dip (noise?) |
+| 36K   | 16.56%  | **41.02%** | 71.34%  | top-3 new high |
 
 Best: 16.76% at step 30K (on 5K eval). HF baseline: 12.84%.
 Old fine-tuning peak (exp137): 17.16%. Not yet broken past this.
 Epoch 1 ends at step ~105K (~19 hours from step 35K).
 
-**Assessment**: Healthy training curve, still climbing. Top-3 improving steadily (40%+).
-The 5K eval is noisy (±1pp). Need >17.5% sustained over 2-3 evals for confidence.
+**Assessment**: Healthy training curve. Top-3 improving steadily (40%→41%+) while
+top-1 oscillates 15-17%. This top-3 vs top-1 divergence supports the over-regularization
+hypothesis: the model learns good move FAMILIES but label_smoothing=0.1 spreads the
+signal too thin for exact best-move prediction. The 5K eval is noisy (±1pp).
+Need >17.5% sustained over 2-3 evals for confidence.
 
 ### Eval Infrastructure Improvements
 
@@ -3880,7 +3884,60 @@ below 17.5% on the 20K eval for 10+ consecutive checkpoints.
 ### Paths Forward (Updated)
 
 1. **Let exp149 run** → monitor → at epoch 1 (~step 105K), evaluate on 20K
-2. If <17.5% sustained: launch exp150 ablations one at a time
+2. If <17.5% sustained: launch exp150 ablations AND/OR exp151 soft policy
 3. If >17.5% sustained: let exp149 continue to epoch 3
 4. Next big lever after policy: search-side improvements (only after >18% top-1)
 5. Multi-PV / soft policy targets as bigger bet if basic recipe stalls
+
+### exp151: Soft Policy Targets (Designed, Ready to Run)
+
+**Core insight**: label_smoothing=0.1 distributes 10% probability mass UNIFORMLY
+across all ~4507 moves. This includes completely irrelevant moves in the smoothing.
+Soft policy targets instead concentrate that mass on the 2-5 moves that Stockfish
+actually considers good. This is a targeted, informed smoothing.
+
+**Evidence for this approach**:
+- Top-3 climbs steadily (40%→41%+) while top-1 oscillates (15-17%)
+- This means the model identifies good MOVE FAMILIES but can't distinguish the exact best
+- Uniform smoothing wastes gradient signal on obviously bad moves
+- Soft targets from multi-PV give gradient signal ONLY to moves Stockfish considers
+
+**Implementation (all code written)**:
+1. `_build_soft_targets.py`: Reads shard board_arrays → FEN → Stockfish multi-PV (depth=6, pvs=5)
+   Saves companion files: `shard_xxxxx_soft.pt` with (N,K) indices + cp values
+   Current run: 50K positions from shard 0, ~20 pos/s with 4 workers, ETA ~40 min
+2. `exp151_soft_policy.py`: Training with combined loss:
+   `loss = (1-α)*CE(hard, ls) + α*soft_CE(softmax(cp/temp), logits)`
+
+**Ablation matrix** (5K steps each, ~35 min):
+
+| Name     | Alpha | Temp | LS   | Description |
+|----------|-------|------|------|-------------|
+| control  | 0.0   | —    | 0.1  | exp149 baseline (hard targets) |
+| soft_A   | 0.5   | 100  | 0.0  | 50/50 hard/soft mix |
+| soft_B   | 1.0   | 100  | 0.0  | fully soft |
+| soft_C   | 0.5   | 50   | 0.0  | sharper soft targets |
+| soft_D   | 0.3   | 100  | 0.05 | soft + mild uniform smoothing |
+
+**Temperature intuition** (for softmax(cp_delta / temp)):
+- temp=50: 20cp gap → 60/40 split, 100cp gap → 88/12 (sharper)
+- temp=100: 20cp gap → 55/45 split, 100cp gap → 73/27 (balanced)
+- temp=200: 20cp gap → 52/48 split, 100cp gap → 62/38 (smoother)
+
+**What we need before running**:
+- [x] _build_soft_targets.py written and tested
+- [x] exp151_soft_policy.py written
+- [ ] shard_00000_soft.pt generated (50K positions in progress)
+- [ ] exp149 epoch 1 checkpoint OR decision to interrupt early
+
+**Risk assessment**: LOW — this is an incremental change to the loss function.
+If it doesn't help, we lose ~3 hours of ablation time. If it helps, it's a
+principled improvement over uniform label smoothing that scales to all training.
+
+### CPU Eval Note
+
+Attempted 20K eval on CPU (PID 30240): consumed 26K CPU seconds with no output.
+The 204M model on CPU is too slow for 20K positions (~0.16 pos/s).
+Solution: brief GPU interruption when needed (pause exp149 for ~2 min, run eval).
+Or: integrate 20K eval into next training script directly.
+exp150 and exp151 already default to eval_20k.pt if available.
