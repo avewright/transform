@@ -319,7 +319,7 @@ class MCTSSearch:
     def _run_sims(self, root, base_board, max_sims=None, stop_event=None):
         """Run MCTS simulations. Returns number of sims completed.
 
-        Stops when max_sims reached or stop_event is set.
+        Stops when max_sims reached, stop_event is set, or move is stable.
         """
         VIRTUAL_LOSS = 1
         sims_done = 0
@@ -343,6 +343,14 @@ class MCTSSearch:
                 if len(visits) >= 2:
                     remaining = max_sims - sims_done
                     if visits[1] + remaining < visits[0]:
+                        break
+                    # Stability check: if top move has >70% of visits after
+                    # using at least 25% of budget, the position is likely clear
+                    total_visits = sum(visits)
+                    if (total_visits > 0
+                            and sims_done >= max_sims * 0.25
+                            and visits[0] / total_visits > 0.70
+                            and visits[0] - visits[1] > max_sims * 0.15):
                         break
 
             # Collect a batch of leaves

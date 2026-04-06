@@ -42,6 +42,65 @@ PARQUET_GLOB = "outputs/lichess_cache/datasets--Lichess--chess-position-evaluati
 HF_DATASET = "avewright/chess-positions-lichess-sf"
 
 
+# ── Horizontal flip augmentation tables ──
+# Chess has mirror symmetry: reflecting the board left-right (a↔h files)
+# produces an equivalent position with equivalent best moves.
+
+def _build_mirror_tables():
+    """Build lookup tables for horizontal board flipping."""
+    # Square mirror: flip file within each rank
+    sq_table = torch.zeros(64, dtype=torch.long)
+    for sq in range(64):
+        rank, file = sq // 8, sq % 8
+        sq_table[sq] = rank * 8 + (7 - file)
+
+    # Move index mirror: remap from_sq and to_sq through square mirror
+    move_table = torch.zeros(len(IDX_TO_UCI), dtype=torch.long)
+    for idx, uci in enumerate(IDX_TO_UCI):
+        fs = chess.parse_square(uci[:2])
+        ts = chess.parse_square(uci[2:4])
+        promo = uci[4:] if len(uci) > 4 else ""
+        m_fs = (fs // 8) * 8 + (7 - fs % 8)
+        m_ts = (ts // 8) * 8 + (7 - ts % 8)
+        m_uci = chess.square_name(m_fs) + chess.square_name(m_ts) + promo
+        move_table[idx] = UCI_TO_IDX[m_uci]
+
+    # Castling mirror: K(8)↔Q(4), k(2)↔q(1)
+    castling_table = torch.zeros(16, dtype=torch.long)
+    for c in range(16):
+        K, Q, k, q = bool(c & 8), bool(c & 4), bool(c & 2), bool(c & 1)
+        castling_table[c] = (Q << 3) | (K << 2) | (q << 1) | int(k)
+
+    return sq_table, move_table, castling_table
+
+
+MIRROR_SQ, MIRROR_MOVE, MIRROR_CASTLING = _build_mirror_tables()
+
+
+def hflip_board_array(board_array):
+    """Horizontally flip board_array: (N, 64) or (64,)."""
+    return board_array[..., MIRROR_SQ]
+
+
+def hflip_move_idx(move_idx):
+    """Mirror move indices through horizontal flip."""
+    return MIRROR_MOVE[move_idx.long()]
+
+
+def hflip_castling(castling):
+    """Mirror castling rights: K↔Q, k↔q."""
+    return MIRROR_CASTLING[castling.long()]
+
+
+def hflip_ep_square(ep_square):
+    """Mirror en passant square. -1 stays -1, otherwise flip file."""
+    result = ep_square.clone().long()
+    valid = result >= 0
+    if valid.any():
+        result[valid] = MIRROR_SQ[result[valid]]
+    return result
+
+
 def _maybe_load_hf_token_from_env():
     """Populate HF_TOKEN from a local .env file if the process does not have it."""
     if os.environ.get("HF_TOKEN"):
@@ -1405,12 +1464,13 @@ class ShardedChessLoader:
 
     def __init__(self, shard_dir, batch_size, encoder_type="fused",
                  device="cpu", seed=42, drop_last=True, skip_positions=0,
-                 expected_shards=None, start_shard=0):
+                 expected_shards=None, start_shard=0, hflip=False):
         self.shard_dir = Path(shard_dir)
         self.batch_size = batch_size
         self.encoder_type = encoder_type
         self.device = device
         self.seed = seed
+        self.hflip = hflip
         self.drop_last = drop_last
         self.skip_positions = skip_positions
         self.epoch = 0
@@ -1525,14 +1585,46 @@ class ShardedChessLoader:
                               weights_only=True)
             n = shard["board_array"].shape[0]
 
+            # Horizontal flip augmentation: flip a random 50% of positions
+            if self.hflip:
+                hflip_rng = torch.Generator().manual_seed(
+                    self.seed + self.epoch * 3571 + si * 17)
+                flip_mask = torch.rand(n, generator=hflip_rng) < 0.5
+                if flip_mask.any():
+                    ba = shard["board_array"].clone()
+                    ba[flip_mask] = hflip_board_array(ba[flip_mask])
+                    shard_ba = ba
+
+                    mi = shard["move_idx"].clone()
+                    mi[flip_mask] = hflip_move_idx(mi[flip_mask]).to(mi.dtype)
+                    shard_mi = mi
+
+                    ca = shard["castling"].clone()
+                    ca[flip_mask] = hflip_castling(ca[flip_mask]).to(ca.dtype)
+                    shard_ca = ca
+
+                    ep = shard["ep_square"].clone()
+                    ep[flip_mask] = hflip_ep_square(ep[flip_mask]).to(ep.dtype)
+                    shard_ep = ep
+                else:
+                    shard_ba = shard["board_array"]
+                    shard_mi = shard["move_idx"]
+                    shard_ca = shard["castling"]
+                    shard_ep = shard["ep_square"]
+            else:
+                shard_ba = shard["board_array"]
+                shard_mi = shard["move_idx"]
+                shard_ca = shard["castling"]
+                shard_ep = shard["ep_square"]
+
             # Precompute derived fields for full shard
-            fused = board_array_to_fused(shard["board_array"])
+            fused = board_array_to_fused(shard_ba)
             turn = shard["turn"].long()
-            castling_t = shard["castling"].long()
-            ep_file = ep_square_to_file(shard["ep_square"].long())
-            move_idx = shard["move_idx"].long()
+            castling_t = shard_ca.long()
+            ep_file = ep_square_to_file(shard_ep.long())
+            move_idx = shard_mi.long()
             wdl = compute_wdl(shard["cp"], shard["mate"])
-            del shard
+            del shard, shard_ba, shard_mi, shard_ca, shard_ep
 
             # Shuffle within shard
             row_rng = torch.Generator().manual_seed(
