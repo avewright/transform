@@ -2869,8 +2869,26 @@ The value head needs Stockfish centipawn targets, not game-outcome WDL.
 - **SpatialPolicyHead optimization**: Already landed in session 4 (project-then-gather). Every experiment since session 4 has the ~37% inference speedup baked in. No further code change needed.
 - **Git push**: Full commit with all experiments exp125-148b pushed to remote.
 
-### 1600-sim 32-game Validation (IN PROGRESS)
-Re-running exp148b with 1600 sims, 32 games vs SF1900. Previous run killed at 5/32 (2W-3D-0L ≈ 2047). Running on HF checkpoint (exp100).
+### 1600-sim 32-game Validation — COMPLETED
+Full 32-game result at 1600 sims vs SF1900:
+**0.766 (22W-5D-5L) CI=[0.596, 0.879] ELO~2106**
+
+Updated scaling table:
+
+| Sims | Score | W-D-L | ELO | Δ from previous |
+|------|-------|-------|-----|-----------------|
+| 200 | 0.484 | 11-9-12 | 1889 | — |
+| 400 | 0.578 | 15-7-10 | 1955 | +66 |
+| 800 | 0.734 | 20-7-5 | 2077 | +122 |
+| 1600 | 0.766 | 22-5-5 | 2106 | +29 |
+
+**KEY FINDING**: Massive diminishing returns at 1600 sims. The 200→400→800 scaling
+suggested +100/doubling, but 800→1600 gives only +29. This confirms the policy quality
+ceiling — more sims can't compensate for a 14% top-1 policy beyond ~2100 ELO.
+The CIs for 800 and 1600 overlap substantially.
+
+**Implication**: Further sim scaling is pointless. The model needs better policy.
+This makes from-scratch training (exp149) the CRITICAL next experiment.
 
 ### Formed Opinions — Agent Research Assessment
 
