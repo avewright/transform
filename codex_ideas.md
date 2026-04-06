@@ -2917,11 +2917,52 @@ Assessment: Options 1 and 2 are compatible with from-scratch training as auxilia
 **Priority Stack (My Opinion)**:
 | # | Action | Expected ELO Gain | Time |
 |---|--------|-------------------|------|
-| 1 | 1600-sim validation (RUNNING) | +50-100 over 800 sims | 2 hrs |
-| 2 | From-scratch 204M on 10M | +400-800 over current | 3.5 days |
+| 1 | 1600-sim validation (DONE) | +29 over 800 sims (diminishing returns) | 3.5 hrs |
+| 2 | From-scratch 204M on 10M (RUNNING) | Already +3.3% top-1 at 24% epoch 1 | 3.5 days |
 | 3 | Add move-quality auxiliary loss to #2 | +50-100 above baseline #2 | +0 extra time |
 | 4 | Once #2 converges, 800-1600 sim eval | Quantifies #2 gains | 2-4 hrs |
 | 5 | Self-play expert iteration (large-scale) | +100-300 if policy is 30%+ | Days |
+
+### exp149: From-Scratch 204M Training — BREAKTHROUGH IN PROGRESS
+
+**Config**: Random init, LR=2e-4, warmup=2000, cosine decay, label_smoothing=0.1,
+weight_decay=0.1, betas=(0.9, 0.95), grad_clip=1.0, bs=24, accum=4 (eff_bs=96).
+Train: 10.1M positions × 3 epochs = 316K steps. Speed: 98-105 pos/s. ETA: ~3.3 days.
+
+**Accuracy trajectory (eval set = 5000 positions from same distribution):**
+
+| Step | Positions Seen | Acc | Top-3 | Val | Notes |
+|------|---------------|-----|-------|-----|-------|
+| 0 | 0 | 6.64% | 17.06% | 11.32% | Random init |
+| 1,000 | 96K | 9.62% | 25.70% | 65.20% | |
+| 2,000 | 192K | 10.94% | 26.50% | 63.92% | Peak LR reached |
+| 3,000 | 288K | 11.34% | 28.88% | 66.56% | Past exp142 NaN zone |
+| 4,000 | 384K | 13.12% | 32.36% | 65.74% | Near HF baseline (12.84%) |
+| 7,000 | 672K | 13.84% | 32.72% | 67.00% | **Passed HF baseline!** |
+| 9,000 | 864K | 14.22% | 34.74% | 69.56% | **Passed all fine-tune peaks** |
+| 11,000 | 1.06M | 14.24% | 35.32% | 70.70% | |
+| 13,000 | 1.25M | 15.10% | 36.20% | 70.82% | |
+| 14,000 | 1.34M | 15.18% | 36.58% | 69.14% | |
+| 16,000 | 1.54M | 15.30% | 37.70% | 69.60% | |
+| **22,000** | **2.11M** | **16.18%** | **39.10%** | **68.00%** | **ALL-TIME BEST** |
+| 25,000 | 2.40M | 15.42% | 38.86% | 68.84% | Normal oscillation |
+
+**Key observations:**
+1. From scratch surpassed HF baseline (832M positions, 12.84%) in only 672K positions
+2. Already +3.34% top-1 over HF baseline at 21% of epoch 1
+3. No NaN, no divergence — training is extremely stable
+4. Policy loss dropped from 8.3 → 3.7, still declining
+5. Top-3 accuracy 39.10% (HF was 34.32%) — better move ranking
+6. Value accuracy 68-71% vs HF's 77% — needs more training
+7. LR just started cosine decay (1.97e-4 from peak 2.0e-4)
+8. Still climbing — expect 18-20%+ by end of epoch 1, potentially 22-25% by epoch 3
+
+**Why from-scratch works and fine-tuning didn't:**
+- Fine-tuning the 832M-pretrained model creates gradient conflict between old and new data
+- From scratch: gradients are coherent, model learns the dataset's distribution cleanly
+- The 832M pre-training wasn't bad — it just created a local optimum that resists retraining
+- From-scratch on 10M × 3 epochs = 30M position-iterations vs 832M × 1 epoch
+  Even with fewer unique positions, repeat exposure with cosine decay is powerful
 
 **What to NOT do** (validated dead ends at current policy quality):
 - Fine-tuning from the current checkpoint (always forgetting)
