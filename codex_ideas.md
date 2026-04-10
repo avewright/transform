@@ -4783,6 +4783,65 @@ while avoiding the earlier high-LR collapse.
 **Recommended next direction:**
 1. Stop spending 4xA40 time on plain continuation of the same objective.
 2. Change the data recipe or supervision target before the next large run.
+
+---
+
+## 2026-04-10 — Move-History Transformer (exp002/exp003)
+
+### Architecture: Pure Move-History Decoder
+
+**Hypothesis:** A LLaMA-style causal decoder trained ONLY on move sequences (no board
+state, no piece positions) can learn to implicitly reconstruct the board and predict
+next moves from move order alone. This tests how strong "autoregressive chess" can be.
+
+**Architecture (all exp002/003 share):**
+- DeepMoveHistoryTransformer: 101.7M params
+- 24 layers, 512d, 8 heads, SwiGLU-2048 FFN
+- RoPE positional encoding, RMSNorm (pre-norm), no bias
+- Gradient checkpointing, BF16, tied output/embedding weights
+- Compact vocab: 1968 UCI moves + 3 special = 1971 tokens
+- Custom `masked_cross_entropy` for legal move masking + label smoothing
+
+### exp002: 5K SF-vs-SF Games (Baseline)
+
+**Data:** sf_games_5k.pgn — 4,750 train, 250 eval, 638,775 train moves
+
+| Epoch | Train Loss | Eval Loss | Top-1 | Top-3 | Notes |
+|-------|-----------|-----------|-------|-------|-------|
+| 1 | 2.8356 | 2.7027 | 18.34% | 37.79% | ★ |
+| 2 | 2.6967 | 2.6367 | 20.10% | 40.54% | ★ |
+| 3 | 2.5958 | 2.6145 | 21.06% | 41.92% | ★ BEST |
+| 4 | 2.4397 | 2.6276 | 21.03% | 41.89% | |
+| 5 | 2.1730 | 2.6563 | 20.84% | 41.42% | Overfitting begins |
+| 6 | 1.7708 | 2.7105 | 20.07% | 40.31% | Severe overfitting |
+| 7 | 1.3034 | 2.7713 | 19.08% | 38.91% | |
+
+**Key finding:** 21.06% top-1 from MOVE HISTORY ONLY, competitive with 204M board-centric
+models (exp100: 15.22%, exp159: 17.76%). Severely data-starved — 101.7M params on 638K moves.
+
+**Critical bugs fixed during development:**
+1. Embedding scale `* math.sqrt(d_model)` → overflow through 24 layers → removed
+2. FP16 dynamic range → switched to BF16, removed GradScaler
+3. `F.cross_entropy` label smoothing + legal masking = inf → custom masked impl
+
+### exp003: 200K Lichess High-Elo Games (Scale-Up)
+
+**Data source:** Lichess/standard-chess-games HuggingFace dataset
+- 7.14 billion games, CC0, partitioned by year/month
+- Streaming via `datasets` library with `data_files` targeting specific months
+- Filter: WhiteElo >= 2000 AND BlackElo >= 2000, "Normal" termination
+- SAN → UCI conversion via python-chess (regex strip comments/move numbers, `board.parse_san`)
+- Hit rate: ~10.5% of rows pass 2000+ Elo filter
+
+**Falsification (2K games, 1 epoch):**
+- Streamed from Jan 2024 partition
+- 19,070 rows scanned in 11s → 2,000 games, 133K moves
+- Result: 21.44% top-1 / 42.21% top-3 in 1 epoch — already beats exp002 best
+
+**Full run (200K games, 3 epochs) — TRAINING NOW:**
+- Expected: ~13.4M training moves (21× more than exp002)
+- Should eliminate overfitting, test true capacity of architecture
+- Estimated time: ~5 hours on RTX 4060
 3. Fix the `Infinity` NLL eval bug before relying on that metric.
 
 ---
