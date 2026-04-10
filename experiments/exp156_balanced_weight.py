@@ -1,24 +1,36 @@
-"""exp149: Train 204M model FROM SCRATCH on 10M positions.
+"""exp156: CP-aware position weighting — upweight balanced/quiet positions.
 
-Motivation:
-  - All fine-tuning attempts (exp112-116, exp137, exp142, exp143, exp147) caused
-    catastrophic forgetting because the 832M-pretrained weights resist adaptation.
-  - Ruoss et al. 2024: 270M on 10M → 2895 ELO WITHOUT search.
-  - From-scratch avoids the forgetting problem entirely.
-  - If policy reaches 30%+ top-1, MCTS at 800 sims → 2500+ ELO expected.
+Hypothesis:
+  The training data is 58% opening and 80% quiet moves, yet quiet moves at
+  14.6% accuracy are the primary bottleneck. Positions with |cp| near 0 have
+  many roughly-equal candidate moves, so the hard one-hot target is especially
+  noisy. By upweighting these balanced positions (where the model must learn
+  finer distinctions), we can improve quiet-move accuracy without changing the
+  architecture.
 
-Architecture: unchanged 204M (16L/1024d/16H), same weights shape as HF checkpoint.
-Data: 10.1M Stockfish-labeled positions (shards from exp139).
-Aux loss: centipawn regression head for richer training signal.
+  Weight formula: w(cp) = 1 + alpha * exp(-|cp| / tau)
+  - |cp| = 0 → weight ≈ 1 + alpha (maximum upweight for balanced positions)
+  - |cp| = 500 → weight drops toward 1 (winning positions are easier, less useful)
+  - alpha=1.0, tau=200 gives 2.0× weight at cp=0, 1.08× at cp=500
 
-Hardware: RTX 4060 8GB
-  - bs=24, accum=4 (eff_bs=96) at ~74-98 pos/s
-  - 10M × 3 epochs ÷ 90 pos/s ≈ 93 hours (3.9 days)
+Expected gain: +0.5-2% quiet-move accuracy → better MCTS performance on typical positions.
+
+Baseline: exp149 continuing from epoch_1 (uniform weighting, label_smoothing=0.1)
+Control:  exp153 (hflip, uniform, same data)
+Variable: Per-sample weight w(cp) applied to policy loss
+
+Quick test: 5K steps from epoch_1 checkpoint (~35 min on RTX 4060).
+If improved: extend to full epoch.
+
+Architecture: unchanged 204M (16L/1024d/16H)
+Data: same 10.1M positions, hflip=True, with cp-based sample weights
+LR: resume cosine schedule from exp149 epoch 1 position
 
 Usage:
-  python experiments/exp149_from_scratch_204m.py --epochs 3
-  python experiments/exp149_from_scratch_204m.py --resume
-  python experiments/exp149_from_scratch_204m.py --eval-only --checkpoint outputs/exp149_scratch_204m/best_model.pt
+  python experiments/exp156_balanced_weight.py
+  python experiments/exp156_balanced_weight.py --alpha 0.5 --tau 150
+  python experiments/exp156_balanced_weight.py --resume
+  python experiments/exp156_balanced_weight.py --eval-only --checkpoint outputs/exp156_balanced_weight/best_model.pt
 """
 
 import argparse
@@ -54,8 +66,9 @@ from data_loader import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = ROOT / "outputs" / "exp149_scratch_204m"
+OUTPUT_DIR = ROOT / "outputs" / "exp156_balanced_weight"
 SHARD_DIR = ROOT / "outputs" / "exp139_massive_train" / "shards"
+SOURCE_CKPT = ROOT / "outputs" / "exp149_scratch_204m" / "epoch_1.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOG_PATH = None
 SHUTDOWN = False
@@ -80,8 +93,10 @@ def log(msg):
             f.write(line + "\n")
 
 
+PIECE_CHARS = ".PNBRQKpnbrqk"
+
+
 def _board_array_to_fen(ba_row, turn_val, castling_val, ep_val):
-    PIECE_CHARS = ".PNBRQKpnbrqk"
     fen_rows = []
     for rank in range(7, -1, -1):
         row = ""
@@ -135,8 +150,7 @@ def load_eval_data(eval_path):
             if move not in board.legal_moves:
                 continue
             eval_data.append({
-                "board": board,
-                "move": move,
+                "board": board, "move": move,
                 "wdl": (wdl[i, 0].item(), wdl[i, 1].item(), wdl[i, 2].item()),
             })
             surviving.append(i)
@@ -156,7 +170,7 @@ def load_eval_data(eval_path):
 
 def run_eval(model, eval_data, eval_tensors, batch_size=32):
     model.eval()
-    correct = top3 = val_correct = total = 0
+    correct = top3 = top5 = val_correct = total = 0
 
     with torch.no_grad():
         for i in range(0, len(eval_data), batch_size):
@@ -186,9 +200,11 @@ def run_eval(model, eval_data, eval_tensors, batch_size=32):
                 true_idx = move_to_index(true_move)
                 if l.argmax().item() == true_idx:
                     correct += 1
-                topk = l.topk(min(3, l.shape[0])).indices.tolist()
-                if true_idx in topk:
+                topk = l.topk(min(5, l.shape[0])).indices.tolist()
+                if true_idx in topk[:3]:
                     top3 += 1
+                if true_idx in topk:
+                    top5 += 1
 
                 vp = F.softmax(value_logits[j], dim=-1)
                 pred_class = vp.argmax().item()
@@ -199,7 +215,7 @@ def run_eval(model, eval_data, eval_tensors, batch_size=32):
 
                 total += 1
 
-    return correct / max(total, 1), top3 / max(total, 1), val_correct / max(total, 1)
+    return correct / max(total, 1), top3 / max(total, 1), top5 / max(total, 1), val_correct / max(total, 1)
 
 
 def save_checkpoint(model, optimizer, scaler, step, epoch, best_acc, path):
@@ -218,9 +234,29 @@ def save_checkpoint(model, optimizer, scaler, step, epoch, best_acc, path):
     os.replace(str(tmp), str(path))
 
 
+def compute_cp_weights(cp_tensor, mate_tensor, alpha, tau):
+    """Compute per-sample weights: upweight balanced positions, downweight decisive.
+
+    w(cp) = 1 + alpha * exp(-|cp| / tau)
+    - |cp|=0: weight = 1+alpha (balanced position, maximum upweight)
+    - |cp|→∞: weight → 1 (decisive position, uniform weight)
+
+    Mate positions get weight = 1.0 (tactical, already well-learned at 41.8%).
+    """
+    cp = cp_tensor.float()
+    has_mate = mate_tensor != 0
+
+    weights = 1.0 + alpha * torch.exp(-cp.abs() / tau)
+
+    # Mate positions: no upweight (already easy/tactical)
+    weights[has_mate] = 1.0
+
+    return weights
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--accum-steps", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -229,12 +265,19 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--label-smoothing", type=float, default=0.1)
+    ap.add_argument("--alpha", type=float, default=1.0,
+                    help="Max CP weight boost for balanced positions (default: 1.0 = 2x weight at cp=0)")
+    ap.add_argument("--tau", type=float, default=200.0,
+                    help="CP decay scale in centipawns (default: 200)")
     ap.add_argument("--log-interval", type=int, default=25)
     ap.add_argument("--eval-interval", type=int, default=1000)
     ap.add_argument("--save-interval", type=int, default=1000)
+    ap.add_argument("--max-steps", type=int, default=None,
+                    help="Max steps for quick ablation (default: full training)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--eval-only", action="store_true")
     ap.add_argument("--checkpoint", type=str, default=None)
+    ap.add_argument("--source-ckpt", type=str, default=str(SOURCE_CKPT))
     args = ap.parse_args()
 
     global LOG_PATH
@@ -242,18 +285,14 @@ def main():
     LOG_PATH = OUTPUT_DIR / "training.log"
 
     log("=" * 60)
-    log("exp149: 204M model FROM SCRATCH on 10M positions")
+    log(f"exp156: CP-weighted policy loss (alpha={args.alpha}, tau={args.tau})")
     log(f"  device: {DEVICE}")
     log(f"  config: {MODEL_CONFIG}")
 
-    # Build model from random init
     model = build_model(MODEL_CONFIG)
     n_params = sum(p.numel() for p in model.parameters())
     log(f"  params: {n_params/1e6:.1f}M")
 
-    start_step = 0
-    start_epoch = 0
-    best_acc = 0.0
     resume_path = OUTPUT_DIR / "latest.pt"
 
     if args.eval_only:
@@ -263,14 +302,12 @@ def main():
         sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         model.load_state_dict(sd, strict=False)
         model.to(DEVICE)
-        log(f"  Loaded checkpoint for eval: {ckpt_path}")
-
-        eval_path = SHARD_DIR / "eval.pt"
-        eval_data, eval_tensors = load_eval_data(eval_path)
-        acc, top3, val_acc = run_eval(model, eval_data, eval_tensors)
-        log(f"  EVAL: acc={acc:.2%} top3={top3:.2%} val={val_acc:.2%}")
+        eval_data, eval_tensors = load_eval_data(SHARD_DIR / "eval.pt")
+        acc, top3, top5, val_acc = run_eval(model, eval_data, eval_tensors)
+        log(f"  EVAL: acc={acc:.2%} top3={top3:.2%} top5={top5:.2%} val={val_acc:.2%}")
         return
 
+    # Load source or resume
     if args.resume and resume_path.exists():
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
         sd = ckpt.get("model_state_dict", ckpt)
@@ -281,12 +318,23 @@ def main():
         best_acc = ckpt.get("best_acc", 0.0)
         log(f"  Resumed: step={start_step}, epoch={start_epoch}, best_acc={best_acc:.2%}")
     else:
-        log("  Training from RANDOM INITIALIZATION (no pre-trained weights)")
+        source = Path(args.source_ckpt)
+        if not source.exists():
+            log(f"ERROR: Source checkpoint not found: {source}")
+            log("  exp149 must complete epoch 1 first.")
+            return
+        ckpt = torch.load(source, map_location="cpu", weights_only=False)
+        sd = ckpt.get("model_state_dict", ckpt)
+        sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        model.load_state_dict(sd, strict=False)
+        start_step = ckpt.get("step", 0)
+        start_epoch = ckpt.get("epoch", 1)
+        best_acc = ckpt.get("best_acc", 0.0)
+        log(f"  Loaded exp149 epoch_1: step={start_step}, best_acc={best_acc:.2%}")
 
     model.to(DEVICE)
     model.train()
 
-    # Optimizer — higher weight decay for from-scratch (regularization)
     optimizer = AdamW(model.parameters(), lr=args.lr,
                       weight_decay=args.weight_decay, betas=(0.9, 0.95))
     scaler = GradScaler('cuda')
@@ -298,91 +346,128 @@ def main():
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
 
-    # Data loader
-    log(f"Loading shards from {SHARD_DIR}...")
+    # Data loader WITH hflip + include_cp for weighting
+    log(f"Loading shards from {SHARD_DIR} (hflip=True, include_cp=True)...")
     loader = ShardedChessLoader(
         SHARD_DIR, batch_size=args.batch_size,
-        encoder_type="fused", device=DEVICE, seed=42)
+        encoder_type="fused", device=DEVICE, seed=42,
+        hflip=True, include_cp=True)
     total_pos = loader.total_positions
     steps_per_epoch = len(loader) // args.accum_steps
-    total_steps = steps_per_epoch * args.epochs
+    total_steps_full = steps_per_epoch * 3
     eff_bs = args.batch_size * args.accum_steps
 
     log(f"  {total_pos:,} positions, bs={args.batch_size}, accum={args.accum_steps}, eff_bs={eff_bs}")
-    log(f"  {steps_per_epoch:,} steps/epoch, {total_steps:,} total")
+    log(f"  {steps_per_epoch:,} steps/epoch")
+    log(f"  CP weighting: alpha={args.alpha}, tau={args.tau}")
+    log(f"  Weight at |cp|=0: {1+args.alpha:.1f}x, |cp|=100: {1+args.alpha*math.exp(-100/args.tau):.2f}x, |cp|=500: {1+args.alpha*math.exp(-500/args.tau):.2f}x")
 
-    # LR schedule — longer warmup for from-scratch
-    warmup_steps = min(2000, total_steps // 10)
+    warmup_steps = 2000
 
     def get_lr(step):
         if step < warmup_steps:
             return args.lr * (step + 1) / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps_full - warmup_steps, 1)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return args.lr * (args.min_lr_frac + (1.0 - args.min_lr_frac) * cosine)
 
     # Save config
-    config_path = OUTPUT_DIR / "config.json"
-    with open(config_path, "w") as f:
+    with open(OUTPUT_DIR / "config.json", "w") as f:
         json.dump({"model": MODEL_CONFIG.to_dict(), "training": {
             "batch_size": args.batch_size, "accum_steps": args.accum_steps,
-            "eff_bs": eff_bs, "lr": args.lr, "epochs": args.epochs,
+            "eff_bs": eff_bs, "lr": args.lr, "value_weight": args.value_weight,
+            "epochs": args.epochs, "alpha": args.alpha, "tau": args.tau,
             "weight_decay": args.weight_decay, "label_smoothing": args.label_smoothing,
-            "warmup_steps": warmup_steps, "total_steps": total_steps,
-            "init": "random",
+            "warmup_steps": warmup_steps, "source_ckpt": str(args.source_ckpt),
+            "augmentation": "hflip_50pct",
+            "variable": "cp_weighted_policy_loss",
         }}, f, indent=2)
 
-    # Eval data
+    # Eval
     eval_data, eval_tensors = None, None
     eval_path = SHARD_DIR / "eval.pt"
     if eval_path.exists():
         eval_data, eval_tensors = load_eval_data(eval_path)
         log(f"  Eval: {len(eval_data)} positions")
 
-    # Initial eval (random init baseline)
-    if eval_data and start_step == 0:
+    if eval_data:
         torch.cuda.empty_cache()
-        acc, top3, val_acc = run_eval(model, eval_data, eval_tensors)
-        log(f"  RANDOM INIT BASELINE: acc={acc:.2%} top3={top3:.2%} val={val_acc:.2%}")
-        best_acc = acc
+        acc, top3, top5, val_acc = run_eval(model, eval_data, eval_tensors)
+        log(f"  BASELINE: acc={acc:.2%} top3={top3:.2%} top5={top5:.2%} val={val_acc:.2%}")
+        if not (args.resume and resume_path.exists()):
+            best_acc = acc
 
-    # Training
     log(f"\n{'='*60}")
-    log(f"Training: {args.epochs} epochs, LR={args.lr}, warmup={warmup_steps}")
-    log(f"  weight_decay={args.weight_decay}, label_smoothing={args.label_smoothing}")
-    log(f"  grad_clip={args.grad_clip}, betas=(0.9, 0.95)")
-    log(f"  RANDOM INITIALIZATION — expect slow start, then rapid improvement")
+    log(f"Training: epochs {start_epoch+1}-{start_epoch+args.epochs}")
+    log(f"  LR={args.lr}, value_weight={args.value_weight}")
+    log(f"  CP weight: alpha={args.alpha}, tau={args.tau}")
+    log(f"  HFLIP=True")
+    if args.max_steps:
+        log(f"  MAX STEPS: {args.max_steps} (quick ablation)")
     log(f"{'='*60}")
 
     step = start_step
     accum_p_loss = 0.0
     accum_v_loss = 0.0
+    accum_avg_weight = 0.0
     accum_count = 0
     positions_seen = step * eff_bs
     t0 = time.time()
     grad_norm_accum = 0.0
 
-    for epoch in range(start_epoch, args.epochs):
+    end_epoch = start_epoch + args.epochs
+
+    for epoch in range(start_epoch, end_epoch):
         loader.set_epoch(epoch)
 
-        for batch_input, move_targets, wdl_targets in loader:
+        for batch_data in loader:
             if SHUTDOWN:
                 save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
                               OUTPUT_DIR / "latest.pt")
                 log(f"Shutdown at step {step}")
                 return
 
+            if args.max_steps and step >= start_step + args.max_steps:
+                log(f"Reached max_steps={args.max_steps}. Stopping.")
+                save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
+                              OUTPUT_DIR / "latest.pt")
+                # Final eval
+                if eval_data:
+                    acc, top3, top5, val_acc = run_eval(model, eval_data, eval_tensors)
+                    log(f"  FINAL EVAL: acc={acc:.2%} top3={top3:.2%} top5={top5:.2%} val={val_acc:.2%}")
+                return
+
+            # Unpack — loader yields (batch_input, move_targets, wdl_targets)
+            # when include_cp=True, cp is in batch_input["cp"]
+            batch_input, move_targets, wdl_targets = batch_data
+            cp_batch = batch_input.pop("cp", None)
+
             with autocast('cuda', dtype=torch.float16):
                 result = model(batch_input)
-                p_loss = F.cross_entropy(
+
+                # Standard per-sample cross entropy (no reduction)
+                p_loss_per_sample = F.cross_entropy(
                     result["policy_logits"], move_targets,
-                    label_smoothing=args.label_smoothing)
+                    label_smoothing=args.label_smoothing, reduction='none')
+
+                # Apply CP-based weights to policy loss
+                if cp_batch is not None:
+                    mate_batch = torch.zeros_like(cp_batch)  # mate info not in loader
+                    weights = compute_cp_weights(
+                        cp_batch, mate_batch, args.alpha, args.tau).to(DEVICE)
+                    # Normalize weights so mean ≈ 1 (preserve effective LR)
+                    weights = weights / weights.mean()
+                    p_loss = (p_loss_per_sample * weights).mean()
+                    avg_w = weights.mean().item()
+                else:
+                    p_loss = p_loss_per_sample.mean()
+                    avg_w = 1.0
+
                 v_loss = F.cross_entropy(result["value_logits"], wdl_targets)
                 loss = (p_loss + args.value_weight * v_loss) / args.accum_steps
 
             scaler.scale(loss).backward()
 
-            # NaN guard
             if torch.isnan(p_loss) or torch.isnan(v_loss):
                 log(f"NaN detected at step {step}! Saving and aborting.")
                 save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
@@ -391,6 +476,7 @@ def main():
 
             accum_p_loss += p_loss.item()
             accum_v_loss += v_loss.item()
+            accum_avg_weight += avg_w
             accum_count += 1
             positions_seen += move_targets.shape[0]
 
@@ -404,47 +490,41 @@ def main():
 
                 step += 1
 
-                # Update LR
                 lr = get_lr(step)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                # Log
                 if step % args.log_interval == 0:
                     avg_p = accum_p_loss / accum_count
                     avg_v = accum_v_loss / accum_count
                     avg_gn = grad_norm_accum / args.log_interval
+                    avg_wt = accum_avg_weight / accum_count
                     grad_norm_accum = 0.0
                     elapsed = time.time() - t0
-                    pos_s = positions_seen / max(elapsed, 1) if start_step == 0 else \
-                             (positions_seen - start_step * eff_bs) / max(elapsed, 1)
-                    remaining = total_pos * args.epochs - positions_seen
+                    pos_delta = positions_seen - start_step * eff_bs
+                    pos_s = pos_delta / max(elapsed, 1)
+                    remaining = total_pos * end_epoch - positions_seen
                     eta = remaining / max(pos_s, 1)
 
-                    log(f"  step {step:,}/{total_steps:,} | "
-                        f"p={avg_p:.4f} v={avg_v:.4f} | "
+                    log(f"  step {step:,}/{total_steps_full:,} | "
+                        f"p={avg_p:.4f} v={avg_v:.4f} w={avg_wt:.2f} | "
                         f"lr={lr:.2e} gn={avg_gn:.2f} | {pos_s:.0f} pos/s | "
                         f"pos={positions_seen:,} | "
                         f"ETA {timedelta(seconds=int(eta))}")
 
                     accum_p_loss = 0.0
                     accum_v_loss = 0.0
+                    accum_avg_weight = 0.0
                     accum_count = 0
 
-                # Save
                 if step % args.save_interval == 0:
                     save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
                                   OUTPUT_DIR / "latest.pt")
-                    # SWA snapshots every 10K steps (for checkpoint averaging)
-                    if step % 10000 == 0 and step > 0:
-                        save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
-                                      OUTPUT_DIR / f"step_{step}.pt")
 
-                # Eval
                 if step % args.eval_interval == 0 and eval_data:
                     torch.cuda.empty_cache()
-                    acc, top3, val_acc = run_eval(model, eval_data, eval_tensors)
-                    log(f"  EVAL step {step}: acc={acc:.2%} top3={top3:.2%} val={val_acc:.2%}")
+                    acc, top3, top5, val_acc = run_eval(model, eval_data, eval_tensors)
+                    log(f"  EVAL step {step}: acc={acc:.2%} top3={top3:.2%} top5={top5:.2%} val={val_acc:.2%}")
                     if acc > best_acc:
                         best_acc = acc
                         save_checkpoint(model, optimizer, scaler, step, epoch, best_acc,
@@ -452,61 +532,15 @@ def main():
                         log(f"  ** New best! acc={best_acc:.2%}")
                     model.train()
 
-                accum_count = 0
-                accum_p_loss = 0.0
-                accum_v_loss = 0.0
-
         # End of epoch
-        log(f"\nEpoch {epoch+1}/{args.epochs} complete. positions_seen={positions_seen:,}")
-
         save_checkpoint(model, optimizer, scaler, step, epoch + 1, best_acc,
-                       OUTPUT_DIR / f"epoch_{epoch+1}.pt")
+                       OUTPUT_DIR / f"epoch_{epoch + 1}.pt")
+        log(f"  Epoch {epoch + 1} complete. best_acc={best_acc:.2%}")
 
-        if eval_data:
-            torch.cuda.empty_cache()
-            acc, top3, val_acc = run_eval(model, eval_data, eval_tensors)
-            log(f"  EPOCH EVAL: acc={acc:.2%} top3={top3:.2%} val={val_acc:.2%}")
-            if acc > best_acc:
-                best_acc = acc
-                save_checkpoint(model, optimizer, scaler, step, epoch + 1, best_acc,
-                              OUTPUT_DIR / "best_model.pt")
-                log(f"  ** New best! acc={best_acc:.2%}")
-
-    # Final save
-    save_checkpoint(model, optimizer, scaler, step, args.epochs, best_acc,
-                   OUTPUT_DIR / "best_model.pt")
-
-    elapsed = time.time() - t0
-    log(f"\nTraining complete: {step:,} steps, {positions_seen:,} positions")
-    log(f"  Time: {timedelta(seconds=int(elapsed))}")
-    log(f"  Speed: {positions_seen/max(elapsed,1):.0f} pos/s")
-    log(f"  Best acc: {best_acc:.2%}")
+    log("Training complete.")
 
 
 if __name__ == "__main__":
-    import traceback
-    MAX_RETRIES = 5
-    for _attempt in range(MAX_RETRIES):
-        try:
-            main()
-            break  # Clean exit
-        except Exception as e:
-            err_str = f"{type(e).__name__}: {e}"
-            if "CUDA" in err_str.upper() or "Accelerator" in type(e).__name__:
-                log(f"\n{'='*60}")
-                log(f"CUDA/Accelerator error (attempt {_attempt+1}/{MAX_RETRIES}): {e}")
-                log(f"Retrying from latest checkpoint in 10s...")
-                log(f"{'='*60}")
-                traceback.print_exc()
-                try:
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-                time.sleep(10)
-                if "--resume" not in sys.argv:
-                    sys.argv.append("--resume")
-            else:
-                raise
-    else:
-        log(f"FATAL: {MAX_RETRIES} CUDA retries exhausted. Giving up.")
+    if "--resume" not in sys.argv:
+        sys.argv.append("--resume")
+    main()

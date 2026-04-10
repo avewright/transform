@@ -3,7 +3,37 @@ import json
 import math
 import os
 import shutil
+import sys
 from pathlib import Path
+
+# ── Compact vocab auto-detection (MUST run BEFORE chess/move_vocab imports) ──
+# Check --checkpoint for vocab_version metadata
+def _auto_detect_compact_vocab():
+    """Set MOVE_VOCAB_VERSION=compact if checkpoint uses compact vocab."""
+    for i, a in enumerate(sys.argv):
+        if a in ('--checkpoint', '-c') and i + 1 < len(sys.argv):
+            ckpt_path = sys.argv[i + 1]
+            break
+    else:
+        # Also check positional arg (first arg that looks like a path)
+        ckpt_path = None
+        for a in sys.argv[1:]:
+            if not a.startswith('-') and (a.endswith('.pt') or a.endswith('.pth')):
+                ckpt_path = a
+                break
+    if ckpt_path and os.path.exists(ckpt_path):
+        import torch as _torch
+        try:
+            _ck = _torch.load(ckpt_path, map_location='cpu', weights_only=False)
+            if _ck.get('vocab_version') == 'compact':
+                os.environ['MOVE_VOCAB_VERSION'] = 'compact'
+            del _ck
+        except Exception:
+            pass
+
+if not os.environ.get('MOVE_VOCAB_VERSION'):
+    _auto_detect_compact_vocab()
+# ── end auto-detection ──
 
 import chess
 import chess.engine
@@ -12,7 +42,7 @@ import torch
 import torch.nn.functional as F
 
 from chess_features import batch_boards_to_fused_token_ids
-from chess_transformer_factory import build_model
+from chess_transformer_factory import build_model, ChessTransformerConfig
 from opening_book import get_book_move
 
 ROOT = Path(__file__).resolve().parent
@@ -109,20 +139,50 @@ def resolve_stockfish_path() -> Path:
 SF = resolve_stockfish_path()
 
 
-def load_checkpoint_state(checkpoint_path: str | Path) -> dict:
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "model_state_dict" in state:
-        state = state["model_state_dict"]
-    return {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+def load_checkpoint_state(checkpoint_path: str | Path):
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state = ckpt["model_state_dict"]
+        cleaned = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        return cleaned, ckpt
+    else:
+        cleaned = {k.replace("_orig_mod.", ""): v for k, v in ckpt.items()}
+        return cleaned, {}
+
+
+def _detect_n_value_classes(ckpt_meta: dict, state: dict) -> int:
+    """Detect value head output size from checkpoint metadata or state dict."""
+    # Check checkpoint metadata
+    if ckpt_meta.get("n_value_bins"):
+        return int(ckpt_meta["n_value_bins"])
+    cfg = ckpt_meta.get("config", {})
+    if isinstance(cfg, dict) and cfg.get("n_value_classes"):
+        return int(cfg["n_value_classes"])
+    # Infer from state dict weight shape
+    for key in ("value_head.2.weight", "value_head.2.linear.weight"):
+        if key in state:
+            return state[key].shape[0]
+    return 3  # default: 3-class WDL
 
 
 def load_eval_model(checkpoint_path: str | Path, device: torch.device, model_config: str | None = None):
     if model_config is None:
+        # Try auto-detect for distributional value checkpoints
+        state, ckpt_meta = load_checkpoint_state(checkpoint_path)
+        n_val = _detect_n_value_classes(ckpt_meta, state)
+        if n_val != 3:
+            # Distributional value — can't use play.load_model, build manually
+            cfg = ChessTransformerConfig(n_value_classes=n_val)
+            model = build_model(cfg)
+            model.load_state_dict(state)
+            model = model.to(device)
+            model.eval()
+            return model
         from play import load_model
         return load_model(str(checkpoint_path), device)
 
     model = build_model(model_config)
-    state = load_checkpoint_state(checkpoint_path)
+    state, _ = load_checkpoint_state(checkpoint_path)
     model.load_state_dict(state)
     model = model.to(device)
     model.eval()
@@ -152,9 +212,18 @@ def get_model_move_generic(model, board: chess.Board, device: torch.device, temp
     for idx, p in zip(topk.indices.tolist(), topk.values.tolist()):
         top_moves.append((IDX_TO_UCI[idx], f"{p*100:.1f}%"))
     wdl_logits = result["value_logits"][0].float()
-    wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
-    # Model WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
-    return move, {"top_moves": top_moves, "wdl": {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}}
+    if wdl_logits.shape[-1] == 3:
+        wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
+        # Model WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
+        return move, {"top_moves": top_moves, "wdl": {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}}
+    else:
+        # Distributional value (N-bin HL-Gauss) → expected win%
+        n_bins = wdl_logits.shape[-1]
+        bin_centers = torch.linspace(0.5 / n_bins, 1 - 0.5 / n_bins, n_bins,
+                                     device=wdl_logits.device)
+        probs_v = F.softmax(wdl_logits, dim=-1)
+        win_pct = (probs_v * bin_centers).sum().item()
+        return move, {"top_moves": top_moves, "wdl": {"win": win_pct, "draw": 0.0, "loss": 1.0 - win_pct}}
 
 
 def log(msg: str) -> None:
@@ -508,7 +577,9 @@ def main() -> None:
         )
     )
     model = load_eval_model(str(checkpoint), DEVICE, model_config=args.model_config)
-    move_fn = get_model_move_generic if args.model_config else __import__("play").get_model_move
+    # Use generic move fn for distributional value or explicit config; play.py for legacy 3-class
+    n_val = model.value_head[-1].out_features if hasattr(model.value_head, '__getitem__') else 3
+    move_fn = get_model_move_generic if (args.model_config or n_val != 3) else __import__("play").get_model_move
 
     # Initialize Syzygy tablebases for perfect endgame play
     if not args.no_syzygy:

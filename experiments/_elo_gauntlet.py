@@ -19,9 +19,31 @@ from pathlib import Path
 os.environ['PYTHONUNBUFFERED'] = '1'
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Must set compact vocab BEFORE any chess imports
+if '--compact' in sys.argv:
+    os.environ['MOVE_VOCAB_VERSION'] = 'compact'
+else:
+    # Auto-detect from checkpoint
+    _ckpt_idx = None
+    for i, a in enumerate(sys.argv):
+        if a == '--checkpoint' and i + 1 < len(sys.argv):
+            _ckpt_idx = i + 1
+            break
+    if _ckpt_idx:
+        import torch as _torch
+        try:
+            _ck = _torch.load(sys.argv[_ckpt_idx], map_location='cpu', weights_only=False)
+            if _ck.get('vocab_version') == 'compact':
+                os.environ['MOVE_VOCAB_VERSION'] = 'compact'
+                print("Auto-detected compact vocab from checkpoint")
+            del _ck
+        except Exception:
+            pass
+
 import chess
 import chess.engine
 import torch
+from torch import nn
 
 from chess_transformer_factory import build_model, ChessTransformerConfig
 from uci_engine import MCTSSearch, SyzygyProbe
@@ -74,12 +96,25 @@ def load_model(checkpoint_path, config_path=None):
         cfg = None  # default
 
     model = build_model(cfg)
+
+    # Auto-detect distributional value head (128-bin HL-Gauss vs 3-class WDL)
+    ckpt_vbias = sd.get('value_head.2.bias')
+    if ckpt_vbias is not None and ckpt_vbias.shape[0] != model.value_head[2].out_features:
+        n_bins = ckpt_vbias.shape[0]
+        old_head = model.value_head
+        model.value_head = nn.Sequential(
+            old_head[0], old_head[1],
+            nn.Linear(old_head[0].out_features, n_bins),
+        )
+
     model.load_state_dict(sd, strict=False)
     model.to(DEVICE).eval()
     return model
 
 
-def run_gauntlet(model, sf_elo, sims, games, c_puct=2.5, use_book=True):
+def run_gauntlet(model, sf_elo, sims, games, c_puct=2.5, use_book=True,
+                 dynamic_cpuct=False, batch_size=16, policy_temp=1.0,
+                 fpu_reduction=0.25, inner_temp=1.0):
     """Run MCTS gauntlet. Returns summary dict."""
     sf = chess.engine.SimpleEngine.popen_uci(str(SF_PATH))
     sf.configure({'UCI_LimitStrength': True, 'UCI_Elo': sf_elo, 'Threads': 1})
@@ -87,9 +122,13 @@ def run_gauntlet(model, sf_elo, sims, games, c_puct=2.5, use_book=True):
     syzygy = SyzygyProbe()
     mcts = MCTSSearch(
         model, DEVICE, syzygy,
-        c_puct=c_puct, batch_size=8,
+        c_puct=c_puct, batch_size=batch_size,
         root_noise_alpha=0.3, root_noise_frac=0.25,
         use_fp16=True, use_transpositions=True,
+        dynamic_cpuct=dynamic_cpuct,
+        policy_temp=policy_temp,
+        fpu_reduction=fpu_reduction,
+        inner_temp=inner_temp,
     )
 
     results = []
@@ -191,11 +230,23 @@ def main():
     ap.add_argument('--sf-elo', type=int, default=1900)
     ap.add_argument('--games', type=int, default=16)
     ap.add_argument('--c-puct', type=float, default=2.5)
+    ap.add_argument('--policy-temp', type=float, default=1.0,
+                    help="Policy temperature at root (lower=sharper, default: 1.0)")
+    ap.add_argument('--fpu-reduction', type=float, default=0.25,
+                    help="First play urgency reduction (default: 0.25)")
+    ap.add_argument('--inner-temp', type=float, default=1.0,
+                    help="Policy temperature at non-root nodes (default: 1.0)")
     ap.add_argument('--no-book', action='store_true')
+    ap.add_argument('--dynamic-cpuct', action='store_true',
+                    help="Enable KataGo-style dynamic variance-scaled cPUCT")
+    ap.add_argument('--batch-size', type=int, default=16,
+                    help="NN batch size for MCTS leaf eval (default: 16)")
     ap.add_argument('--quick', action='store_true',
                     help="Quick screening: 8 games at 100 sims")
     ap.add_argument('--output', type=str, default=None,
                     help="Save results to JSON file")
+    ap.add_argument('--compact', action='store_true',
+                    help="Use compact vocab (1968 moves, auto-detected if possible)")
     args = ap.parse_args()
 
     if args.quick:
@@ -214,6 +265,11 @@ def main():
     summary, results = run_gauntlet(
         model, args.sf_elo, args.sims, args.games,
         c_puct=args.c_puct, use_book=not args.no_book,
+        dynamic_cpuct=args.dynamic_cpuct,
+        batch_size=args.batch_size,
+        policy_temp=args.policy_temp,
+        fpu_reduction=args.fpu_reduction,
+        inner_temp=args.inner_temp,
     )
     elapsed = time.time() - t0
     summary['elapsed_seconds'] = round(elapsed, 1)

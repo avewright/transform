@@ -1,0 +1,295 @@
+"""exp171: Data scaling with SwiGLU+RelBias medium architecture.
+
+exp170 showed SwiGLU+RelBias (variant G) at 14.48% top-1 / 35.84% top-3 on
+2 shards (2M positions) / 5K steps. The eval curve showed signs of plateau
+(15.10% at step 4000, then dipped to 14.48% at step 5000) — possible overfitting
+on limited data diversity.
+
+Hypothesis: More diverse training data will break past the 14.48% ceiling.
+The model processes 320K total positions in 5K steps (batch_size 64),
+seeing only 16% of the 2M shard pool. With 4-8 shards, the model gets
+more diverse positions per step, which should reduce overfitting.
+
+Two variants:
+  H. DATA_4S  — 4 shards (4M pos), 10K steps  (2x data, 2x compute)
+  I. DATA_8S  — 8 shards (8M pos), 10K steps  (4x data, 2x compute)
+
+Architecture: Same as exp170 G — 8L/512d/8H, SwiGLU, RelBias.
+Expected wall time: ~22 min per variant.
+
+Usage:
+  python experiments/exp171_data_scaling.py --variant H
+  python experiments/exp171_data_scaling.py --variant I
+"""
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ['MOVE_VOCAB_VERSION'] = 'compact'
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.amp import autocast, GradScaler
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from chess_transformer_factory import (
+    ChessTransformerConfig, build_model, count_parameters,
+    SpatialPolicyHead, _build_move_square_indices,
+)
+from chess_model import FusedBoardEncoder
+from move_vocab import VOCAB_SIZE, LEGACY_UCI_TO_IDX, legacy_to_compact_map
+from data_loader import board_array_to_fused, ep_square_to_file, compute_wdl
+
+ROOT = Path(__file__).resolve().parent.parent
+SHARD_DIR = ROOT / "outputs" / "exp139_massive_train" / "shards"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ── Compact vocab remap ──
+def build_remap_tensor():
+    remap = legacy_to_compact_map()
+    legacy_size = max(LEGACY_UCI_TO_IDX.values()) + 1
+    t = torch.full((legacy_size,), -1, dtype=torch.long)
+    for old_idx, new_idx in remap.items():
+        t[old_idx] = new_idx
+    return t
+
+REMAP = build_remap_tensor()
+
+
+# ── Variants ──
+VARIANTS = {
+    "H": {"name": "DATA_4S", "shards": 4, "steps": 10000},
+    "I": {"name": "DATA_8S", "shards": 8, "steps": 10000},
+}
+
+
+# ── Data ──
+def load_shard(shard_idx=0):
+    path = SHARD_DIR / f"shard_{shard_idx:05d}.pt"
+    return torch.load(path, weights_only=True, map_location="cpu")
+
+
+def prepare_batch(data, indices, device):
+    ba = data["board_array"][indices]
+    turn = data["turn"][indices]
+    castling = data["castling"][indices]
+    ep = data["ep_square"][indices]
+    move_idx = data["move_idx"][indices]
+    cp = data["cp"][indices]
+    mate = data["mate"][indices]
+
+    fused_ids = board_array_to_fused(ba)
+    ep_file = ep_square_to_file(ep)
+    wdl = compute_wdl(cp, mate)
+
+    compact_move = REMAP[move_idx.long()]
+    valid = compact_move >= 0
+    compact_move = compact_move.clamp(min=0)
+
+    board_input = {
+        "fused_ids": fused_ids.to(device),
+        "turn": turn.long().to(device),
+        "castling": castling.long().to(device),
+        "ep_file": ep_file.long().to(device),
+    }
+    return board_input, compact_move.to(device), wdl.to(device), valid.to(device)
+
+
+@torch.no_grad()
+def evaluate(model, eval_data, device, num_samples=5000):
+    model.eval()
+    bs = 256
+    correct1 = correct3 = total = 0
+    total_loss = 0.0
+    n_batches = 0
+    N = min(num_samples, eval_data["board_array"].shape[0])
+
+    for start in range(0, N, bs):
+        end = min(start + bs, N)
+        idx = torch.arange(start, end)
+        board_input, target_move, wdl, valid = prepare_batch(eval_data, idx, device)
+
+        with autocast("cuda", dtype=torch.float16):
+            out = model(board_input)
+            policy_logits = out["policy_logits"]
+            loss = F.cross_entropy(policy_logits[valid.bool()], target_move[valid.bool()])
+
+        total_loss += loss.item()
+        n_batches += 1
+        preds = policy_logits[valid.bool()].topk(3, dim=-1).indices
+        targets = target_move[valid.bool()]
+        correct1 += (preds[:, 0] == targets).sum().item()
+        correct3 += (preds == targets.unsqueeze(1)).any(dim=1).sum().item()
+        total += valid.sum().item()
+
+    model.train()
+    return {
+        "top1": correct1 / max(total, 1),
+        "top3": correct3 / max(total, 1),
+        "loss": total_loss / max(n_batches, 1),
+    }
+
+
+def run_variant(variant_key, steps, eval_every, batch_size, lr, seed):
+    v = VARIANTS[variant_key]
+    n_shards = v["shards"]
+    steps = v["steps"] if steps is None else steps
+
+    torch.manual_seed(seed)
+    print(f"Device: {DEVICE}")
+    if DEVICE.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"Compact vocab size: {VOCAB_SIZE}")
+
+    print(f"\n{'='*60}")
+    print(f"  ABLATION {variant_key}: {v['name']}")
+    print(f"  shards={n_shards} steps={steps} bs={batch_size} lr={lr}")
+    print(f"{'='*60}\n")
+
+    # Build model using production factory — SwiGLU+RelBias config
+    cfg = ChessTransformerConfig(
+        encoder_dim=256,
+        hidden_dim=512,
+        num_layers=8,
+        num_heads=8,
+        ffn_ratio=4,
+        dropout=0.05,
+        policy_head_dim=256,
+        value_hidden=256,
+        use_pos_embed=True,
+        n_ctx_tokens=4,
+        value_head_type="cls",
+        n_value_classes=3,
+        use_swiglu=True,
+        use_rel_bias=True,
+    )
+    model = build_model(cfg).to(DEVICE)
+    n_params = count_parameters(model)
+    print(f"  Parameters: {n_params:,}")
+
+    # Load training shards
+    print(f"  Loading {n_shards} training shards...")
+    train_data_list = []
+    for i in range(n_shards):
+        train_data_list.append(load_shard(i))
+    train_data = {k: torch.cat([d[k] for d in train_data_list], dim=0) for k in train_data_list[0].keys()}
+    n_train = train_data["board_array"].shape[0]
+    print(f"  Training positions: {n_train:,}")
+    del train_data_list
+    gc.collect()
+
+    # Eval data: shard 2 (index 2)
+    print(f"  Loading eval data (shard 2)...")
+    eval_data = load_shard(2)
+
+    opt = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scaler = GradScaler("cuda")
+    model.train()
+
+    results = []
+    t0 = time.time()
+    total_pos = 0
+
+    for step in range(1, steps + 1):
+        idx = torch.randint(0, n_train, (batch_size,))
+        board_input, target_move, wdl, valid = prepare_batch(train_data, idx, DEVICE)
+
+        with autocast("cuda", dtype=torch.float16):
+            out = model(board_input)
+            p_loss = F.cross_entropy(out["policy_logits"][valid.bool()], target_move[valid.bool()])
+            v_loss = F.cross_entropy(out["value_logits"], wdl)
+            loss = p_loss + v_loss
+
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+
+        total_pos += batch_size
+
+        if step % 100 == 0:
+            elapsed = time.time() - t0
+            pos_s = total_pos / elapsed
+            print(f"  step={step:5d} p_loss={p_loss.item():.3f} v_loss={v_loss.item():.3f} {pos_s:.0f} pos/s")
+            sys.stdout.flush()
+
+        if step % eval_every == 0:
+            ev = evaluate(model, eval_data, DEVICE)
+            results.append({"step": step, **ev})
+            print(f"  >>> EVAL step={step}: top1={ev['top1']:.4f} top3={ev['top3']:.4f} loss={ev['loss']:.3f}")
+            sys.stdout.flush()
+
+    elapsed = time.time() - t0
+    pos_s = total_pos / elapsed
+
+    ev_final = results[-1] if results else {}
+    print(f"\n  Completed {v['name']} in {elapsed:.1f}s ({pos_s:.0f} pos/s)")
+
+    return {
+        "variant": variant_key,
+        "name": v["name"],
+        "params": n_params,
+        "shards": n_shards,
+        "steps": steps,
+        "top1": ev_final.get("top1", 0),
+        "top3": ev_final.get("top3", 0),
+        "loss": ev_final.get("loss", 0),
+        "time_s": elapsed,
+        "pos_s": pos_s,
+        "eval_history": results,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", type=str, default=None, choices=list(VARIANTS.keys()))
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    variants_to_run = [args.variant] if args.variant else list(VARIANTS.keys())
+    all_results = []
+
+    for v in variants_to_run:
+        result = run_variant(v, args.steps, args.eval_every, args.batch_size, args.lr, args.seed)
+        all_results.append(result)
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # Print summary
+    print(f"\n{'='*80}")
+    print(f"  DATA SCALING RESULTS (step {all_results[0]['steps']})")
+    print(f"{'='*80}")
+    print(f"{'Variant':<8} {'Name':<12} {'Shards':<8} {'Params':>12} {'Top-1':>8} {'Top-3':>8} {'Loss':>8} {'Time':>8} {'pos/s':>8}")
+    print("-" * 88)
+    for r in all_results:
+        print(f"{r['variant']:<8} {r['name']:<12} {r['shards']:<8} {r['params']:>12,} {r['top1']:>7.2%} {r['top3']:>7.2%} {r['loss']:>8.3f} {r['time_s']:>7.1f}s {r['pos_s']:>8.0f}")
+
+    # Save results
+    out_path = ROOT / "outputs" / "exp171_data_scaling_results.json"
+    with open(out_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nResults saved to {out_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from chess_model import FusedBoardEncoder
+from chess_model import FusedBoardEncoder, ChessRelativeBias
 from move_vocab import IDX_TO_UCI, VOCAB_SIZE
 
 
@@ -26,6 +26,9 @@ class ChessTransformerConfig:
     use_pos_embed: bool = True
     n_ctx_tokens: int = 4
     value_head_type: str = "cls"  # "cls" (CLS only) or "pool" (CLS + mean pool)
+    n_value_classes: int = 3     # 3 for WDL, 128 for distributional HL-Gauss
+    use_swiglu: bool = False       # SwiGLU gated FFN (Llama/Ruoss-style)
+    use_rel_bias: bool = False     # Chess-aware relative geometry attention bias
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ChessTransformerConfig":
@@ -59,6 +62,51 @@ def _build_move_square_indices():
         torch.tensor(to_sqs, dtype=torch.long),
         torch.tensor(promo_types, dtype=torch.long),
     )
+
+
+# ── SwiGLU FFN (validated in exp169/exp170) ──
+class SwiGLUFFN(nn.Module):
+    """Gated FFN: SiLU(Wg·x) * Wu·x → Wd.
+    Inner dim is 2/3 of ffn_dim to match parameter count with standard FFN."""
+    def __init__(self, d_model: int, ffn_dim: int, dropout: float = 0.1):
+        super().__init__()
+        inner = int(ffn_dim * 2 / 3)
+        self.w_gate = nn.Linear(d_model, inner)
+        self.w_up = nn.Linear(d_model, inner)
+        self.w_down = nn.Linear(inner, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+
+
+# ── Custom encoder layer supporting SwiGLU + attention bias ──
+class ChessTransformerEncoderLayer(nn.Module):
+    """Pre-norm transformer encoder layer with optional SwiGLU FFN and attention bias."""
+    def __init__(self, d_model: int, nhead: int, ffn_dim: int,
+                 dropout: float = 0.1, use_swiglu: bool = False):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = (
+            SwiGLUFFN(d_model, ffn_dim, dropout) if use_swiglu
+            else nn.Sequential(
+                nn.Linear(d_model, ffn_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(ffn_dim, d_model),
+                nn.Dropout(dropout),
+            )
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed, normed, normed, attn_mask=attn_bias)
+        x = x + self.dropout(attn_out)
+        x = x + self.ffn(self.norm2(x))
+        return x
 
 
 class SpatialPolicyHead(nn.Module):
@@ -124,16 +172,40 @@ class ChessTransformer(nn.Module):
             if config.use_pos_embed
             else None
         )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=config.num_heads,
-            dim_feedforward=config.hidden_dim * config.ffn_ratio,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+
+        # Relative bias (chess geometry)
+        self.rel_bias = (
+            ChessRelativeBias(config.num_heads, n_ctx=config.n_ctx_tokens)
+            if config.use_rel_bias else None
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+
+        # Encoder layers: custom (SwiGLU/bias-aware) or standard
+        ffn_dim = config.hidden_dim * config.ffn_ratio
+        if config.use_swiglu or config.use_rel_bias:
+            self.layers = nn.ModuleList([
+                ChessTransformerEncoderLayer(
+                    d_model=config.hidden_dim,
+                    nhead=config.num_heads,
+                    ffn_dim=ffn_dim,
+                    dropout=config.dropout,
+                    use_swiglu=config.use_swiglu,
+                )
+                for _ in range(config.num_layers)
+            ])
+            self.transformer = None
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_dim,
+                nhead=config.num_heads,
+                dim_feedforward=ffn_dim,
+                dropout=config.dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+            self.layers = None
+
         self.norm = nn.LayerNorm(config.hidden_dim)
         self.policy_head = SpatialPolicyHead(
             config.hidden_dim,
@@ -149,7 +221,7 @@ class ChessTransformer(nn.Module):
             self.value_head = nn.Sequential(
                 nn.Linear(config.hidden_dim, config.value_hidden),
                 nn.ReLU(),
-                nn.Linear(config.value_hidden, 3),
+                nn.Linear(config.value_hidden, config.n_value_classes),
             )
             self._pool_value = False
 
@@ -159,7 +231,23 @@ class ChessTransformer(nn.Module):
         hidden = torch.cat([self.cls_token.expand(batch_size, -1, -1), hidden], dim=1)
         if self.pos_embed is not None:
             hidden = hidden + self.pos_embed
-        hidden = self.norm(self.transformer(hidden))
+
+        if self.layers is not None:
+            # Custom layers path (SwiGLU and/or RelBias)
+            attn_bias = None
+            if self.rel_bias is not None:
+                bias = self.rel_bias()  # (H, seq, seq)
+                # Expand to (B*H, seq, seq) for nn.MultiheadAttention
+                nhead = self.config.num_heads
+                attn_bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(
+                    batch_size * nhead, hidden.shape[1], hidden.shape[1]
+                )
+            for layer in self.layers:
+                hidden = layer(hidden, attn_bias=attn_bias)
+        else:
+            hidden = self.transformer(hidden)
+
+        hidden = self.norm(hidden)
         cls_hidden = hidden[:, 0, :]
         value_logits = (
             self.value_head(hidden, cls_hidden) if self._pool_value

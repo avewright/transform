@@ -111,13 +111,14 @@ class SyzygyProbe:
 # ── MCTS Engine ──
 
 class MCTSNode:
-    __slots__ = ['prior', 'visit_count', 'value_sum', 'children', 'is_expanded',
-                 '_deferred']
+    __slots__ = ['prior', 'visit_count', 'value_sum', 'value_sq_sum',
+                 'children', 'is_expanded', '_deferred']
 
     def __init__(self, prior=0.0):
         self.prior = prior
         self.visit_count = 0
         self.value_sum = 0.0
+        self.value_sq_sum = 0.0  # for variance tracking (dynamic cPUCT)
         self.children = {}
         self.is_expanded = False
         self._deferred = None
@@ -126,6 +127,13 @@ class MCTSNode:
         if self.visit_count == 0:
             return 0.0
         return self.value_sum / self.visit_count
+
+    def value_variance(self):
+        """Empirical variance of value backups through this node."""
+        if self.visit_count < 2:
+            return 1.0  # prior variance when unknown
+        mean = self.value_sum / self.visit_count
+        return max(0.01, self.value_sq_sum / self.visit_count - mean * mean)
 
 
 class MCTSSearch:
@@ -142,7 +150,7 @@ class MCTSSearch:
                  root_noise_alpha=0.3, root_noise_frac=0.25,
                  use_fp16=True, policy_temp=1.0,
                  root_widening=0, inner_temp=1.0,
-                 use_transpositions=True):
+                 use_transpositions=True, dynamic_cpuct=False):
         self.model = model
         self.device = device
         self.syzygy = syzygy
@@ -159,6 +167,7 @@ class MCTSSearch:
         # Inner tree temperature: sharpen policy at non-root depth for exploitation
         self.inner_temp = inner_temp
         self.use_transpositions = use_transpositions
+        self.dynamic_cpuct = dynamic_cpuct
         self.root = None
         self.root_board = None
         self.nn_evals = 0
@@ -232,8 +241,19 @@ class MCTSSearch:
                     p += probs[alt_idx].item()
                 policy[m] = p
             # Value: White-absolute → side-to-move
-            wdl = F.softmax(r["value_logits"][i].float(), dim=-1)
-            white_val = (wdl[0] - wdl[2]).item()
+            val_logits = r["value_logits"][i].float()
+            if val_logits.shape[-1] == 3:
+                # Standard 3-class WDL
+                wdl = F.softmax(val_logits, dim=-1)
+                white_val = (wdl[0] - wdl[2]).item()
+            else:
+                # Distributional value (N-bin HL-Gauss) → expected win%
+                n_bins = val_logits.shape[-1]
+                bin_centers = torch.linspace(0.5 / n_bins, 1 - 0.5 / n_bins, n_bins,
+                                             device=val_logits.device)
+                probs_v = F.softmax(val_logits, dim=-1)
+                win_pct = (probs_v * bin_centers).sum().item()
+                white_val = win_pct * 2 - 1  # map [0,1] → [-1,+1]
             stm_val = white_val if board.turn == chess.WHITE else -white_val
             results.append((policy, stm_val))
         self.nn_evals += len(boards)
@@ -247,12 +267,18 @@ class MCTSSearch:
         best_move = None
         best_child = None
         sqrt_parent = math.sqrt(max(1, parent_n))
+        # Dynamic cPUCT: scale exploration by sqrt(utility variance)
+        # (KataGo: Wu 2019, +25-50 Elo)
+        if self.dynamic_cpuct:
+            cpuct = self.c_puct * math.sqrt(node.value_variance())
+        else:
+            cpuct = self.c_puct
         for move, child in node.children.items():
             if child.visit_count == 0:
                 q = fpu_value
             else:
                 q = -child.q_value()
-            u = self.c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
+            u = cpuct * child.prior * sqrt_parent / (1 + child.visit_count)
             score = q + u
             if score > best_score:
                 best_score = score
@@ -404,6 +430,7 @@ class MCTSSearch:
                     for n in reversed(path):
                         n.visit_count += 1
                         n.value_sum += value
+                        n.value_sq_sum += value * value
                         value = -value
                     sims_done += 1
                     continue
@@ -422,6 +449,7 @@ class MCTSSearch:
                     for n in reversed(path):
                         n.visit_count += 1
                         n.value_sum += value
+                        n.value_sq_sum += value * value
                         value = -value
                     sims_done += 1
                     continue
@@ -439,6 +467,7 @@ class MCTSSearch:
                     for n in reversed(path):
                         n.visit_count += 1
                         n.value_sum += value
+                        n.value_sq_sum += value * value
                         value = -value
                     sims_done += 1
 
@@ -462,6 +491,7 @@ class MCTSSearch:
                     for n in reversed(path):
                         n.visit_count += 1
                         n.value_sum += v
+                        n.value_sq_sum += v * v
                         v = -v
                     sims_done += 1
 
@@ -750,13 +780,14 @@ class UCIEngine:
     """UCI protocol handler."""
 
     def __init__(self, checkpoint_path: str, syzygy_path: str = None,
-                 default_sims: int = 800):
+                 default_sims: int = 800, dynamic_cpuct: bool = False):
         self.model = None
         self.checkpoint_path = checkpoint_path
         self.search = None
         self.time_manager = TimeManager(default_sims=default_sims)
         self.syzygy = SyzygyProbe(syzygy_path)
         self.default_sims = default_sims
+        self.dynamic_cpuct = dynamic_cpuct
         self.board = chess.Board()
         self.ponder = False
         self.debug = False
@@ -778,6 +809,7 @@ class UCIEngine:
         self.search = MCTSSearch(
             self.model, DEVICE, self.syzygy,
             c_puct=2.5, batch_size=8,
+            dynamic_cpuct=self.dynamic_cpuct,
         )
 
     def run(self):
@@ -1053,10 +1085,13 @@ def main():
                         help="Path to Syzygy tablebase directory")
     parser.add_argument("--default-sims", type=int, default=200,
                         help="Default MCTS simulations per move")
+    parser.add_argument("--dynamic-cpuct", action="store_true",
+                        help="Scale cPUCT by sqrt(value variance) per node (KataGo-style)")
     args = parser.parse_args()
 
     ckpt = args.checkpoint or find_checkpoint()
-    engine = UCIEngine(ckpt, args.syzygy, args.default_sims)
+    engine = UCIEngine(ckpt, args.syzygy, args.default_sims,
+                       dynamic_cpuct=args.dynamic_cpuct)
     engine.run()
 
 

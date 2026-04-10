@@ -117,19 +117,22 @@ def evaluate(model, eval_data, device, max_positions=5000):
     top3 = 0
     value_correct = 0
     total = 0
-    all_fused = eval_data["fused_ids"]
-    all_moves = eval_data["move_idx"]
-    all_wdl = eval_data["wdl"]
+    n = min(len(eval_data["move_idx"]), max_positions)
     bs = 64
 
     with torch.no_grad():
-        for start in range(0, min(len(all_moves), max_positions), bs):
-            end = min(start + bs, len(all_moves), max_positions)
-            batch_fused = all_fused[start:end].to(device)
-            batch_moves = all_moves[start:end].to(device)
-            batch_wdl = all_wdl[start:end].to(device)
+        for start in range(0, n, bs):
+            end = min(start + bs, n)
+            batch_input = {
+                "fused_ids": eval_data["fused_ids"][start:end].to(device),
+                "turn": eval_data["turn"][start:end].to(device),
+                "castling": eval_data["castling"][start:end].to(device),
+                "ep_file": eval_data["ep_file"][start:end].to(device),
+            }
+            batch_moves = eval_data["move_idx"][start:end].to(device)
+            batch_wdl = eval_data["wdl"][start:end].to(device)
             with autocast('cuda', dtype=torch.float16):
-                result = model({"fused_ids": batch_fused})
+                result = model(batch_input)
             logits = result["policy_logits"]
             preds = logits.argmax(dim=-1)
             correct += (preds == batch_moves).sum().item()
@@ -148,17 +151,17 @@ def prepare_eval_data(shard_dir, n_eval=5000, seed=42):
     data = torch.load(eval_path, map_location="cpu", weights_only=True)
     n = min(n_eval, data["board_array"].shape[0])
     ba = data["board_array"][:n]
-    turn = data["turn"][:n]
-    castling = data["castling"][:n]
-    ep = data["ep_square"][:n]
     fused = board_array_to_fused(ba)
-    ep_file = ep_square_to_file(ep)
-    fused_ids = torch.cat([fused, turn.unsqueeze(1).long(), castling.unsqueeze(1).long(), ep_file.unsqueeze(1)], dim=1)
+    ep_file = ep_square_to_file(data["ep_square"][:n].long())
     wdl = compute_wdl(data["cp"][:n], data["mate"][:n])
+    wdl_class = wdl.argmax(dim=-1)
     return {
-        "fused_ids": fused_ids,
+        "fused_ids": fused,
+        "turn": data["turn"][:n].long(),
+        "castling": data["castling"][:n].long(),
+        "ep_file": ep_file,
         "move_idx": data["move_idx"][:n].long(),
-        "wdl": wdl,
+        "wdl": wdl_class,
     }
 
 
@@ -263,6 +266,7 @@ def main():
 
     loader = ShardedChessLoader(
         SHARD_DIR, batch_size=args.batch_size,
+        encoder_type="fused", device=DEVICE, seed=42,
         hflip=True, include_cp=True,
     )
     steps_per_epoch = len(loader) // args.accum_steps

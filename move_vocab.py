@@ -3,46 +3,95 @@
 Enumerates all possible chess moves (from_sq, to_sq, promotion) as a
 fixed vocabulary. This lets us use a simple classification head instead
 of autoregressive text generation.
+
+Two vocab versions:
+  - LEGACY (5504): all 64×63 square pairs + promotions. Used by all
+    checkpoints trained before April 2026.
+  - COMPACT (1968): only geometrically reachable moves (ray, knight,
+    pawn promotions). ~2.8× smaller output head.  Use for new training
+    runs via MOVE_VOCAB_VERSION=compact env var or by importing
+    COMPACT_* symbols directly.
 """
 
+import os
 import chess
 import torch
 
-# Build the full move vocabulary once at import time.
-# We enumerate all (from_sq, to_sq) pairs that are geometrically reachable,
-# plus promotion variants. This is a superset of legal moves in any position.
+# ── Legacy vocab (5504) — all sq pairs, used by existing checkpoints ──
 
-def _build_move_vocab() -> tuple[list[str], dict[str, int]]:
-    """Build the complete UCI move vocabulary.
-
-    Returns (idx_to_uci, uci_to_idx).
-    """
+def _build_legacy_vocab() -> tuple[list[str], dict[str, int]]:
     moves = set()
-
-    # Generate all moves from every possible position configuration.
-    # Easier: enumerate geometrically. A piece on any square can move to
-    # any other square. Promotions add 4 variants per pawn push to back rank.
     for from_sq in range(64):
         for to_sq in range(64):
             if from_sq == to_sq:
                 continue
             uci = chess.square_name(from_sq) + chess.square_name(to_sq)
             moves.add(uci)
-
-            # Promotion moves: pawn reaching rank 0 or rank 7
             to_rank = chess.square_rank(to_sq)
             from_rank = chess.square_rank(from_sq)
             if to_rank in (0, 7) and abs(from_rank - to_rank) <= 2:
                 for promo in "qrbn":
                     moves.add(uci + promo)
-
     move_list = sorted(moves)
-    move_to_idx = {m: i for i, m in enumerate(move_list)}
-    return move_list, move_to_idx
+    return move_list, {m: i for i, m in enumerate(move_list)}
 
 
-IDX_TO_UCI, UCI_TO_IDX = _build_move_vocab()
+# ── Compact vocab (1968) — only geometrically reachable moves ──
+
+def _build_compact_vocab() -> tuple[list[str], dict[str, int]]:
+    _KNIGHT_DELTAS = [(1,2),(2,1),(-1,2),(-2,1),(1,-2),(2,-1),(-1,-2),(-2,-1)]
+    _RAY_DELTAS = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    moves: set[str] = set()
+    for sq in range(64):
+        f, r = chess.square_file(sq), chess.square_rank(sq)
+        name = chess.square_name(sq)
+        # Knight
+        for df, dr in _KNIGHT_DELTAS:
+            nf, nr = f + df, r + dr
+            if 0 <= nf < 8 and 0 <= nr < 8:
+                moves.add(name + chess.square_name(chess.square(nf, nr)))
+        # Rays (covers rook, bishop, queen, king, and non-promo pawn moves)
+        for df, dr in _RAY_DELTAS:
+            nf, nr = f + df, r + dr
+            while 0 <= nf < 8 and 0 <= nr < 8:
+                moves.add(name + chess.square_name(chess.square(nf, nr)))
+                nf += df
+                nr += dr
+        # Pawn promotions (white rank 6→7, black rank 1→0)
+        for promo_from, promo_to in [(6, 7), (1, 0)]:
+            if r == promo_from:
+                for df in (-1, 0, 1):
+                    nf = f + df
+                    if 0 <= nf < 8:
+                        to_name = chess.square_name(chess.square(nf, promo_to))
+                        for p in "qrbn":
+                            moves.add(name + to_name + p)
+    move_list = sorted(moves)
+    return move_list, {m: i for i, m in enumerate(move_list)}
+
+
+# ── Select active vocab based on env var (default: legacy for compat) ──
+
+_VOCAB_VERSION = os.environ.get("MOVE_VOCAB_VERSION", "legacy")
+
+LEGACY_IDX_TO_UCI, LEGACY_UCI_TO_IDX = _build_legacy_vocab()
+LEGACY_VOCAB_SIZE = len(LEGACY_IDX_TO_UCI)
+
+COMPACT_IDX_TO_UCI, COMPACT_UCI_TO_IDX = _build_compact_vocab()
+COMPACT_VOCAB_SIZE = len(COMPACT_IDX_TO_UCI)
+
+if _VOCAB_VERSION == "compact":
+    IDX_TO_UCI, UCI_TO_IDX = COMPACT_IDX_TO_UCI, COMPACT_UCI_TO_IDX
+else:
+    IDX_TO_UCI, UCI_TO_IDX = LEGACY_IDX_TO_UCI, LEGACY_UCI_TO_IDX
+
 VOCAB_SIZE = len(IDX_TO_UCI)
+
+
+def legacy_to_compact_map() -> dict[int, int]:
+    """Return {legacy_idx: compact_idx} for moves that exist in both vocabs."""
+    return {LEGACY_UCI_TO_IDX[m]: COMPACT_UCI_TO_IDX[m]
+            for m in COMPACT_UCI_TO_IDX if m in LEGACY_UCI_TO_IDX}
 
 
 def move_to_index(move: chess.Move) -> int:
