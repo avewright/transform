@@ -1,123 +1,0 @@
-Uploading the dataset shards:   0%|          | 0/1 [00:00<?, ? shards/s]
-Creating parquet from Arrow format:   0%|          | 0/48 [00:00<?, ?ba/s][A
-Creating parquet from Arrow format:   2%|2         | 1/48 [00:00<00:12,  3.83ba/s][A
-Creating parquet from Arrow format:   4%|4         | 2/48 [00:00<00:12,  3.66ba/s][A
-Creating parquet from Arrow format:   6%|6         | 3/48 [00:00<00:12,  3.68ba/s][A
-Creating parquet from Arrow format:   8%|8         | 4/48 [00:01<00:12,  3.57ba/s][A
-Creating parquet from Arrow format:  10%|#         | 5/48 [00:01<00:12,  3.57ba/s][A
-Creating parquet from Arrow format:  12%|#2        | 6/48 [00:01<00:12,  3.49ba/s][A
-Creating parquet from Arrow format:  15%|#4        | 7/48 [00:01<00:11,  3.52ba/s][A
-Creating parquet from Arrow format:  17%|#6        | 8/48 [00:02<00:11,  3.48ba/s][A
-Creating parquet from Arrow format:  19%|#8        | 9/48 [00:02<00:11,  3.50ba/s][A
-Creating parquet from Arrow format:  21%|##        | 10/48 [00:02<00:10,  3.49ba/s][A
-Creating parquet from Arrow format:  23%|##2       | 11/48 [00:03<00:10,  3.57ba/s][A
-Creating parquet from Arrow format:  25%|##5       | 12/48 [00:03<00:10,  3.56ba/s][A
-Creating parquet from Arrow format:  27%|##7       | 13/48 [00:03<00:10,  3.47ba/s][A
-Creating parquet from Arrow format:  29%|##9       | 14/48 [00:03<00:09,  3.52ba/s][A
-Creating parquet from Arrow format:  31%|###1      | 15/48 [00:04<00:09,  3.45ba/s][A
-Creating parquet from Arrow format:  33%|###3      | 16/48 [00:04<00:09,  3.44ba/s][A
-Creating parquet from Arrow format:  35%|###5      | 17/48 [00:04<00:08,  3.47ba/s][A
-Creating parquet from Arrow format:  38%|###7      | 18/48 [00:05<00:08,  3.39ba/s][A
-Creating parquet from Arrow format:  40%|###9      | 19/48 [00:05<00:08,  3.44ba/s][A
-Creating parquet from Arrow format:  42%|####1     | 20/48 [00:05<00:08,  3.42ba/s][A
-Creating parquet from Arrow format:  44%|####3     | 21/48 [00:06<00:07,  3.40ba/s][A
-Creating parquet from Arrow format:  46%|####5     | 22/48 [00:06<00:07,  3.40ba/s][A
-Creating parquet from Arrow format:  48%|####7     | 23/48 [00:06<00:07,  3.33ba/s][A
-Creating parquet from Arrow format:  50%|#####     | 24/48 [00:06<00:07,  3.36ba/s][A
-Creating parquet from Arrow format:  52%|#####2    | 25/48 [00:07<00:06,  3.38ba/s][A
-Creating parquet from Arrow format:  54%|#####4    | 26/48 [00:07<00:06,  3.48ba/s][A
-Creating parquet from Arrow format:  56%|#####6    | 27/48 [00:07<00:06,  3.49ba/s][A
-Creating parquet from Arrow format:  58%|#####8    | 28/48 [00:08<00:05,  3.46ba/s][A
-Creating parquet from Arrow format:  60%|######    | 29/48 [00:08<00:05,  3.53ba/s][A
-Creating parquet from Arrow format:  62%|######2   | 30/48 [00:08<00:05,  3.52ba/s][A
-Creating parquet from Arrow format:  65%|######4   | 31/48 [00:08<00:04,  3.58ba/s][A
-Creating parquet from Arrow format:  67%|######6   | 32/48 [00:09<00:04,  3.59ba/s][A
-Creating parquet from Arrow format:  69%|######8   | 33/48 [00:09<00:04,  3.52ba/s][A
-Creating parquet from Arrow format:  71%|#######   | 34/48 [00:09<00:04,  3.48ba/s][A
-Creating parquet from Arrow format:  73%|#######2  | 35/48 [00:10<00:03,  3.47ba/s][A
-Creating parquet from Arrow format:  75%|#######5  | 36/48 [00:10<00:03,  3.45ba/s][A
-Creating parquet from Arrow format:  77%|#######7  | 37/48 [00:10<00:03,  3.47ba/s][A
-Creating parquet from Arrow format:  79%|#######9  | 38/48 [00:10<00:02,  3.42ba/s][A
-Creating parquet from Arrow format:  81%|########1 | 39/48 [00:11<00:02,  3.47ba/s][A
-Creating parquet from Arrow format:  83%|########3 | 40/48 [00:11<00:02,  3.47ba/s][A
-Creating parquet from Arrow format:  85%|########5 | 41/48 [00:11<00:02,  3.43ba/s][A
-Creating parquet from Arrow format:  88%|########7 | 42/48 [00:12<00:01,  3.46ba/s][A
-Creating parquet from Arrow format:  90%|########9 | 43/48 [00:12<00:01,  3.53ba/s][A
-Creating parquet from Arrow format:  92%|#########1| 44/48 [00:12<00:01,  3.43ba/s][A
-Creating parquet from Arrow format:  94%|#########3| 45/48 [00:12<00:00,  3.47ba/s][A
-Creating parquet from Arrow format:  96%|#########5| 46/48 [00:13<00:00,  3.50ba/s][A
-Creating parquet from Arrow format:  98%|#########7| 47/48 [00:13<00:00,  3.62ba/s][A
-Creating parquet from Arrow format: 100%|##########| 48/48 [00:13<00:00,  4.18ba/s][ACreating parquet from Arrow format: 100%|##########| 48/48 [00:13<00:00,  3.52ba/s]
-Processing Files (0 / 0)      : |          |  0.00B /  0.00B            
-New Data Upload               : |          |  0.00B /  0.00B            [A
-
-                              :  10%|#         |  533kB / 5.20MB            [A[A
-
-                              :  10%|#         |  533kB / 5.20MB            [A[AProcessing Files (0 / 1)      :  10%|#         |  533kB / 5.20MB,  177kB/s  
-New Data Upload               :  10%|#         |  533kB / 5.20MB,  177kB/s  [A
-
-                              :  92%|#########2| 4.80MB / 5.20MB            [A[AProcessing Files (0 / 1)      :  92%|#########2| 4.80MB / 5.20MB, 1.50MB/s  
-New Data Upload               :  92%|#########2| 4.80MB / 5.20MB, 1.50MB/s  [A
-
-                              :  92%|#########2| 4.80MB / 5.20MB            [A[A
-
-                              : 100%|##########| 5.20MB / 5.20MB            [A[AProcessing Files (1 / 1)      : 100%|##########| 5.20MB / 5.20MB, 1.44MB/s  
-New Data Upload               : 100%|##########| 5.20MB / 5.20MB, 1.44MB/s  [A
-
-                              : 100%|##########| 5.20MB / 5.20MB            [A[A
-
-                              : 100%|##########| 5.20MB / 5.20MB            [A[AProcessing Files (1 / 1)      : 100%|##########| 5.20MB / 5.20MB, 1.37MB/s  
-New Data Upload               : 100%|##########| 5.20MB / 5.20MB, 1.37MB/s  
-                              : 100%|##########| 5.20MB / 5.20MB            
-Uploading the dataset shards: 100%|##########| 1/1 [02:38<00:00, 158.04s/ shard Uploading the dataset shards: 100%|##########| 1/1 [02:38<00:00, 158.04s/ shards]
-Uploading the dataset shards:   0%|          | 0/1 [00:00<?, ? shards/s]
-Creating parquet from Arrow format:   0%|          | 0/3 [00:00<?, ?ba/s][A
-Creating parquet from Arrow format:  33%|###3      | 1/3 [00:00<00:00,  4.28ba/s][A
-Creating parquet from Arrow format:  67%|######6   | 2/3 [00:00<00:00,  4.26ba/s][A
-Creating parquet from Arrow format: 100%|##########| 3/3 [00:00<00:00,  5.23ba/s][ACreating parquet from Arrow format: 100%|##########| 3/3 [00:00<00:00,  4.92ba/s]
-Processing Files (0 / 0)      : |          |  0.00B /  0.00B            
-New Data Upload               : |          |  0.00B /  0.00B            [A
-
-                              : 100%|##########|  281kB /  281kB            [A[A
-
-                              : 100%|##########|  281kB /  281kB            [A[AProcessing Files (1 / 1)      : 100%|##########|  281kB /  281kB,  682kB/s  
-New Data Upload               : 100%|##########|  281kB /  281kB,  682kB/s  [A
-
-                              : 100%|##########|  281kB /  281kB            [A[A
-
-                              : 100%|##########|  281kB /  281kB            [A[AProcessing Files (1 / 1)      : 100%|##########|  281kB /  281kB,  458kB/s  
-New Data Upload               : 100%|##########|  281kB /  281kB,  458kB/s  
-                              : 100%|##########|  281kB /  281kB            
-Uploading the dataset shards: 100%|##########| 1/1 [00:02<00:00,  2.12s/ shards]Uploading the dataset shards: 100%|##########| 1/1 [00:02<00:00,  2.12s/ shards]
-Traceback (most recent call last):
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\huggingface_hub\utils\_http.py", line 402, in hf_raise_for_status
-    response.raise_for_status()
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\requests\models.py", line 1026, in raise_for_status
-    raise HTTPError(http_error_msg, response=self)
-requests.exceptions.HTTPError: 412 Client Error: Precondition Failed for url: https://huggingface.co/api/datasets/avewright/chess-positions/commit/main
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "C:\Users\AWright\OneDrive - Kahua, Inc\Projects\transform\build_dataset.py", line 689, in <module>
-    main()
-  File "C:\Users\AWright\OneDrive - Kahua, Inc\Projects\transform\build_dataset.py", line 682, in main
-    upload_to_hf(records, args.repo, HF_TOKEN, append=not args.no_append)
-  File "C:\Users\AWright\OneDrive - Kahua, Inc\Projects\transform\build_dataset.py", line 592, in upload_to_hf
-    ds_dict.push_to_hub(
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\datasets\dataset_dict.py", line 1886, in push_to_hub
-    commit_info = api.create_commit(
-                  ^^^^^^^^^^^^^^^^^^
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\huggingface_hub\utils\_validators.py", line 114, in _inner_fn
-    return fn(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\huggingface_hub\hf_api.py", line 1687, in _inner
-    return fn(self, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\huggingface_hub\hf_api.py", line 4321, in create_commit
-    hf_raise_for_status(commit_resp, endpoint_name="commit")
-  File "C:\Users\AWright\AppData\Roaming\Python\Python312\site-packages\huggingface_hub\utils\_http.py", line 475, in hf_raise_for_status
-    raise _format(HfHubHTTPError, str(e), response) from e
-huggingface_hub.errors.HfHubHTTPError: 412 Client Error: Precondition Failed for url: https://huggingface.co/api/datasets/avewright/chess-positions/commit/main (Request ID: Root=1-69c023dc-3b7a36b274a00b0472e3bcea;a0e74536-fdd7-4255-8e38-db98c6c5851b)
-
-A commit has happened since. Please refresh and try again.

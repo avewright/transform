@@ -9,8 +9,10 @@ Two vocab versions:
     checkpoints trained before April 2026.
   - COMPACT (1968): only geometrically reachable moves (ray, knight,
     pawn promotions). ~2.8× smaller output head.  Use for new training
-    runs via MOVE_VOCAB_VERSION=compact env var or by importing
-    COMPACT_* symbols directly.
+    runs via MOVE_VOCAB_VERSION=legacy env var or by importing
+    LEGACY_* symbols directly.
+
+Default is COMPACT (1968 moves) for all new training runs.
 """
 
 import os
@@ -70,9 +72,9 @@ def _build_compact_vocab() -> tuple[list[str], dict[str, int]]:
     return move_list, {m: i for i, m in enumerate(move_list)}
 
 
-# ── Select active vocab based on env var (default: legacy for compat) ──
+# ── Select active vocab based on env var (default: compact for new runs) ──
 
-_VOCAB_VERSION = os.environ.get("MOVE_VOCAB_VERSION", "legacy")
+_VOCAB_VERSION = os.environ.get("MOVE_VOCAB_VERSION", "compact")
 
 LEGACY_IDX_TO_UCI, LEGACY_UCI_TO_IDX = _build_legacy_vocab()
 LEGACY_VOCAB_SIZE = len(LEGACY_IDX_TO_UCI)

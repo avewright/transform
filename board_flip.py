@@ -106,6 +106,21 @@ def flip_ep_square(ep_square: torch.Tensor) -> torch.Tensor:
     return ep_square  # File-based EP doesn't need flipping
 
 
+def flip_move_targets(
+    move_targets: torch.Tensor,
+    turn: torch.Tensor,
+    flip_move_table: torch.Tensor,
+) -> torch.Tensor:
+    """Flip move indices for Black-to-move rows (pairs with STM board encoder)."""
+    black = turn == 1
+    if not black.any():
+        return move_targets
+    out = move_targets.clone()
+    table = flip_move_table.to(move_targets.device)
+    out[black] = table[move_targets[black]]
+    return out
+
+
 def flip_batch(batch_input: dict, move_targets: torch.Tensor,
                flip_move_table: torch.Tensor) -> tuple:
     """Flip positions where Black is to move.

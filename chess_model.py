@@ -25,7 +25,9 @@ from chess_features import (
     NUM_PIECE_TYPES, NUM_COLORS, NUM_CASTLING_STATES, NUM_EP_STATES,
     NUM_FUSED_TOKENS,
 )
+from board_flip import flip_board_array, flip_castling
 from move_vocab import VOCAB_SIZE, legal_move_mask, move_to_index, index_to_move
+from chess_features import fused_ids_to_planes
 
 
 class ResidualBlock(nn.Module):
@@ -244,6 +246,100 @@ class FusedBoardEncoder(nn.Module):
         return batch_boards_to_fused_token_ids(boards, device)
 
 
+class StrengthenedBoardEncoder(nn.Module):
+    """STM-normalized fused encoder + 2-layer spatial conv stem.
+
+    - Side-to-move flip: Black positions are rank-flipped in-place; turn→0.
+    - Per square: fused piece-color embed + square embed + conv local features.
+    - Context tokens: turn (0 after STM), castling, en passant file.
+
+    Output: (B, 67, embed_dim)
+    """
+
+    NUM_CONTEXT = 3
+
+    def __init__(
+        self,
+        embed_dim: int = 384,
+        conv_blocks: int = 2,
+        normalize_stm: bool = True,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.normalize_stm = normalize_stm
+
+        self.piece_color_embed = nn.Embedding(NUM_FUSED_TOKENS, embed_dim)
+        self.square_embed = nn.Embedding(64, embed_dim)
+        self.turn_embed = nn.Embedding(2, embed_dim)
+        self.castling_embed = nn.Embedding(NUM_CASTLING_STATES, embed_dim)
+        self.ep_embed = nn.Embedding(NUM_EP_STATES, embed_dim)
+
+        self.plane_conv = nn.Sequential(
+            nn.Conv2d(NUM_FUSED_TOKENS, embed_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.SiLU(),
+        )
+        self.conv_blocks = nn.Sequential(
+            *[ResidualBlock(embed_dim) for _ in range(conv_blocks)]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _apply_stm(
+        self,
+        fused_ids: torch.Tensor,
+        castling: torch.Tensor,
+        turn: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flip Black-to-move positions to side-to-move perspective."""
+        if not self.normalize_stm:
+            return fused_ids, castling, turn
+
+        black = turn == 1
+        if not black.any():
+            return fused_ids, castling, turn
+
+        fused = fused_ids.clone()
+        castle = castling.clone()
+        out_turn = turn.clone()
+
+        if black.all():
+            fused = flip_board_array(fused)
+            castle = flip_castling(castle)
+            out_turn = torch.zeros_like(turn)
+        else:
+            fused[black] = flip_board_array(fused[black])
+            castle[black] = flip_castling(castle[black])
+            out_turn[black] = 0
+
+        return fused, castle, out_turn
+
+    def forward(self, token_ids: dict[str, torch.Tensor]) -> torch.Tensor:
+        fused_ids, castling, turn = self._apply_stm(
+            token_ids["fused_ids"],
+            token_ids["castling"],
+            token_ids["turn"],
+        )
+
+        sq_idx = torch.arange(64, device=fused_ids.device)
+        sq_emb = self.piece_color_embed(fused_ids) + self.square_embed(sq_idx)
+
+        conv_feat = self.conv_blocks(self.plane_conv(fused_ids_to_planes(fused_ids)))
+        sq_emb = sq_emb + conv_feat.view(fused_ids.shape[0], self.embed_dim, 64).permute(0, 2, 1)
+
+        turn_tok = self.turn_embed(turn).unsqueeze(1)
+        castle_tok = self.castling_embed(castling).unsqueeze(1)
+        ep_tok = self.ep_embed(token_ids["ep_file"]).unsqueeze(1)
+
+        tokens = torch.cat([turn_tok, castle_tok, ep_tok, sq_emb], dim=1)
+        return self.norm(tokens)
+
+    def prepare_input(self, board: chess.Board, device: torch.device):
+        return batch_boards_to_fused_token_ids([board], device)
+
+    def prepare_batch(self, boards: list[chess.Board], device: torch.device):
+        return batch_boards_to_fused_token_ids(boards, device)
+
+
 class ChessRelativeBias(nn.Module):
     """Chess-aware relative geometry bias for attention.
 
@@ -382,11 +478,14 @@ class ChessModel(nn.Module):
             nn.Linear(self.hidden_size, VOCAB_SIZE),
         )
 
-        # Value head: scalar evaluation
+        # Value head: White-absolute WDL
+        # Output: [P(White wins), P(draw), P(White loses)]
+        # Board is always oriented from White's side.
+        # When Black makes a strong move (bad for White), P(W wins) → 0.
         self.value_head = nn.Sequential(
             nn.Linear(self.hidden_size, 256),
             nn.ReLU(),
-            nn.Linear(256, 3),  # White-absolute: [P(W wins), P(draw), P(W loses)]
+            nn.Linear(256, 3),
         )
 
     def forward(

@@ -5,6 +5,16 @@ Provides a unified loader that:
 2. Falls back to HF streaming dataset
 3. Falls back to raw parquet (builds cache for next time)
 
+Board orientation: ALWAYS White's perspective. Rank 1 (White's home rank)
+is at row index 0. Piece IDs are absolute (1-6 = White P..K, 7-12 = Black
+p..k) regardless of whose turn it is. No board flipping is applied —
+the model always sees the board from the same (White) side.
+
+Value convention: WDL is ALWAYS White-absolute. wdl[:,0] = P(White wins),
+wdl[:,1] = P(draw), wdl[:,2] = P(White loses). Stockfish cp/mate values
+(which are from side-to-move perspective) are negated for Black-to-move
+positions before WDL conversion.
+
 All experiments should use this instead of hand-rolling data loading.
 
 Usage:
@@ -488,8 +498,33 @@ def _build_from_hf(n_total, seed):
 
 # ── WDL conversion ──
 
-def compute_wdl(cp, mate):
-    """Vectorized WDL from cp/mate tensors. Returns (N, 3) float tensor."""
+def compute_wdl(cp, mate, turn=None):
+    """Vectorized WDL from cp/mate tensors. Returns (N, 3) float tensor.
+
+    Always returns White-absolute WDL:
+        wdl[:, 0] = P(White wins)
+        wdl[:, 1] = P(draw)
+        wdl[:, 2] = P(White loses)
+
+    Stockfish cp/mate values are from side-to-move perspective (positive = good
+    for the side to move). When turn is provided, Black-to-move positions have
+    their cp/mate negated so the resulting WDL is White-absolute.
+
+    Args:
+        cp: (N,) int/float tensor of centipawn values (STM perspective)
+        mate: (N,) int tensor of mate-in-N (STM perspective)
+        turn: (N,) int tensor, 0=White, 1=Black. If None, cp/mate are assumed
+              to already be White-absolute.
+    """
+    # Negate for Black-to-move positions → White-absolute
+    if turn is not None:
+        black_mask = (turn == 1)
+        if black_mask.any():
+            cp = cp.clone()
+            mate = mate.clone()
+            cp[black_mask] = -cp[black_mask]
+            mate[black_mask] = -mate[black_mask]
+
     N = cp.shape[0]
     wdl = torch.zeros(N, 3)
 
@@ -578,7 +613,8 @@ def load_training_data(
     t0 = time.time()
     eval_data = []
     eval_surviving = []  # track which indices successfully built
-    eval_wdl = compute_wdl(raw["cp"][:n_eval_actual], raw["mate"][:n_eval_actual])
+    eval_wdl = compute_wdl(raw["cp"][:n_eval_actual], raw["mate"][:n_eval_actual],
+                             raw["turn"][:n_eval_actual])
     eval_phases = compute_phase(eval_fens)
 
     for i in range(n_eval_actual):
@@ -619,6 +655,7 @@ def load_training_data(
         "wdl": compute_wdl(
             raw["cp"][n_eval_actual:n_eval_actual + n_train_actual],
             raw["mate"][n_eval_actual:n_eval_actual + n_train_actual],
+            raw["turn"][n_eval_actual:n_eval_actual + n_train_actual],
         ),
     }
 
@@ -940,7 +977,7 @@ def build_eval_from_pretokenized(eval_path, encoder_type="fused"):
     n = raw["board_array"].shape[0]
     fens = raw["fen"]
     move_idxs = raw["move_idx"]
-    wdl = compute_wdl(raw["cp"], raw["mate"])
+    wdl = compute_wdl(raw["cp"], raw["mate"], raw.get("turn"))
     phases = compute_phase(fens)
 
     eval_data = []
@@ -1109,7 +1146,8 @@ def build_eval_from_hf(repo_id, n_eval=5000, encoder_type="fused"):
     arr_buf = np.zeros(64, dtype=np.int8)
     eval_data = []
     surviving = []
-    wdl = compute_wdl(torch.tensor(raw["cp"][:n]), torch.tensor(raw["mate"][:n]))
+    wdl = compute_wdl(torch.tensor(raw["cp"][:n]), torch.tensor(raw["mate"][:n]),
+                       torch.tensor(raw["turn"][:n]))
 
     for i in range(n):
         try:
@@ -1395,7 +1433,7 @@ class StreamingHFChessLoader:
             castling = torch.from_numpy(raw["castling"]).long()
             ep_file = ep_square_to_file(torch.from_numpy(raw["ep_square"]).long())
             move_idx = torch.from_numpy(raw["move_idx"]).long()
-            wdl = compute_wdl(torch.from_numpy(raw["cp"]), torch.from_numpy(raw["mate"]))
+            wdl = compute_wdl(torch.from_numpy(raw["cp"]), torch.from_numpy(raw["mate"]), turn)
             del raw
 
             # Shuffle within file (deterministic per file index)
@@ -1630,7 +1668,7 @@ class ShardedChessLoader:
             castling_t = shard_ca.long()
             ep_file = ep_square_to_file(shard_ep.long())
             move_idx = shard_mi.long()
-            wdl = compute_wdl(shard["cp"], shard["mate"])
+            wdl = compute_wdl(shard["cp"], shard["mate"], turn)
             cp_vals = shard["cp"].float() if self.include_cp else None
             mate_vals = shard["mate"].long() if self.include_mate else None
             del shard, shard_ba, shard_mi, shard_ca, shard_ep
@@ -1673,6 +1711,123 @@ class ShardedChessLoader:
                        wdl[idx].float().to(self.device))
 
             del fused, turn, castling_t, ep_file, move_idx, wdl, cp_vals, mate_vals
+
+
+def stream_hf_batches(
+    batch_size: int,
+    device,
+    seed: int = 42,
+    shuffle_buffer: int = 8192,
+    min_depth: int = 0,
+):
+    """RAM-efficient HF streaming: yields training minibatches without full cache.
+
+    Keeps at most ``shuffle_buffer`` rows in CPU memory at once.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError("pip install datasets") from exc
+
+    ds = load_dataset(HF_DATASET, split="train", streaming=True)
+    ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    ds_iter = iter(ds)
+
+    def _row_to_tensors(row):
+        if "board_array" in row:
+            ba = torch.tensor(row["board_array"], dtype=torch.int8).unsqueeze(0)
+            turn = torch.tensor([row["turn"]], dtype=torch.int8)
+            castling = torch.tensor([row["castling"]], dtype=torch.int8)
+            ep_sq = torch.tensor([row["ep_square"]], dtype=torch.int8)
+            move_idx = torch.tensor([row["move_idx"]], dtype=torch.long)
+            cp = torch.tensor([row["cp"]], dtype=torch.int32)
+            mate = torch.tensor([row["mate"]], dtype=torch.int32)
+            depth = int(row.get("depth", 99))
+        else:
+            fen = row["fen"]
+            best_uci = row["best_move"]
+            if best_uci not in UCI_TO_IDX:
+                return None
+            board = chess.Board(fen)
+            move = chess.Move.from_uci(best_uci)
+            if move not in board.legal_moves:
+                return None
+            arr = [0] * 64
+            for sq, piece in board.piece_map().items():
+                arr[sq] = piece.piece_type if piece.color == chess.WHITE else piece.piece_type + 6
+            ba = torch.tensor([arr], dtype=torch.int8)
+            turn = torch.tensor([0 if board.turn == chess.WHITE else 1], dtype=torch.int8)
+            castling = torch.tensor([0], dtype=torch.int8)
+            if board.has_kingside_castling_rights(chess.WHITE):
+                castling[0] |= 1
+            if board.has_queenside_castling_rights(chess.WHITE):
+                castling[0] |= 2
+            if board.has_kingside_castling_rights(chess.BLACK):
+                castling[0] |= 4
+            if board.has_queenside_castling_rights(chess.BLACK):
+                castling[0] |= 8
+            ep_sq = torch.tensor(
+                [board.ep_square if board.ep_square is not None else 0], dtype=torch.int8)
+            move_idx = torch.tensor([UCI_TO_IDX[best_uci]], dtype=torch.long)
+            cp = torch.tensor([int(row.get("eval_value", 0))], dtype=torch.int32)
+            mate = torch.tensor([0], dtype=torch.int32)
+            depth = int(row.get("depth", 99))
+
+        if depth < min_depth:
+            return None
+
+        fused = board_array_to_fused(ba)
+        turn_l = turn.long()
+        wdl = compute_wdl(cp, mate, turn)
+        batch_input = {
+            "fused_ids": fused,
+            "turn": turn_l,
+            "castling": castling.long(),
+            "ep_file": ep_square_to_file(ep_sq.long()),
+        }
+        return batch_input, move_idx.squeeze(0), wdl.squeeze(0)
+
+    pending_input: dict[str, list[torch.Tensor]] = {
+        "fused_ids": [], "turn": [], "castling": [], "ep_file": [],
+    }
+    pending_moves: list[torch.Tensor] = []
+    pending_wdl: list[torch.Tensor] = []
+
+    while True:
+        try:
+            row = next(ds_iter)
+        except StopIteration:
+            ds = load_dataset(HF_DATASET, split="train", streaming=True)
+            ds = ds.shuffle(seed=seed + 1, buffer_size=shuffle_buffer)
+            ds_iter = iter(ds)
+            continue
+
+        parsed = _row_to_tensors(row)
+        if parsed is None:
+            continue
+        batch_input, move_t, wdl_t = parsed
+        pending_input["fused_ids"].append(batch_input["fused_ids"])
+        pending_input["turn"].append(batch_input["turn"])
+        pending_input["castling"].append(batch_input["castling"])
+        pending_input["ep_file"].append(batch_input["ep_file"])
+        pending_moves.append(move_t)
+        pending_wdl.append(wdl_t)
+
+        if len(pending_moves) < batch_size:
+            continue
+
+        out = {
+            "fused_ids": torch.cat(pending_input["fused_ids"], dim=0).to(device),
+            "turn": torch.cat(pending_input["turn"], dim=0).to(device),
+            "castling": torch.cat(pending_input["castling"], dim=0).to(device),
+            "ep_file": torch.cat(pending_input["ep_file"], dim=0).to(device),
+        }
+        moves = torch.stack(pending_moves).to(device)
+        wdl = torch.stack(pending_wdl).float().to(device)
+        pending_input = {k: [] for k in pending_input}
+        pending_moves = []
+        pending_wdl = []
+        yield out, moves, wdl
 
 
 # ── CLI: Build cache manually ──
