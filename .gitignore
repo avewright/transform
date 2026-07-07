@@ -41,3 +41,9 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local archive / generated logs (optional regen)
+archive/scratch/*.txt
+*.log
+build_*.txt
+unsloth_compiled_cache/

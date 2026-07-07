@@ -105,53 +105,7 @@ class ChessTransformer200M(nn.Module):
         }
 
 
-# ---- Inference helpers ----
-
-def encode_board(board: chess.Board, device: torch.device) -> dict[str, torch.Tensor]:
-    """Encode a single board for model input (batched with B=1)."""
-    from chess_features import batch_boards_to_fused_token_ids
-    return batch_boards_to_fused_token_ids([board], device)
-
-
-@torch.no_grad()
-def get_model_move(model, board: chess.Board, device: torch.device,
-                   temperature: float = 0.0) -> tuple[chess.Move, dict]:
-    """Get the model's move for a position.
-
-    Returns (move, info_dict) where info has top moves, WDL, etc.
-    """
-    board_input = encode_board(board, device)
-    result = model(board_input)
-
-    logits = result["policy_logits"][0].float()
-    mask = legal_move_mask(board).to(device)
-    logits[~mask] = float("-inf")
-
-    if temperature <= 0:
-        # Greedy
-        move_idx = logits.argmax().item()
-    else:
-        probs = F.softmax(logits / temperature, dim=-1)
-        move_idx = torch.multinomial(probs, 1).item()
-
-    move = index_to_move(move_idx)
-
-    # Top 5 moves for display
-    probs = F.softmax(logits, dim=-1)
-    topk = torch.topk(probs, min(5, mask.sum().item()))
-    top_moves = []
-    for idx, p in zip(topk.indices.tolist(), topk.values.tolist()):
-        top_moves.append((IDX_TO_UCI[idx], f"{p*100:.1f}%"))
-
-    # WDL evaluation
-    wdl_logits = result["value_logits"][0].float()
-    wdl_probs = F.softmax(wdl_logits, dim=-1).tolist()
-
-    # Model WDL is White-absolute: idx0=P(W wins), idx1=P(draw), idx2=P(W loses)
-    return move, {
-        "top_moves": top_moves,
-        "wdl": {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]},
-    }
+from chess_inference import get_model_move, load_checkpoint, resolve_checkpoint
 
 
 # ---- Display ----
@@ -201,32 +155,20 @@ def print_wdl(wdl: dict, model_is_white: bool):
 
 # ---- Main game loop ----
 
-def load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
-    """Load the ChessTransformer200M from a checkpoint."""
-    print(f"Loading model from {checkpoint_path}...")
-    model = ChessTransformer200M()
-
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    # Handle both raw state_dict and wrapped checkpoint formats
-    if "model_state_dict" in state:
-        state = state["model_state_dict"]
-
-    # Strip torch.compile _orig_mod. prefix if present
-    state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-
-    model.load_state_dict(state)
-    model = model.to(device)
-    model.eval()
+def load_model(checkpoint_path: str | None, device: torch.device):
+    """Load a ChessTransformer checkpoint for play."""
+    path = resolve_checkpoint(checkpoint_path)
+    print(f"Loading model from {path}...")
+    model = load_checkpoint(path, device)
     print(f"Model loaded ({sum(p.numel() for p in model.parameters()) / 1e6:.0f}M params) on {device}")
     return model
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Play chess against ChessTransformer200M")
-    parser.add_argument("--checkpoint", "-c", type=str,
-                        default="outputs/exp073_200m_full_epoch/best_model.pt",
-                        help="Path to model checkpoint")
+    parser = argparse.ArgumentParser(description="Play chess against ChessTransformer")
+    parser.add_argument("--checkpoint", "-c", type=str, default=None,
+                        help="Path to model checkpoint (default: exp182 latest)")
     parser.add_argument("--device", "-d", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--temperature", "-t", type=float, default=0.0,
                         help="Sampling temperature (0 = greedy)")
@@ -243,7 +185,7 @@ def main():
     human_is_white = args.play_as in ("white", "w")
 
     print("\n" + "=" * 50)
-    print("  CHESS — You vs ChessTransformer200M (204M)")
+    print("  CHESS — You vs ChessTransformer (exp182)")
     print("=" * 50)
     print(f"  You play: {'White' if human_is_white else 'Black'}")
     print(f"  Temperature: {args.temperature}")

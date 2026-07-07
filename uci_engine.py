@@ -36,7 +36,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chess_features import batch_boards_to_fused_token_ids
-from chess_transformer_factory import build_model, ChessTransformerConfig
+from chess_inference import load_checkpoint, resolve_checkpoint
 from move_vocab import (VOCAB_SIZE, index_to_move, legal_move_mask,
                         move_to_index, UCI_TO_IDX,
                         _CASTLE_STD_TO_960)
@@ -184,25 +184,12 @@ class MCTSSearch:
         self._tt_hits = 0
 
     def _fp16_safe_forward(self, inp):
-        """Run backbone in FP16 for speed, heads in FP32 for precision.
-
-        Policy logits are ~2000+ magnitude where FP16 precision is ±2,
-        causing near-uniform softmax output. Heads must stay FP32.
-        """
-        m = self.model
-        with torch.amp.autocast('cuda'):
-            hidden = m.input_proj(m.encoder(inp))
-            B = hidden.shape[0]
-            hidden = torch.cat([m.cls_token.expand(B, -1, -1), hidden], dim=1)
-            if m.pos_embed is not None:
-                hidden = hidden + m.pos_embed
-            hidden = m.norm(m.transformer(hidden))
-        # Cast to FP32 before heads to preserve policy logit precision
-        hidden = hidden.float()
-        cls_hidden = hidden[:, 0, :]
+        """FP16 trunk + FP32 heads for stable policy logits."""
+        with torch.amp.autocast("cuda", enabled=self.use_fp16):
+            out = self.model(inp)
         return {
-            "policy_logits": m.policy_head(hidden, cls_hidden),
-            "value_logits": m.value_head(cls_hidden),
+            "policy_logits": out["policy_logits"].float(),
+            "value_logits": out["value_logits"].float(),
         }
 
     @torch.no_grad()
@@ -797,15 +784,7 @@ class UCIEngine:
         self._load_model()
 
     def _load_model(self):
-        self.model = build_model()
-        ckpt = torch.load(self.checkpoint_path, map_location=DEVICE,
-                          weights_only=False)
-        state = ckpt.get("model_state_dict", ckpt)
-        self.model.load_state_dict(
-            {k.replace("_orig_mod.", ""): v for k, v in state.items()})
-        self.model = self.model.to(DEVICE)
-        self.model.eval()
-
+        self.model = load_checkpoint(self.checkpoint_path, DEVICE)
         self.search = MCTSSearch(
             self.model, DEVICE, self.syzygy,
             c_puct=2.5, batch_size=8,
@@ -1056,6 +1035,7 @@ class UCIEngine:
 def find_checkpoint():
     """Find the best model checkpoint."""
     candidates = [
+        ROOT / "outputs" / "exp182_pretrain_8gb" / "latest.pt",
         ROOT / "outputs" / "hf" / "chess-transformer-200m-latest" / "best_model.pt",
         ROOT / "outputs" / "hf_checkpoint" / "best_model.pt",
         Path.home() / ".cache" / "huggingface" / "hub" /

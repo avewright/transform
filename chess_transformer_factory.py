@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import chess
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-from chess_model import FusedBoardEncoder, ChessRelativeBias
+from chess_model import FusedBoardEncoder, ChessRelativeBias, StrengthenedBoardEncoder
 from move_vocab import IDX_TO_UCI, VOCAB_SIZE
 
 
 @dataclass(frozen=True)
 class ChessTransformerConfig:
     encoder_dim: int = 256
+    encoder_type: str = "fused"  # "fused" | "strengthened"
+    encoder_conv_blocks: int = 2
+    normalize_stm: bool = False
     hidden_dim: int = 1024
     num_layers: int = 16
     num_heads: int = 16
@@ -29,6 +33,7 @@ class ChessTransformerConfig:
     n_value_classes: int = 3     # 3 for WDL, 128 for distributional HL-Gauss
     use_swiglu: bool = False       # SwiGLU gated FFN (Llama/Ruoss-style)
     use_rel_bias: bool = False     # Chess-aware relative geometry attention bias
+    gradient_checkpointing: bool = False
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ChessTransformerConfig":
@@ -47,6 +52,53 @@ CONFIG_16L_P256_NO_POS = ChessTransformerConfig(
     policy_head_dim=256,
     use_pos_embed=False,
 )
+# Deep-narrow ~700M for cloud GPUs (A100+). Do not train on 8GB laptops.
+DEFAULT_700M_CONFIG = ChessTransformerConfig(
+    encoder_dim=384,
+    encoder_type="strengthened",
+    encoder_conv_blocks=2,
+    normalize_stm=True,
+    hidden_dim=960,
+    num_layers=63,
+    num_heads=12,
+    ffn_ratio=4,
+    dropout=0.05,
+    policy_head_dim=512,
+    value_hidden=512,
+    use_pos_embed=False,
+    n_ctx_tokens=4,
+    value_head_type="cls",
+    n_value_classes=128,
+    use_swiglu=True,
+    use_rel_bias=True,
+    gradient_checkpointing=True,
+)
+
+# Deep-narrow ~309M for 8GB laptop: 96 thin layers, strengthened encoder, Muon-friendly.
+DEFAULT_8GB_CONFIG = ChessTransformerConfig(
+    encoder_dim=384,
+    encoder_type="strengthened",
+    encoder_conv_blocks=2,
+    normalize_stm=True,
+    hidden_dim=512,
+    num_layers=96,
+    num_heads=8,
+    ffn_ratio=4,
+    dropout=0.05,
+    policy_head_dim=384,
+    value_hidden=384,
+    use_pos_embed=False,
+    n_ctx_tokens=4,
+    value_head_type="cls",
+    n_value_classes=128,
+    use_swiglu=True,
+    use_rel_bias=True,
+    gradient_checkpointing=True,
+)
+
+# A100 80GB: 705M with grad ckpt (fits bs=64); 309M without ckpt (fast path).
+DEFAULT_A100_700M_CONFIG = DEFAULT_700M_CONFIG
+DEFAULT_A100_309M_CONFIG = replace(DEFAULT_8GB_CONFIG, gradient_checkpointing=False)
 
 
 def _build_move_square_indices():
@@ -164,7 +216,14 @@ class ChessTransformer(nn.Module):
     def __init__(self, config: ChessTransformerConfig):
         super().__init__()
         self.config = config
-        self.encoder = FusedBoardEncoder(embed_dim=config.encoder_dim)
+        if config.encoder_type == "strengthened":
+            self.encoder = StrengthenedBoardEncoder(
+                embed_dim=config.encoder_dim,
+                conv_blocks=config.encoder_conv_blocks,
+                normalize_stm=config.normalize_stm,
+            )
+        else:
+            self.encoder = FusedBoardEncoder(embed_dim=config.encoder_dim)
         self.input_proj = nn.Linear(config.encoder_dim, config.hidden_dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_dim) * 0.02)
         self.pos_embed = (
@@ -243,7 +302,13 @@ class ChessTransformer(nn.Module):
                     batch_size * nhead, hidden.shape[1], hidden.shape[1]
                 )
             for layer in self.layers:
-                hidden = layer(hidden, attn_bias=attn_bias)
+                if self.config.gradient_checkpointing and self.training:
+                    hidden = checkpoint(
+                        layer, hidden, attn_bias,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden = layer(hidden, attn_bias=attn_bias)
         else:
             hidden = self.transformer(hidden)
 

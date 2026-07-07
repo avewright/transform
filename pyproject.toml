@@ -21,8 +21,25 @@ dev = [
     "ruff",
     "ipython",
 ]
+muon = [
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+]
 stockfish = [
     "stockfish",  # python wrapper for stockfish engine
+]
+peft = [
+    "peft>=0.10",
+]
+unsloth = [
+    "unsloth",
+    "unsloth_zoo",
+    "peft>=0.10",
+    "bitsandbytes>=0.43",
+    "trl>=0.9",
+]
+qwen = [
+    "peft>=0.10",
+    "bitsandbytes>=0.43",
 ]
 
 [build-system]

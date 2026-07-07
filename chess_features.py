@@ -195,6 +195,18 @@ def board_to_fused_token_ids(board: chess.Board) -> dict[str, torch.Tensor]:
     }
 
 
+def fused_ids_to_planes(fused_ids: torch.Tensor) -> torch.Tensor:
+    """Convert fused square IDs to 13-channel spatial planes.
+
+    Args:
+        fused_ids: (B, 64) long — 0=empty, 1-6=white, 7-12=black
+    Returns:
+        (B, 13, 8, 8) float tensor
+    """
+    one_hot = torch.nn.functional.one_hot(fused_ids.long(), num_classes=NUM_FUSED_TOKENS).float()
+    return one_hot.permute(0, 2, 1).reshape(fused_ids.shape[0], NUM_FUSED_TOKENS, 8, 8)
+
+
 def batch_boards_to_fused_token_ids(
     boards: list[chess.Board],
     device: torch.device | None = None,
