@@ -103,6 +103,29 @@ def play_self_game(
     return positions, result
 
 
+def _sf_limit(cfg: SelfPlayConfig) -> chess.engine.Limit:
+    if cfg.sf_depth is not None:
+        return chess.engine.Limit(depth=cfg.sf_depth)
+    return chess.engine.Limit(time=cfg.sf_move_time)
+
+
+def _score_to_stm_q(score: chess.engine.PovScore | None, turn: chess.Color) -> float:
+    """Map SF score to side-to-move Q in [-1, 1]."""
+    if score is None:
+        return 0.0
+    pov = score.pov(turn)
+    if pov.is_mate():
+        mate = pov.mate()
+        if mate is None:
+            return 0.0
+        return 1.0 if mate > 0 else -1.0
+    cp = pov.score(mate_score=10000)
+    if cp is None:
+        return 0.0
+    # squash centipawns → [-1, 1]
+    return max(-1.0, min(1.0, cp / 400.0))
+
+
 def play_sf_game(
     mcts: MCTSSearch,
     cfg: SelfPlayConfig,
@@ -111,11 +134,13 @@ def play_sf_game(
     model_color: chess.Color,
     log_fn=print,
 ) -> tuple[list[dict], float]:
-    """Model (MCTS) vs Stockfish. Records model moves only."""
+    """Model (MCTS) vs Stockfish. Records model MCTS + optional SF moves."""
     board = chess.Board()
     _play_opening(board, OPENINGS[game_id % len(OPENINGS)])
     mcts.new_game()
     positions: list[dict] = []
+    n_mcts = n_sf = 0
+    limit = _sf_limit(cfg)
 
     while len(board.move_stack) < cfg.ply_cap:
         if should_adjudicate(board, len(board.move_stack)):
@@ -127,20 +152,34 @@ def play_sf_game(
             move, record = _mcts_move(mcts, board, cfg.mcts_sims)
             if record is not None:
                 record["game_id"] = game_id
+                record["source"] = "mcts"
                 positions.append(record)
+                n_mcts += 1
             board.push(move)
         else:
-            sf_move = engine.play(
-                board, chess.engine.Limit(time=cfg.sf_move_time),
-            ).move
-            if sf_move not in board.legal_moves:
+            fen_before = board.fen()
+            turn = board.turn
+            info = engine.play(board, limit, info=chess.engine.INFO_SCORE)
+            sf_move = info.move
+            if sf_move is None or sf_move not in board.legal_moves:
                 sf_move = next(iter(board.legal_moves))
+            if cfg.record_sf_moves:
+                positions.append({
+                    "fen": fen_before,
+                    "source": "sf",
+                    "chosen_move": move_to_index(sf_move),
+                    "root_q": _score_to_stm_q(info.info.get("score"), turn),
+                    "visit_dist": {move_to_index(sf_move): 1.0},
+                    "game_id": game_id,
+                    "sf_depth": cfg.sf_depth,
+                })
+                n_sf += 1
             board.push(sf_move)
 
     result = game_result(board, model_color)
     log_fn(
         f"  sf game {game_id + 1}: {'W' if model_color == chess.WHITE else 'B'} "
-        f"{len(board.move_stack)} ply, {len(positions)} pos, result={result:.1f}"
+        f"{len(board.move_stack)} ply, mcts={n_mcts} sf={n_sf}, result={result:.1f}"
     )
     return positions, result
 
@@ -214,11 +253,17 @@ def generate_positions(
     if cfg.mode == "sf":
         sf_path = resolve_stockfish()
         engine = chess.engine.SimpleEngine.popen_uci(str(sf_path))
-        engine.configure({
-            "UCI_LimitStrength": True,
-            "UCI_Elo": cfg.sf_elo,
-            "Threads": 1,
-        })
+        if cfg.sf_full_strength:
+            # Full strength; shallow depth keeps games fast.
+            engine.configure({"Threads": 2, "Hash": 256})
+            log_fn(f"  Stockfish FULL strength depth={cfg.sf_depth}")
+        else:
+            engine.configure({
+                "UCI_LimitStrength": True,
+                "UCI_Elo": cfg.sf_elo,
+                "Threads": 1,
+            })
+            log_fn(f"  Stockfish limited Elo={cfg.sf_elo}")
         try:
             for i in range(n):
                 color = chess.WHITE if i % 2 == 0 else chess.BLACK

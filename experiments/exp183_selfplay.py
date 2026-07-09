@@ -37,9 +37,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from chess_inference import load_checkpoint, resolve_checkpoint
-from rl_selfplay.config import SelfPlayConfig, a100_80gb_config, laptop_8gb_config
+from rl_selfplay.config import (
+    SelfPlayConfig, a100_80gb_config, a40_45gb_config, laptop_8gb_config,
+)
 from rl_selfplay.generate import build_mcts, generate_positions
-from rl_selfplay.storage import load_positions, save_positions
+from rl_selfplay.storage import append_dataset, load_positions, save_positions
 from rl_selfplay.train import train_on_positions
 from rl_selfplay.utils import resolve_stockfish
 
@@ -71,12 +73,17 @@ def save_rl_checkpoint(model, path: Path, step: int, meta: dict) -> None:
 
 def quick_eval(model, cfg: SelfPlayConfig, checkpoint_path: str) -> float:
     """Short SF match using MCTS for a sanity score."""
-    from rl_selfplay.generate import play_sf_game
+    from rl_selfplay.generate import build_mcts, play_sf_game
     import chess.engine
 
     sf_path = resolve_stockfish()
     engine = chess.engine.SimpleEngine.popen_uci(str(sf_path))
-    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": cfg.sf_elo, "Threads": 1})
+    if cfg.sf_full_strength:
+        engine.configure({"Threads": 2, "Hash": 256})
+        label = f"SFfull/d{cfg.sf_depth}"
+    else:
+        engine.configure({"UCI_LimitStrength": True, "UCI_Elo": cfg.sf_elo, "Threads": 1})
+        label = f"SF{cfg.sf_elo}"
     mcts = build_mcts(model, DEVICE, cfg)
     scores = []
     try:
@@ -87,7 +94,7 @@ def quick_eval(model, cfg: SelfPlayConfig, checkpoint_path: str) -> float:
     finally:
         engine.quit()
     score = sum(scores) / max(1, len(scores))
-    log(f"  eval vs SF{cfg.sf_elo}: {score:.3f} ({cfg.eval_games} games, {cfg.eval_sims} sims)")
+    log(f"  eval vs {label}: {score:.3f} ({cfg.eval_games} games, {cfg.eval_sims} sims)")
     return score
 
 
@@ -111,8 +118,11 @@ def run_iteration(
     )
     gen_s = time.time() - t0
     avg_result = sum(results) / max(1, len(results))
+    n_mcts = sum(1 for p in positions if p.get("source", "mcts") != "sf")
+    n_sf = sum(1 for p in positions if p.get("source") == "sf")
     log(f"  generated {len(positions)} positions in {gen_s:.0f}s "
-        f"({len(positions)/max(gen_s,1):.1f} pos/s recorded), avg_result={avg_result:.3f}")
+        f"(mcts={n_mcts} sf={n_sf}, {len(positions)/max(gen_s,1):.1f} pos/s), "
+        f"avg_result={avg_result:.3f}")
 
     meta = {
         "iteration": iter_idx,
@@ -120,11 +130,19 @@ def run_iteration(
         "mode": cfg.mode,
         "n_games": n_games,
         "mcts_sims": cfg.mcts_sims,
+        "sf_full_strength": cfg.sf_full_strength,
+        "sf_depth": cfg.sf_depth,
         "n_positions": len(positions),
+        "n_mcts": n_mcts,
+        "n_sf": n_sf,
         "avg_result": avg_result,
         "config": cfg.to_dict(),
     }
     save_positions(data_path, positions, meta)
+    if cfg.dataset_dir:
+        shard = append_dataset(Path(cfg.dataset_dir), positions, meta)
+        log(f"  dataset += {len(positions)} → {shard} "
+            f"(total tracked in {Path(cfg.dataset_dir) / 'manifest.json'})")
 
     log(f"--- Iteration {iter_idx}: train ({cfg.train_epochs} epoch(s)) ---")
     n_value = model.config.n_value_classes if hasattr(model, "config") else 128
@@ -146,13 +164,15 @@ def run_iteration(
 def main():
     parser = argparse.ArgumentParser(description="Expert-iteration self-play loop")
     parser.add_argument("--go", action="store_true", help="Run (default is dry-run)")
-    parser.add_argument("--preset", choices=["laptop", "a100"], default="laptop")
+    parser.add_argument("--preset", choices=["laptop", "a40", "a100"], default="laptop")
     parser.add_argument("--mode", choices=["self", "sf", "prior"], default=None)
     parser.add_argument("--checkpoint", "-c", type=str, default=None)
     parser.add_argument("--prior-checkpoint", type=str, default=None)
     parser.add_argument("--iterations", type=int, default=None)
     parser.add_argument("--games", type=int, default=None)
     parser.add_argument("--sims", type=int, default=None)
+    parser.add_argument("--sf-elo", type=int, default=None,
+                        help="Stockfish UCI_Elo when mode=sf (e.g. 1500–2800)")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--smoke", action="store_true", help="Tiny 1-game smoke test")
     parser.add_argument("--generate-only", action="store_true")
@@ -160,7 +180,12 @@ def main():
     parser.add_argument("--data", type=str, default=None, help="Path to data.pt for --train-only")
     args = parser.parse_args()
 
-    cfg = a100_80gb_config() if args.preset == "a100" else laptop_8gb_config()
+    if args.preset == "a100":
+        cfg = a100_80gb_config()
+    elif args.preset == "a40":
+        cfg = a40_45gb_config()
+    else:
+        cfg = laptop_8gb_config()
     if args.mode:
         cfg = SelfPlayConfig(**{**cfg.to_dict(), "mode": args.mode})
     if args.iterations is not None:
@@ -169,6 +194,8 @@ def main():
         cfg = SelfPlayConfig(**{**cfg.to_dict(), "n_games": args.games, "games_per_iter": args.games})
     if args.sims is not None:
         cfg = SelfPlayConfig(**{**cfg.to_dict(), "mcts_sims": args.sims})
+    if args.sf_elo is not None:
+        cfg = SelfPlayConfig(**{**cfg.to_dict(), "sf_elo": args.sf_elo})
     if args.output_dir:
         cfg = SelfPlayConfig(**{**cfg.to_dict(), "output_dir": args.output_dir})
     if args.prior_checkpoint:
@@ -197,6 +224,7 @@ def main():
         print()
         print("  Laptop smoke:  python experiments/exp183_selfplay.py --preset laptop --go --smoke")
         print("  Laptop SF:     python experiments/exp183_selfplay.py --preset laptop --go --mode sf")
+        print("  A40 loop:      python experiments/exp183_selfplay.py --preset a40 --go")
         print("  A100 loop:     python experiments/exp183_selfplay.py --preset a100 --go")
         return
 

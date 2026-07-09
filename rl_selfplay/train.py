@@ -1,4 +1,4 @@
-"""Train on MCTS visit distributions (expert iteration)."""
+"""Train on soft MCTS visit distributions + hard Stockfish moves."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from torch.amp import autocast
 from chess_features import batch_boards_to_fused_token_ids
 from move_vocab import VOCAB_SIZE, legal_move_mask
 from rl_selfplay.config import SelfPlayConfig
-from rl_selfplay.utils import q_to_wdl, q_to_win_pct
+from rl_selfplay.utils import q_to_wdl
 
 SIGMA_HL_GAUSS = 0.04
 
@@ -59,9 +59,9 @@ def _build_visit_tensor(positions: list[dict]) -> tuple[list[str], torch.Tensor,
     visit = torch.zeros(len(positions), VOCAB_SIZE)
     root_q = torch.zeros(len(positions))
     for i, pos in enumerate(positions):
-        for idx, prob in pos["visit_dist"].items():
+        for idx, prob in pos.get("visit_dist", {}).items():
             visit[i, int(idx)] = prob
-        root_q[i] = pos["root_q"]
+        root_q[i] = float(pos.get("root_q", 0.0))
     return fens, visit, root_q
 
 
@@ -76,6 +76,17 @@ def _maybe_sf_batch(shard_dir: Path | None, batch_size: int, device: torch.devic
         return next(iter(loader))
     except StopIteration:
         return None
+
+
+def _split_sources(positions: list[dict]) -> tuple[list[int], list[int]]:
+    mcts_idx, sf_idx = [], []
+    for i, p in enumerate(positions):
+        src = p.get("source", "mcts")
+        if src == "sf":
+            sf_idx.append(i)
+        else:
+            mcts_idx.append(i)
+    return mcts_idx, sf_idx
 
 
 def train_on_positions(
@@ -97,41 +108,77 @@ def train_on_positions(
 
     fens, visit_targets, root_qs = _build_visit_tensor(positions)
     value_targets = _value_targets(root_qs, n_value_classes)
-    indices = list(range(len(positions)))
+    mcts_idx, sf_idx = _split_sources(positions)
     shard_dir = Path(cfg.sf_shard_dir) if cfg.sf_shard_dir else None
 
-    totals = {"loss": 0.0, "policy": 0.0, "value": 0.0, "batches": 0}
+    log_fn(
+        f"  train mix: {len(mcts_idx)} soft-MCTS + {len(sf_idx)} SF-hard "
+        f"(sf_move_frac={cfg.mix_sf_move_frac})"
+    )
+
+    totals = {"loss": 0.0, "policy": 0.0, "value": 0.0, "batches": 0, "sf_batches": 0, "mcts_batches": 0}
+
+    # Prefer the larger pool for epoch length so we see most data once.
+    primary = mcts_idx if len(mcts_idx) >= len(sf_idx) else (sf_idx or mcts_idx)
+    if not primary:
+        primary = list(range(len(positions)))
 
     for epoch in range(cfg.train_epochs):
-        random.shuffle(indices)
+        random.shuffle(primary)
         epoch_batches = 0
-        for start in range(0, len(indices), cfg.train_batch_size):
-            batch_idx = indices[start:start + cfg.train_batch_size]
-            use_sf = (
-                cfg.mix_sf_frac > 0
+        for start in range(0, len(primary), cfg.train_batch_size):
+            # Choose soft MCTS vs hard SF for this batch.
+            use_recorded_sf = (
+                bool(sf_idx)
+                and cfg.mix_sf_move_frac > 0
+                and random.random() < cfg.mix_sf_move_frac
+            )
+            use_external_sf = (
+                not use_recorded_sf
+                and cfg.mix_sf_frac > 0
                 and random.random() < cfg.mix_sf_frac
                 and shard_dir is not None
             )
 
-            if use_sf:
-                sf_batch = _maybe_sf_batch(shard_dir, len(batch_idx), device)
+            if use_recorded_sf:
+                batch_idx = random.sample(sf_idx, min(cfg.train_batch_size, len(sf_idx)))
+                batch = [positions[i] for i in batch_idx]
+                boards = [chess.Board(p["fen"]) for p in batch]
+                batch_input = batch_boards_to_fused_token_ids(boards, device)
+                move_targets = torch.tensor(
+                    [int(p["chosen_move"]) for p in batch], device=device, dtype=torch.long,
+                )
+                value_batch = value_targets[batch_idx].to(device)
+                mode = "sf_hard"
+            elif use_external_sf:
+                sf_batch = _maybe_sf_batch(shard_dir, cfg.train_batch_size, device)
                 if sf_batch is None:
-                    use_sf = False
-
-            if use_sf:
-                batch_input, move_targets, wdl_targets = sf_batch
-                boards = None
+                    use_external_sf = False
+                    mode = "mcts"
+                else:
+                    batch_input, move_targets, wdl_targets = sf_batch
+                    boards = None
+                    mode = "sf_shard"
             else:
+                use_external_sf = False
+
+            if not use_recorded_sf and not use_external_sf:
+                pool = mcts_idx if mcts_idx else primary
+                batch_idx = random.sample(pool, min(cfg.train_batch_size, len(pool)))
                 batch = [positions[i] for i in batch_idx]
                 boards = [chess.Board(p["fen"]) for p in batch]
                 batch_input = batch_boards_to_fused_token_ids(boards, device)
                 visit_batch = visit_targets[batch_idx].to(device)
                 value_batch = value_targets[batch_idx].to(device)
+                mode = "mcts"
 
             optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 out = model(batch_input)
-                if use_sf:
+                if mode == "sf_hard":
+                    p_loss = F.cross_entropy(out["policy_logits"], move_targets)
+                    v_loss = value_loss(out["value_logits"], value_batch, n_value_classes)
+                elif mode == "sf_shard":
                     p_loss = F.cross_entropy(out["policy_logits"], move_targets)
                     if n_value_classes == 3:
                         v_loss = F.cross_entropy(
@@ -158,6 +205,10 @@ def train_on_positions(
             totals["policy"] += p_loss.item()
             totals["value"] += v_loss.item()
             totals["batches"] += 1
+            if mode.startswith("sf"):
+                totals["sf_batches"] += 1
+            else:
+                totals["mcts_batches"] += 1
             epoch_batches += 1
 
         if epoch_batches:
@@ -165,7 +216,8 @@ def train_on_positions(
                 f"  epoch {epoch + 1}/{cfg.train_epochs}: "
                 f"loss={totals['loss']/totals['batches']:.4f} "
                 f"p={totals['policy']/totals['batches']:.4f} "
-                f"v={totals['value']/totals['batches']:.4f}"
+                f"v={totals['value']/totals['batches']:.4f} "
+                f"(mcts_batches={totals['mcts_batches']} sf_batches={totals['sf_batches']})"
             )
 
     model.eval()

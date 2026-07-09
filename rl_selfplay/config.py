@@ -20,9 +20,12 @@ class SelfPlayConfig:
     mcts_c_puct: float = 2.5
     visit_temp: float = 1.0
     ply_cap: int = 200
-    sf_elo: int = 1500
+    sf_elo: int = 1500  # ignored when sf_full_strength=True
+    sf_full_strength: bool = False  # True = no UCI_LimitStrength
+    sf_depth: int | None = None  # if set, Limit(depth=...) instead of time
     sf_move_time: float = 0.05
     root_noise_frac: float = 0.25
+    record_sf_moves: bool = False  # save SF positions for supervised CE
 
     # Training
     train_epochs: int = 1
@@ -30,8 +33,14 @@ class SelfPlayConfig:
     train_lr: float = 1e-5
     value_weight: float = 0.5
     grad_clip: float = 0.5
-    mix_sf_frac: float = 0.0  # fraction of batches from supervised shards
+    mix_sf_frac: float = 0.0  # fraction of batches from external supervised shards
     sf_shard_dir: str | None = None
+    # Within collected positions: fraction of batches that use SF hard moves
+    # (rest use soft MCTS visit targets). Only applies when SF records exist.
+    mix_sf_move_frac: float = 0.5
+
+    # Dataset
+    dataset_dir: str | None = None  # cumulative position dataset root
 
     # Loop
     iterations: int = 1
@@ -102,5 +111,34 @@ def a100_80gb_config(**overrides) -> SelfPlayConfig:
         mix_sf_frac=0.25,
         sf_shard_dir=str(ROOT / "outputs" / "exp139_massive_train" / "shards"),
         output_dir="outputs/rl_selfplay_a100",
+    )
+    return replace(cfg, **overrides) if overrides else cfg
+
+
+def a40_45gb_config(**overrides) -> SelfPlayConfig:
+    """A40 45GB: full-strength SF (low depth) + soft MCTS; fill VRAM."""
+    cfg = SelfPlayConfig(
+        n_games=32,
+        mcts_sims=200,
+        mcts_batch_size=192,
+        train_batch_size=192,
+        ply_cap=200,
+        eval_games=8,
+        eval_sims=100,
+        iterations=40,
+        games_per_iter=32,
+        sf_full_strength=True,
+        sf_depth=8,              # full strength, shallow for speed
+        sf_elo=3200,             # unused when full strength
+        record_sf_moves=True,    # keep SF moves in dataset + train CE
+        visit_temp=1.0,          # soft MCTS visit distribution
+        root_noise_frac=0.25,
+        mix_sf_move_frac=0.5,    # half batches SF hard, half soft MCTS
+        mix_sf_frac=0.0,
+        sf_shard_dir=None,
+        dataset_dir="outputs/rl_selfplay_a40_soft/dataset",
+        use_fp16=False,
+        use_bf16=True,
+        output_dir="outputs/rl_selfplay_a40_soft",
     )
     return replace(cfg, **overrides) if overrides else cfg
