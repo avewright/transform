@@ -34,6 +34,9 @@ class ChessTransformerConfig:
     use_swiglu: bool = False       # SwiGLU gated FFN (Llama/Ruoss-style)
     use_rel_bias: bool = False     # Chess-aware relative geometry attention bias
     gradient_checkpointing: bool = False
+    # If True, each attention head keeps full hidden_dim (no d/H shrink).
+    # Cheap here because the board sequence is only ~68 tokens.
+    full_dim_attention: bool = False
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ChessTransformerConfig":
@@ -100,6 +103,56 @@ DEFAULT_8GB_CONFIG = ChessTransformerConfig(
 DEFAULT_A100_700M_CONFIG = DEFAULT_700M_CONFIG
 DEFAULT_A100_309M_CONFIG = replace(DEFAULT_8GB_CONFIG, gradient_checkpointing=False)
 
+# A40 48GB: shallower/wider than deep-narrow 16L/96L stacks.
+# Big piece embeds (768), full-dim multi-head attn (no d/H shrink), no grad ckpt.
+# ~8L/1152d/8H-full ≈ 380M — leaves headroom for large batches on 45GB.
+DEFAULT_A40_WIDE_CONFIG = ChessTransformerConfig(
+    encoder_dim=768,
+    encoder_type="strengthened",
+    encoder_conv_blocks=2,
+    normalize_stm=True,
+    hidden_dim=1152,
+    num_layers=8,
+    num_heads=8,
+    ffn_ratio=4,
+    dropout=0.05,
+    policy_head_dim=576,
+    value_hidden=256,
+    use_pos_embed=False,
+    n_ctx_tokens=4,
+    value_head_type="cls",
+    n_value_classes=3,
+    use_swiglu=True,
+    use_rel_bias=True,
+    gradient_checkpointing=False,
+    full_dim_attention=True,
+)
+
+# A40 fast path: deep residual stack that finishes ~10-15M positions in 3-4h.
+# Many layers + standard multi-head attn + SwiGLU + chess rel-bias; no grad ckpt.
+# ~28L/256d/8H ≈ 25M — large batches (~1024) → ~1k pos/s on A40.
+DEFAULT_A40_DEEP_SMALL_CONFIG = ChessTransformerConfig(
+    encoder_dim=256,
+    encoder_type="strengthened",
+    encoder_conv_blocks=2,
+    normalize_stm=True,
+    hidden_dim=256,
+    num_layers=28,
+    num_heads=8,
+    ffn_ratio=4,
+    dropout=0.05,
+    policy_head_dim=192,
+    value_hidden=128,
+    use_pos_embed=False,
+    n_ctx_tokens=4,
+    value_head_type="cls",
+    n_value_classes=3,
+    use_swiglu=True,
+    use_rel_bias=True,
+    gradient_checkpointing=False,
+    full_dim_attention=False,
+)
+
 
 def _build_move_square_indices():
     from_sqs, to_sqs, promo_types = [], [], []
@@ -132,14 +185,84 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
 
 
+class FullDimMultiheadAttention(nn.Module):
+    """Multi-head attention where each head keeps the full model dimension.
+
+    Standard MHA shrinks to d_model // n_heads per head. With only ~68 board
+    tokens that shrink wastes capacity; here each head projects Q/K/V at
+    d_model and outputs are concatenated then projected back to d_model.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        if nhead < 1:
+            raise ValueError("nhead must be >= 1")
+        self.d_model = d_model
+        self.nhead = nhead
+        self.scale = d_model ** -0.5
+        self.q_proj = nn.Linear(d_model, d_model * nhead, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model * nhead, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model * nhead, bias=False)
+        self.out_proj = nn.Linear(d_model * nhead, d_model, bias=True)
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        need_weights: bool = False,
+    ):
+        del need_weights  # API compat with nn.MultiheadAttention
+        B, T, _ = query.shape
+        H, D = self.nhead, self.d_model
+
+        q = self.q_proj(query).view(B, T, H, D).transpose(1, 2)  # (B,H,T,D)
+        k = self.k_proj(key).view(B, T, H, D).transpose(1, 2)
+        v = self.v_proj(value).view(B, T, H, D).transpose(1, 2)
+
+        # Prefer fused SDPA when no additive bias is present.
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                scale=self.scale,
+            )
+        else:
+            # attn_mask: (B*H, T, T) float additive bias from ChessRelativeBias
+            if attn_mask.dim() == 3:
+                bias = attn_mask.view(B, H, T, T)
+            else:
+                bias = attn_mask
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            scores = scores + bias
+            attn = self.attn_dropout(torch.softmax(scores.float(), dim=-1).to(scores.dtype))
+            out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, H * D)
+        return self.dropout(self.out_proj(out)), None
+
+
 # ── Custom encoder layer supporting SwiGLU + attention bias ──
 class ChessTransformerEncoderLayer(nn.Module):
     """Pre-norm transformer encoder layer with optional SwiGLU FFN and attention bias."""
-    def __init__(self, d_model: int, nhead: int, ffn_dim: int,
-                 dropout: float = 0.1, use_swiglu: bool = False):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        ffn_dim: int,
+        dropout: float = 0.1,
+        use_swiglu: bool = False,
+        full_dim_attention: bool = False,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        if full_dim_attention:
+            self.attn = FullDimMultiheadAttention(d_model, nhead, dropout=dropout)
+        else:
+            self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = (
             SwiGLUFFN(d_model, ffn_dim, dropout) if use_swiglu
@@ -238,9 +361,10 @@ class ChessTransformer(nn.Module):
             if config.use_rel_bias else None
         )
 
-        # Encoder layers: custom (SwiGLU/bias-aware) or standard
+        # Encoder layers: custom (SwiGLU/bias/full-dim) or standard
         ffn_dim = config.hidden_dim * config.ffn_ratio
-        if config.use_swiglu or config.use_rel_bias:
+        use_custom = config.use_swiglu or config.use_rel_bias or config.full_dim_attention
+        if use_custom:
             self.layers = nn.ModuleList([
                 ChessTransformerEncoderLayer(
                     d_model=config.hidden_dim,
@@ -248,6 +372,7 @@ class ChessTransformer(nn.Module):
                     ffn_dim=ffn_dim,
                     dropout=config.dropout,
                     use_swiglu=config.use_swiglu,
+                    full_dim_attention=config.full_dim_attention,
                 )
                 for _ in range(config.num_layers)
             ])
