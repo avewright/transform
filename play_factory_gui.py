@@ -46,6 +46,15 @@ SIMS = 256
 SEARCH_LOCK = threading.Lock()
 TITLE = "ChessTransformer 25M + MCTS"
 
+# Training vocab uses king-to-rook castling (e8a8); chess.js needs e8c8.
+_CASTLE_960_TO_STD = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+
+
+def to_browser_uci(uci: str) -> str:
+    """Normalize castling UCI so chess.js accepts the move."""
+    return _CASTLE_960_TO_STD.get(uci, uci)
+
+
 MIME = {
     ".js": "application/javascript",
     ".css": "text/css",
@@ -66,10 +75,11 @@ def policy_topk(board: chess.Board, k: int = 5):
     logits[~mask] = float("-inf")
     probs = F.softmax(logits, dim=-1)
     topk = torch.topk(probs, min(k, int(mask.sum().item())))
-    top_moves = [
-        [IDX_TO_UCI[i], f"{p * 100:.1f}%"]
-        for i, p in zip(topk.indices.tolist(), topk.values.tolist())
-    ]
+    top_moves = []
+    for i, p in zip(topk.indices.tolist(), topk.values.tolist()):
+        # index_to_move converts 960-castling → standard UCI
+        uci = index_to_move(i).uci()
+        top_moves.append([uci, f"{p * 100:.1f}%"])
     wdl_probs = F.softmax(result["value_logits"][0].float(), dim=-1).tolist()
     wdl = {"win": wdl_probs[0], "draw": wdl_probs[1], "loss": wdl_probs[2]}
     return top_moves, wdl
@@ -84,8 +94,20 @@ def model_reply(fen: str) -> dict:
     top_moves, wdl = policy_topk(board)
 
     if SEARCH is None:
+        move_uci = top_moves[0][0]
+        # Safety: never return a move chess.js / python-chess std form rejects
+        mv = chess.Move.from_uci(move_uci)
+        if mv not in board.legal_moves:
+            # fall back to first truly legal top move / any legal
+            for u, _ in top_moves[1:]:
+                m2 = chess.Move.from_uci(u)
+                if m2 in board.legal_moves:
+                    move_uci = u
+                    break
+            else:
+                move_uci = next(iter(board.legal_moves)).uci()
         return {
-            "move": top_moves[0][0],
+            "move": move_uci,
             "top_moves": top_moves,
             "wdl": wdl,
             "search": {"sims": 0, "source": "policy"},
@@ -103,10 +125,13 @@ def model_reply(fen: str) -> dict:
         if root is not None and root.children:
             total = sum(c.visit_count for c in root.children.values()) or 1
             ranked = sorted(root.children.items(), key=lambda x: -x[1].visit_count)[:5]
-            visit_top = [[m.uci(), f"{100.0 * c.visit_count / total:.1f}%"] for m, c in ranked]
+            visit_top = [
+                [to_browser_uci(m.uci()), f"{100.0 * c.visit_count / total:.1f}%"]
+                for m, c in ranked
+            ]
 
     return {
-        "move": move.uci(),
+        "move": to_browser_uci(move.uci()),
         "top_moves": visit_top or top_moves,
         "wdl": wdl,
         "search": {
@@ -191,10 +216,10 @@ def main():
     n = sum(p.numel() for p in MODEL.parameters()) / 1e6
 
     if args.policy_only:
-        TITLE = "ChessTransformer 25M (policy-only)"
+        TITLE = f"ChessTransformer {n:.0f}M (policy-only)"
         print(f"Ready on {DEVICE} ({n:.1f}M) POLICY-ONLY. You play White.", flush=True)
     else:
-        TITLE = f"ChessTransformer 25M + MCTS ({SIMS} sims)"
+        TITLE = f"ChessTransformer {n:.0f}M + MCTS ({SIMS} sims)"
         SEARCH = MCTSSearch(
             MODEL, DEVICE, SyzygyProbe(),
             c_puct=2.5, batch_size=16,
