@@ -15,7 +15,7 @@ Usage:
   Or configure in cutechess-cli / Arena / etc. as a UCI engine.
 
 Value convention: White-absolute
-  wdl[0] = P(White wins), wdl[1] = P(draw), wdl[2] = P(White loses)
+  wdl[0] = P(White wins), wdl[1] = P(draw), wdl[2 ] = P(White loses)
 """
 
 import argparse

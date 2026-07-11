@@ -213,6 +213,30 @@ class FusedBoardEncoder(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
+    def forward_streams(
+        self, token_ids: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return separate content and position streams (B, 67, D).
+
+        content: piece/empty (+ ctx) — *what*
+        position: square identity (+ ctx slot embeds) — *where*
+        """
+        fused_ids = token_ids["fused_ids"]  # (B, 64)
+        sq_idx = torch.arange(64, device=fused_ids.device)
+
+        content_sq = self.piece_color_embed(fused_ids)
+        pos_sq = self.square_embed(sq_idx).unsqueeze(0).expand(fused_ids.shape[0], -1, -1)
+
+        turn_tok = self.turn_embed(token_ids["turn"]).unsqueeze(1)
+        castle_tok = self.castling_embed(token_ids["castling"]).unsqueeze(1)
+        ep_tok = self.ep_embed(token_ids["ep_file"]).unsqueeze(1)
+        content_ctx = torch.cat([turn_tok, castle_tok, ep_tok], dim=1)
+        pos_ctx = content_ctx
+
+        content = torch.cat([content_ctx, content_sq], dim=1)
+        position = torch.cat([pos_ctx, pos_sq], dim=1)
+        return self.norm(content), self.norm(position)
+
     def forward(self, token_ids: dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Args:
@@ -312,6 +336,38 @@ class StrengthenedBoardEncoder(nn.Module):
             out_turn[black] = 0
 
         return fused, castle, out_turn
+
+    def forward_streams(
+        self, token_ids: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return separate content and position streams (B, 67, D).
+
+        content: piece + local conv — *what* (and local neighborhood texture)
+        position: square embed — *where* (absolute grid only; no handcrafted rays)
+        """
+        fused_ids, castling, turn = self._apply_stm(
+            token_ids["fused_ids"],
+            token_ids["castling"],
+            token_ids["turn"],
+        )
+
+        sq_idx = torch.arange(64, device=fused_ids.device)
+        content_sq = self.piece_color_embed(fused_ids)
+        conv_feat = self.conv_blocks(self.plane_conv(fused_ids_to_planes(fused_ids)))
+        content_sq = content_sq + conv_feat.view(
+            fused_ids.shape[0], self.embed_dim, 64
+        ).permute(0, 2, 1)
+        pos_sq = self.square_embed(sq_idx).unsqueeze(0).expand(fused_ids.shape[0], -1, -1)
+
+        turn_tok = self.turn_embed(turn).unsqueeze(1)
+        castle_tok = self.castling_embed(castling).unsqueeze(1)
+        ep_tok = self.ep_embed(token_ids["ep_file"]).unsqueeze(1)
+        content_ctx = torch.cat([turn_tok, castle_tok, ep_tok], dim=1)
+        pos_ctx = content_ctx
+
+        content = torch.cat([content_ctx, content_sq], dim=1)
+        position = torch.cat([pos_ctx, pos_sq], dim=1)
+        return self.norm(content), self.norm(position)
 
     def forward(self, token_ids: dict[str, torch.Tensor]) -> torch.Tensor:
         fused_ids, castling, turn = self._apply_stm(
