@@ -136,6 +136,7 @@ DEFAULT_A40_WIDE_CONFIG = ChessTransformerConfig(
 # ≥400M meta-factored attention: content×position streams + Shaw on ss only.
 # No handcrafted rel-bias, no absolute seq PE, no full-dim attention.
 # Train from scratch (incompatible with 200M checkpoints).
+# A40 default: grad checkpoint OFF for throughput; enable via --grad-checkpoint if OOM.
 DEFAULT_400M_META_CONFIG = ChessTransformerConfig(
     encoder_dim=512,
     encoder_type="strengthened",
@@ -154,7 +155,7 @@ DEFAULT_400M_META_CONFIG = ChessTransformerConfig(
     n_value_classes=3,
     use_swiglu=True,
     use_rel_bias=False,
-    gradient_checkpointing=True,
+    gradient_checkpointing=False,
     full_dim_attention=False,
     use_meta_attention=True,
     use_shaw_on_pos=True,

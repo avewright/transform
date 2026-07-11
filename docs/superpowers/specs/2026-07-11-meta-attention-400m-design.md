@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-11  
 **Status:** Approved via "wire up the next best experiment"  
-**Experiment:** `exp191_400m_meta_attention.py`
+**Experiment:** `exp191_400m_meta_attention.py`  
+**RunPod:** `bash scripts/run_exp191_a40.sh` (NorMuon, A40 throughput defaults)
 
 ## Problem
 

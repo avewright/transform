@@ -11,6 +11,7 @@ apt-get update -qq && apt-get install -y -qq wget unzip git >/dev/null 2>&1 || t
 pip install -q -U pip
 pip install -q -e .
 pip install -q git+https://github.com/KellerJordan/Muon
+pip install -q git+https://github.com/zichongli5/NorMuon.git
 
 # Stockfish binary (for RL / eval)
 if ! find stockfish -name 'stockfish*' -type f 2>/dev/null | grep -q .; then
@@ -39,6 +40,10 @@ python experiments/exp182_pretrain_700m.py --go --a100 --smoke
 
 # Full pretrain (705M, tuned for 80GB)
 python experiments/exp182_pretrain_700m.py --go --a100 --resume
+
+# A40: 437M meta-attention + NorMuon (break ~1700 Elo wall)
+bash scripts/run_exp191_a40.sh
+# If OOM: GRAD_CHECKPOINT=1 BATCH_SIZE=128 bash scripts/run_exp191_a40.sh
 
 # Expert-iteration RL / self-play
 python experiments/exp183_selfplay.py --preset a100 --go --mode sf

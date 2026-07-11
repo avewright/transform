@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""exp191: ≥400M meta-factored attention from scratch (break the ~1700 Elo wall).
+"""exp191: ≥400M meta-factored attention from scratch (A40 / NorMuon).
 
 Architecture (DEFAULT_400M_META_CONFIG):
   - Separate content / position streams through attention
@@ -7,15 +7,15 @@ Architecture (DEFAULT_400M_META_CONFIG):
   - Shaw relative vectors on ss only (Δfile, Δrank) — no handcrafted rays
   - Removed: ChessRelativeBias, sequence pos_embed, full_dim_attention
 
-Training mirrors exp189 soft MultiPV recipe but from scratch (no 200M load):
-  - Soft MultiPV CE + hard best-move CE
-  - Optional deep soft mix (exp190)
-  - Hard HF ballast (lichess-sf, depth>=15)
-  - H-flip aug on soft batches
+A40 RunPod defaults (wise rental use):
+  - NorMuon on ≥2D trunk weights + tiny AdamW aux (embeds/heads/norms)
+  - Large micro-batch, accum=1, bf16, TF32, cudnn.benchmark
+  - Grad checkpoint OFF by default (throughput); --grad-checkpoint if OOM
+  - Soft MultiPV + hard HF ballast; optional deep soft mix
 
 Usage:
   MOVE_VOCAB_VERSION=compact python experiments/exp191_400m_meta_attention.py --go --smoke
-  MOVE_VOCAB_VERSION=compact python experiments/exp191_400m_meta_attention.py --go
+  bash scripts/run_exp191_a40.sh
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +38,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -68,6 +68,13 @@ DEFAULT_SOFT = ROOT / "outputs" / "exp186_sf_multipv" / "soft_cache.pt"
 SHUTDOWN = False
 LOG_PATH: Path | None = None
 
+# AdamW aux group: embeds, norms, biases, heads, Shaw tables, CLS tokens.
+# Everything else ≥2D (QKV/FFN/projections) goes to NorMuon.
+ADAM_NAME_HINTS = (
+    "embed", "policy_head", "value_head", "cls_token", "cls_pos",
+    "pos_embed", "norm", "bn", "shaw_",
+)
+
 
 def log(msg: str) -> None:
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -89,6 +96,35 @@ def soft_policy_loss(logits, soft_indices, soft_probs):
     safe = soft_indices.clamp(min=0).long()
     gathered = log_probs.gather(1, safe) * valid.float()
     return -(soft_probs.float() * gathered).sum(dim=-1).mean()
+
+
+def build_normuon_optimizer(model: nn.Module, muon_lr: float, adam_lr: float, weight_decay: float):
+    from normuon import SingleDeviceNorMuonWithAuxAdam
+
+    muon_params, adam_params = [], []
+    muon_n = adam_n = 0
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        n = param.numel()
+        if any(h in name for h in ADAM_NAME_HINTS) or param.ndim < 2:
+            adam_params.append(param)
+            adam_n += n
+        else:
+            muon_params.append(param)
+            muon_n += n
+
+    opt = SingleDeviceNorMuonWithAuxAdam([
+        dict(
+            params=muon_params, use_muon=True, lr=muon_lr, weight_decay=weight_decay,
+            momentum=0.95, beta2=0.95,
+        ),
+        dict(
+            params=adam_params, use_muon=False, lr=adam_lr, betas=(0.9, 0.95),
+            weight_decay=weight_decay,
+        ),
+    ])
+    return opt, muon_n, adam_n
 
 
 def prepare_soft_batch(data, indices, device, hflip_p: float = 0.0, rng: torch.Generator | None = None):
@@ -150,7 +186,7 @@ def eval_soft_top1(model, soft_data, device, n=5000):
     return {"top1": correct / max(total, 1), "soft_loss": soft_loss_sum / max(total, 1), "n": total}
 
 
-def save_checkpoint(model, optimizer, scaler, step, best_metric, path, args):
+def save_checkpoint(model, optimizer, scaler, step, best_metric, path, args, config):
     tmp = Path(str(path) + ".tmp")
     torch.save({
         "model_state_dict": model.state_dict(),
@@ -158,7 +194,7 @@ def save_checkpoint(model, optimizer, scaler, step, best_metric, path, args):
         "scaler_state_dict": scaler.state_dict() if scaler.is_enabled() else None,
         "step": step,
         "best_metric": best_metric,
-        "config": DEFAULT_400M_META_CONFIG.to_dict(),
+        "config": config.to_dict() if hasattr(config, "to_dict") else config,
         "vocab": "compact",
         "vocab_version": "compact",
         "args": vars(args),
@@ -175,17 +211,19 @@ def main():
     ap.add_argument("--deep-soft-cache", type=str, default=None)
     ap.add_argument("--deep-mix-frac", type=float, default=0.40)
     ap.add_argument("--output-dir", default="outputs/exp191_400m_meta_attention")
-    ap.add_argument("--steps", type=int, default=24000)
-    ap.add_argument("--batch-size", type=int, default=192)
-    ap.add_argument("--accum-steps", type=int, default=4)
+    # A40-oriented defaults: large micro-batch, no accum waste, NorMuon LRs
+    ap.add_argument("--steps", type=int, default=8000)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--accum-steps", type=int, default=1)
     ap.add_argument("--soft-frac", type=float, default=0.72)
     ap.add_argument("--soft-alpha", type=float, default=0.40)
-    ap.add_argument("--lr", type=float, default=1.5e-4)
+    ap.add_argument("--muon-lr", type=float, default=0.02)
+    ap.add_argument("--adam-lr", type=float, default=3e-4)
     ap.add_argument("--hflip-p", type=float, default=0.5)
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument("--resume-opt", action="store_true")
-    ap.add_argument("--min-lr-frac", type=float, default=0.08)
-    ap.add_argument("--warmup", type=int, default=800)
+    ap.add_argument("--min-lr-frac", type=float, default=0.05)
+    ap.add_argument("--warmup", type=int, default=400)
     ap.add_argument("--value-weight", type=float, default=0.08)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--grad-clip", type=float, default=1.0)
@@ -195,11 +233,20 @@ def main():
     ap.add_argument("--eval-interval", type=int, default=500)
     ap.add_argument("--min-depth", type=int, default=15)
     ap.add_argument("--shuffle-buffer", type=int, default=4096)
+    ap.add_argument(
+        "--grad-checkpoint", action="store_true",
+        help="Enable activation checkpointing (slower, less VRAM). Default OFF for A40 throughput.",
+    )
+    ap.add_argument(
+        "--adamw", action="store_true",
+        help="Fallback to AdamW instead of NorMuon (debug only).",
+    )
     args = ap.parse_args()
 
     if not args.go:
         print("DRY RUN. Pass --go to train.")
         print(f"Config: {DEFAULT_400M_META_CONFIG}")
+        print("A40 tip: bash scripts/run_exp191_a40.sh")
         return
     if args.smoke:
         args.steps = 20
@@ -218,12 +265,18 @@ def main():
 
     assert VOCAB_SIZE == 1968, f"expected compact vocab, got {VOCAB_SIZE}"
 
+    model_config = replace(
+        DEFAULT_400M_META_CONFIG,
+        gradient_checkpointing=bool(args.grad_checkpoint),
+    )
+
     log("=" * 64)
-    log("exp191: 400M+ meta-factored attention (from scratch)")
+    log("exp191: 400M+ meta-factored attention (A40 / NorMuon)")
     log(f"  device={DEVICE} vocab={VOCAB_SIZE}")
     log(f"  soft_cache={args.soft_cache}")
     log(f"  deep_soft_cache={args.deep_soft_cache} deep_mix_frac={args.deep_mix_frac}")
-    log(f"  soft_frac={args.soft_frac} soft_alpha={args.soft_alpha} lr={args.lr}")
+    log(f"  soft_frac={args.soft_frac} soft_alpha={args.soft_alpha}")
+    log(f"  muon_lr={args.muon_lr} adam_lr={args.adam_lr} grad_ckpt={model_config.gradient_checkpointing}")
     log(f"  removed: rel_bias, pos_embed, full_dim_attention")
     log(f"  enabled: meta_attention + shaw_on_pos")
 
@@ -257,7 +310,7 @@ def main():
 
     if args.resume:
         log(f"  resume from {args.resume}")
-        model = build_model(DEFAULT_400M_META_CONFIG)
+        model = build_model(model_config)
         rckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(rckpt["model_state_dict"], strict=False)
         start_top1 = float(rckpt.get("best_metric", 0.0))
@@ -265,7 +318,7 @@ def main():
             start_top1 = 0.0
     else:
         rckpt = None
-        model = build_model(DEFAULT_400M_META_CONFIG)
+        model = build_model(model_config)
         start_top1 = 0.0
 
     model = model.to(DEVICE)
@@ -273,9 +326,22 @@ def main():
     log(f"  params={n_params/1e6:.1f}M (>=400 required)")
     if n_params < 400_000_000:
         raise RuntimeError(f"param count {n_params} < 400M — bump config")
-    log(f"  config={DEFAULT_400M_META_CONFIG}")
+    log(f"  config={model_config}")
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.adamw:
+        from torch.optim import AdamW
+        optimizer = AdamW(model.parameters(), lr=args.adam_lr, weight_decay=args.weight_decay)
+        log(f"  optimizer=AdamW lr={args.adam_lr}")
+    else:
+        try:
+            optimizer, muon_n, adam_n = build_normuon_optimizer(
+                model, args.muon_lr, args.adam_lr, args.weight_decay,
+            )
+            log(f"  optimizer=NorMuon ({muon_n/1e6:.1f}M) + AdamW aux ({adam_n/1e6:.1f}M)")
+        except ImportError:
+            log("ERROR: pip install git+https://github.com/zichongli5/NorMuon.git")
+            return
+
     if args.resume and args.resume_opt and rckpt is not None and "optimizer_state_dict" in rckpt:
         try:
             optimizer.load_state_dict(rckpt["optimizer_state_dict"])
@@ -283,7 +349,7 @@ def main():
         except Exception as e:
             log(f"  optimizer resume skipped: {e}")
     scaler = GradScaler("cuda", enabled=False)
-    base_lr = args.lr
+    base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
     def lr_scale(s: int) -> float:
         if s < args.warmup:
@@ -291,6 +357,11 @@ def main():
         progress = (s - args.warmup) / max(args.steps - args.warmup, 1)
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return args.min_lr_frac + (1.0 - args.min_lr_frac) * cosine
+
+    def set_lrs(s: int) -> None:
+        scale = lr_scale(s)
+        for pg, base in zip(optimizer.param_groups, base_lrs):
+            pg["lr"] = base * scale
 
     hard_iter = None
     if args.soft_frac < 1.0 and not args.smoke:
@@ -301,17 +372,21 @@ def main():
 
     with open(out / "config.json", "w") as f:
         json.dump({
-            "model": DEFAULT_400M_META_CONFIG.to_dict(),
+            "model": model_config.to_dict(),
             "training": vars(args),
             "n_params": n_params,
             "vocab": "compact",
-            "goal": "break_1700_wall_via_meta_attention",
+            "goal": "break_1700_wall_via_meta_attention_a40_normuon",
             "removed": ["use_rel_bias", "use_pos_embed", "full_dim_attention"],
+            "optimizer": "adamw" if args.adamw else "normuon",
         }, f, indent=2)
 
     eff_bs = args.batch_size * args.accum_steps
     log(f"  batch={args.batch_size} accum={args.accum_steps} eff_bs={eff_bs}")
     log(f"  steps={args.steps:,}")
+    if DEVICE.type == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        log(f"  gpu={torch.cuda.get_device_name(0)} vram={props.total_memory/1e9:.1f}GB")
     log("=" * 64)
 
     model.train()
@@ -334,7 +409,7 @@ def main():
 
     while step < args.steps:
         if SHUTDOWN:
-            save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args)
+            save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args, model_config)
             log(f"Saved on shutdown at step {step}")
             return
 
@@ -418,8 +493,7 @@ def main():
             positions += args.batch_size
 
         gn = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        for pg in optimizer.param_groups:
-            pg["lr"] = base_lr * lr_scale(step + 1)
+        set_lrs(step + 1)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
@@ -448,16 +522,16 @@ def main():
                 track = 0.5 * metrics["top1"] + 0.5 * dm["top1"]
             if track > best_top1:
                 best_top1 = track
-                save_checkpoint(model, optimizer, scaler, step, best_top1, out / "best.pt", args)
+                save_checkpoint(model, optimizer, scaler, step, best_top1, out / "best.pt", args, model_config)
                 log(f"  new best track={best_top1*100:.2f}%")
 
         if step % args.save_interval == 0:
-            save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args)
+            save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args, model_config)
             gc.collect()
             if DEVICE.type == "cuda":
                 torch.cuda.empty_cache()
 
-    save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args)
+    save_checkpoint(model, optimizer, scaler, step, best_top1, out / "latest.pt", args, model_config)
     log(f"Done. step={step:,} best_track={best_top1*100:.2f}% params={n_params/1e6:.1f}M")
 
 
