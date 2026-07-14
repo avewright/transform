@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChessTransformer — model architecture</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --ink: #111;
+    --muted: #666;
+    --line: #222;
+    --thin: #bbb;
+    --box: #fff;
+    --c: #1a5c3a;
+    --p: #1a3d6b;
+    --h: #6b3a1a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 32px 20px 80px;
+  }
+  h1 {
+    font-size: 1.35rem;
+    font-weight: 700;
+    margin: 0 0 4px;
+    letter-spacing: -0.02em;
+  }
+  .cfg {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 28px;
+  }
+  .cfg b { color: var(--ink); font-weight: 600; }
+
+  /* vertical stack */
+  .stack { display: flex; flex-direction: column; align-items: center; gap: 0; }
+
+  .arrow {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+    padding: 6px 0;
+    text-align: center;
+    line-height: 1.2;
+  }
+  .arrow small { display: block; font-size: 11px; color: #999; }
+
+  .block {
+    width: 100%;
+    border: 1.5px solid var(--line);
+    background: var(--box);
+    padding: 14px 16px;
+  }
+  .block > .title {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .block > .title .shape {
+    letter-spacing: 0;
+    text-transform: none;
+    font-weight: 500;
+    color: var(--muted);
+  }
+
+  /* input tensors */
+  .tensors {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+  .tensor {
+    border: 1px solid var(--thin);
+    padding: 8px 10px;
+    font-size: 12.5px;
+  }
+  .tensor .n { font-family: var(--mono); font-weight: 700; font-size: 12px; }
+  .tensor .d { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 2px; }
+
+  /* encoder internals */
+  .enc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .stream {
+    border: 1.5px solid;
+    padding: 10px 12px;
+  }
+  .stream.content { border-color: var(--c); background: #f3faf6; }
+  .stream.position { border-color: var(--p); background: #f3f6fb; }
+  .stream .lbl {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+  }
+  .stream.content .lbl { color: var(--c); }
+  .stream.position .lbl { color: var(--p); }
+  .stream ul {
+    margin: 0;
+    padding: 0 0 0 16px;
+    font-size: 12.5px;
+  }
+  .stream li { margin-bottom: 3px; }
+  .stream code, .eq code, .layer-body code, .head code, p code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: #eee;
+    padding: 0 4px;
+  }
+
+  .ctx-row {
+    margin-top: 10px;
+    border: 1px dashed var(--thin);
+    padding: 8px 10px;
+    font-size: 12.5px;
+  }
+  .ctx-row .mono { font-family: var(--mono); font-size: 12px; }
+
+  /* token strip */
+  .toks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+  }
+  .tok {
+    font-family: var(--mono);
+    font-size: 11px;
+    border: 1px solid var(--line);
+    padding: 4px 7px;
+    background: #fff;
+  }
+  .tok.cls { background: #111; color: #fff; border-color: #111; }
+  .tok.ctx { background: #e8e8e8; }
+  .tok.sq { background: #fff; }
+  .tok.dim { border-style: dashed; color: var(--muted); border-color: var(--thin); }
+
+  /* layer */
+  .layer {
+    width: 100%;
+    border: 2px solid var(--line);
+    background: #fff;
+  }
+  .layer-head {
+    background: #111;
+    color: #fff;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 8px 14px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .layer-head span { font-weight: 400; opacity: 0.7; }
+  .layer-body { padding: 14px 16px; }
+
+  .attn-box {
+    border: 1.5px solid var(--line);
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .attn-box .h {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .terms {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  .term {
+    border: 1px solid var(--thin);
+    padding: 8px;
+    text-align: center;
+    font-size: 12px;
+  }
+  .term .sym {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 13px;
+    display: block;
+    margin-bottom: 2px;
+  }
+  .term .f { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  .eq {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #f4f4f4;
+    padding: 8px 10px;
+    border-left: 3px solid var(--line);
+    margin: 8px 0 0;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .ffn-box {
+    border: 1.5px solid var(--h);
+    background: #fdf8f3;
+    padding: 12px;
+  }
+  .ffn-box .h {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--h);
+    margin-bottom: 6px;
+  }
+
+  .res {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-top: 8px;
+  }
+
+  /* heads */
+  .heads {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 10px;
+  }
+  .head {
+    border: 1.5px solid var(--line);
+    padding: 14px 16px;
+    background: #fff;
+  }
+  .head .title {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .head ol {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 12.5px;
+  }
+  .head li { margin-bottom: 4px; }
+  .head .out {
+    margin-top: 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    border-top: 1px solid var(--thin);
+    padding-top: 8px;
+  }
+
+  .repeat {
+    width: 100%;
+    text-align: center;
+    border: 1.5px dashed var(--line);
+    padding: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #f7f7f7;
+    margin: 4px 0;
+  }
+
+  .foot {
+    margin-top: 36px;
+    padding-top: 16px;
+    border-top: 1px solid var(--thin);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  @media (max-width: 640px) {
+    .tensors, .terms, .enc-grid, .heads { grid-template-columns: 1fr 1fr; }
+    .heads { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>ChessTransformer forward pass</h1>
+  <p class="cfg">
+    <b>DEFAULT_400M_META_CONFIG</b> ·
+    encoder_dim=512 · hidden=1280 · layers=18 · heads=20 ·
+    SwiGLU · meta-attn · Shaw on ss · vocab=1968 · WDL=3
+  </p>
+
+  <div class="stack">
+
+    <!-- INPUT -->
+    <div class="block">
+      <div class="title">
+        Input tensors
+        <span class="shape">from StrengthenedBoardEncoder.prepare_*</span>
+      </div>
+      <div class="tensors">
+        <div class="tensor">
+          <div class="n">fused_ids</div>
+          <div class="d">(B, 64) · {0…12}</div>
+          empty + 6W + 6B
+        </div>
+        <div class="tensor">
+          <div class="n">turn</div>
+          <div class="d">(B,) · {0,1}</div>
+          STM (flipped→0)
+        </div>
+        <div class="tensor">
+          <div class="n">castling</div>
+          <div class="d">(B,) · 16 states</div>
+          KQkq bitmask
+        </div>
+        <div class="tensor">
+          <div class="n">ep_file</div>
+          <div class="d">(B,) · {0…8}</div>
+          none + a…h
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow">↓ <small>STM normalize: Black boards rank-flipped, turn→0</small></div>
+
+    <!-- ENCODER -->
+    <div class="block">
+      <div class="title">
+        StrengthenedBoardEncoder
+        <span class="shape">→ content, position &nbsp;(B, 67, 512)</span>
+      </div>
+
+      <div class="enc-grid">
+        <div class="stream content">
+          <div class="lbl">content stream c&nbsp;&nbsp;“what”</div>
+          <ul>
+            <li><code>piece_color_embed</code> : Embedding(13, 512)</li>
+            <li>+ conv stem on one-hot planes:<br>
+              <code>Conv2d(13→512, 3×3)</code> → BN → SiLU<br>
+              → 2× <code>ResidualBlock</code>
+            </li>
+            <li>per square: piece + local texture</li>
+          </ul>
+        </div>
+        <div class="stream position">
+          <div class="lbl">position stream p&nbsp;&nbsp;“where”</div>
+          <ul>
+            <li><code>square_embed</code> : Embedding(64, 512)</li>
+            <li>absolute grid only</li>
+            <li>no handcrafted rays / knight flags</li>
+            <li>anchor — not deep-residual updated</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="ctx-row">
+        <span class="mono">context tokens (shared into both streams):</span>
+        <code>turn_embed(2)</code> ·
+        <code>castling_embed(16)</code> ·
+        <code>ep_embed(9)</code>
+        &nbsp;→&nbsp; cat with 64 squares → LayerNorm → <b>(B, 67, 512)</b>
+      </div>
+    </div>
+
+    <div class="arrow">↓ <small>Linear project each stream 512 → 1280 &nbsp;+&nbsp; prepend learned [CLS]</small></div>
+
+    <!-- SEQUENCE -->
+    <div class="block">
+      <div class="title">
+        Sequence layout
+        <span class="shape">(B, 68, 1280) × 2 streams</span>
+      </div>
+      <div class="toks">
+        <span class="tok cls">[CLS]</span>
+        <span class="tok ctx">turn</span>
+        <span class="tok ctx">castling</span>
+        <span class="tok ctx">ep</span>
+        <span class="tok sq">sq0</span>
+        <span class="tok sq">sq1</span>
+        <span class="tok sq">…</span>
+        <span class="tok sq">sq63</span>
+        <span class="tok dim">n_ctx = 4</span>
+      </div>
+    </div>
+
+    <div class="arrow">↓</div>
+
+    <div class="repeat">× 18 &nbsp; MetaFactoredEncoderLayer &nbsp;(pre-norm)</div>
+
+    <!-- ONE LAYER -->
+    <div class="layer">
+      <div class="layer-head">
+        ONE LAYER
+        <span>d=1280 · H=20 · d_h=64 · ffn=5120</span>
+      </div>
+      <div class="layer-body">
+
+        <div class="attn-box">
+          <div class="h">① MetaFactoredAttention</div>
+          <p style="margin:0 0 8px;font-size:12.5px;color:var(--muted)">
+            LN(content), LN(position) → 4-term logits · values from content only
+          </p>
+          <div class="terms">
+            <div class="term">
+              <span class="sym">cc</span>
+              <span class="f">q_c · k_c</span>
+              piece↔piece
+            </div>
+            <div class="term">
+              <span class="sym">ss</span>
+              <span class="f">q_p · k_p</span>
+              square↔square
+            </div>
+            <div class="term">
+              <span class="sym">cs</span>
+              <span class="f">q_c · k_p</span>
+              piece→square
+            </div>
+            <div class="term">
+              <span class="sym">sc</span>
+              <span class="f">q_p · k_c</span>
+              square→piece
+            </div>
+          </div>
+          <div class="eq">
+            score = (cc + ss + cs + sc) / √d_h
+            &nbsp;+&nbsp; Shaw(Δfile, Δrank) on sq↔sq block only
+          </div>
+          <div class="eq" style="margin-top:4px">
+            attn = softmax(score) · V_c &nbsp;→&nbsp; out_proj &nbsp;→&nbsp; content += attn
+          </div>
+          <p style="margin:8px 0 0;font-size:12px;color:var(--muted)">
+            Shaw: learned vectors over 15×15 = 225 relative buckets (Δf,Δr ∈ [−7,7]).
+            Projections: <code>q_c,k_c,v_c,q_p,k_p</code> (no v_p).
+          </p>
+        </div>
+
+        <div class="ffn-box">
+          <div class="h">② SwiGLU FFN</div>
+          <div class="eq" style="border-color:var(--h);background:#fff">
+            y = W_down( SiLU(W_gate x) ⊙ W_up x )
+            &nbsp;&nbsp;inner = ⌊5120 · 2/3⌋ = 3413
+          </div>
+          <div class="res">content = content + FFN(LN(content)) &nbsp;|&nbsp; position unchanged</div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="repeat">× 18</div>
+
+    <div class="arrow">↓ <small>LayerNorm(content) → hidden (B, 68, 1280)</small></div>
+
+    <!-- HEADS -->
+    <div class="heads">
+      <div class="head">
+        <div class="title">SpatialPolicyHead → policy logits</div>
+        <ol>
+          <li>Take square tokens <code>hidden[:, 4:68]</code> → (B, 64, 1280)</li>
+          <li><code>from_proj</code>, <code>to_proj</code> → (B, 64, 512)</li>
+          <li>Gather per-vocab move: from_sq[v], to_sq[v]</li>
+          <li>score = from ⊙ to
+            + <code>global_proj(CLS)</code>
+            + <code>promo_embed</code> {—,q,r,b,n}</li>
+          <li><code>ReLU → Linear(512→1)</code> per move</li>
+        </ol>
+        <div class="out">policy_logits &nbsp;(B, 1968)<br>
+          <span style="font-weight:400;color:var(--muted)">
+            at inference: + legal_move_mask → argmax / sample
+          </span>
+        </div>
+      </div>
+
+      <div class="head">
+        <div class="title">Value head → WDL</div>
+        <ol>
+          <li>Read <code>CLS</code> only (B, 1280)</li>
+          <li><code>Linear(1280 → 512)</code> → ReLU</li>
+          <li><code>Linear(512 → 3)</code></li>
+        </ol>
+        <div class="out">value_logits &nbsp;(B, 3)<br>
+          <span style="font-weight:400;color:var(--muted)">
+            win / draw / loss
+          </span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="foot">
+    source: chess_model.py · chess_transformer_factory.py · move_vocab.py<br>
+    200M line differs: single stream, ChessRelativeBias, no meta-attn · 700M: 63L/960d + rel-bias + 128-bin value
+  </p>
+
+</div>
+</body>
+</html>

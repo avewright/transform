@@ -1713,6 +1713,218 @@ class ShardedChessLoader:
             del fused, turn, castling_t, ep_file, move_idx, wdl, cp_vals, mate_vals
 
 
+def hard_ballast_cache_path(n_total: int, min_depth: int = 15, seed: int = 42) -> Path:
+    return CACHE_DIR / f"hard_ballast_d{min_depth}_n{n_total}_s{seed}.pt"
+
+
+def _parse_hard_chunk(payload):
+    """Process-pool worker: tokenize a chunk of (fen, move, eval_type, eval_value)."""
+    fens, moves, ets, evs = payload
+    m = len(fens)
+    ba = np.zeros((m, 64), dtype=np.int8)
+    turns = np.zeros(m, dtype=np.int8)
+    castlings = np.zeros(m, dtype=np.int8)
+    eps = np.zeros(m, dtype=np.int8)
+    midxs = np.zeros(m, dtype=np.int32)
+    cps = np.zeros(m, dtype=np.int32)
+    mates = np.zeros(m, dtype=np.int32)
+    arr = np.zeros(64, dtype=np.int8)
+    pos = 0
+    for i in range(m):
+        best = moves[i]
+        if best not in UCI_TO_IDX:
+            continue
+        try:
+            turn, castling, ep = _fast_parse_fen(fens[i], arr)
+        except Exception:
+            continue
+        et = ets[i] if ets is not None else "cp"
+        ev = int(evs[i]) if evs is not None and evs[i] is not None else 0
+        ba[pos] = arr
+        turns[pos] = turn
+        castlings[pos] = castling
+        eps[pos] = ep
+        midxs[pos] = UCI_TO_IDX[best]
+        cps[pos] = 0 if et == "mate" else ev
+        mates[pos] = ev if et == "mate" else 0
+        pos += 1
+    return {
+        "board_array": ba[:pos],
+        "turn": turns[:pos],
+        "castling": castlings[:pos],
+        "ep_square": eps[:pos],
+        "move_idx": midxs[:pos],
+        "cp": cps[:pos],
+        "mate": mates[:pos],
+    }
+
+
+def load_or_build_hard_ballast(
+    n_total: int = 2_000_000,
+    min_depth: int = 15,
+    seed: int = 42,
+    path: str | Path | None = None,
+    max_files: int | None = None,
+):
+    """Load (or build once) a local hard-ballast .pt from HF train_main parquets.
+
+    Avoids mid-step HF streaming. All train_main rows are depth>=15 in the
+    current lichess-sf revision; ``min_depth`` is retained for the cache name.
+    Build uses a process pool (FEN parse is CPU-bound).
+    """
+    out = Path(path) if path else hard_ballast_cache_path(n_total, min_depth, seed)
+    if out.exists():
+        print(f"  Loading hard ballast: {out}...", flush=True)
+        t0 = time.time()
+        data = torch.load(out, map_location="cpu", weights_only=True)
+        print(f"  Hard ballast {data['board_array'].shape[0]:,} in {time.time()-t0:.1f}s", flush=True)
+        return data, out
+
+    # Prefer a smaller existing ballast if present (e.g. 1M while 2M builds).
+    if path is None:
+        for alt_n in (n_total, 2_000_000, 1_000_000, 500_000):
+            alt = hard_ballast_cache_path(alt_n, min_depth, seed)
+            if alt.exists() and alt != out:
+                print(f"  Using existing hard ballast {alt} (wanted {out.name})", flush=True)
+                data = torch.load(alt, map_location="cpu", weights_only=True)
+                return data, alt
+
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from huggingface_hub import hf_hub_download
+    import pyarrow.parquet as pq
+
+    layout = get_hf_dataset_layout(HF_DATASET)
+    files = list(layout["train_main"])
+    if max_files is not None:
+        files = files[:max_files]
+    token = _hf_token()
+    workers = min(32, (os.cpu_count() or 8))
+    chunk_rows = 50_000
+    need = int(n_total)
+    parts = []
+    n = 0
+    t0 = time.time()
+    print(
+        f"  Building hard ballast n={n_total:,} from train_main "
+        f"(workers={workers})...",
+        flush=True,
+    )
+
+    for name in files:
+        if n >= need:
+            break
+        print(f"    {name}...", flush=True)
+        local = hf_hub_download(
+            HF_DATASET, name, repo_type="dataset",
+            token=token, revision=layout["revision"],
+        )
+        table = pq.read_table(
+            local, columns=["fen", "best_move", "eval_type", "eval_value"],
+        )
+        fens = table.column("fen").to_pylist()
+        moves = table.column("best_move").to_pylist()
+        ets = table.column("eval_type").to_pylist()
+        evs = table.column("eval_value").to_pylist()
+        del table
+        take = min(len(fens), max(need - n, 0) + chunk_rows)
+        if take <= 0:
+            break
+        fens, moves, ets, evs = fens[:take], moves[:take], ets[:take], evs[:take]
+        payloads = []
+        for start in range(0, take, chunk_rows):
+            end = min(start + chunk_rows, take)
+            payloads.append((fens[start:end], moves[start:end], ets[start:end], evs[start:end]))
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_parse_hard_chunk, p) for p in payloads]
+            for fut in as_completed(futs):
+                raw = fut.result()
+                got = int(raw["board_array"].shape[0])
+                if got == 0:
+                    continue
+                parts.append(raw)
+                n += got
+        print(f"      total={n:,} [{time.time()-t0:.0f}s]", flush=True)
+
+    if not parts:
+        raise RuntimeError("Failed to build hard ballast: no parquet rows")
+
+    keys = ["board_array", "turn", "castling", "ep_square", "move_idx", "cp", "mate"]
+    data = {
+        k: torch.from_numpy(np.concatenate([c[k] for c in parts], axis=0))
+        for k in keys
+    }
+    del parts
+    gc.collect()
+    n = int(data["board_array"].shape[0])
+    rng = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=rng)[: min(n_total, n)]
+    data = {k: v[perm].contiguous() for k, v in data.items()}
+    _save_cache(out, data)
+    print(f"  Hard ballast ready: {data['board_array'].shape[0]:,} @ {out}", flush=True)
+    return data, out
+
+
+class PrefetchIterator:
+    """Background-thread prefetch over a batch iterator (depth=2–4 typical).
+
+    Keeps the producer running while the consumer trains. On producer failure,
+    stores the exception and re-raises on next().
+    """
+
+    def __init__(self, factory, depth: int = 3, name: str = "prefetch"):
+        import queue
+        import threading
+
+        self._factory = factory
+        self._depth = max(1, int(depth))
+        self._name = name
+        self._q: queue.Queue = queue.Queue(maxsize=self._depth)
+        self._stop = threading.Event()
+        self._err: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                it = iter(self._factory())
+                for item in it:
+                    if self._stop.is_set():
+                        break
+                    self._q.put(("ok", item))
+                else:
+                    # iterator exhausted — rebuild via factory
+                    continue
+                break
+        except BaseException as e:
+            self._err = e
+            self._q.put(("err", e))
+        finally:
+            self._q.put(("done", None))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        kind, payload = self._q.get()
+        if kind == "ok":
+            return payload
+        if kind == "err":
+            raise payload
+        if self._err is not None:
+            raise self._err
+        raise StopIteration
+
+    def close(self):
+        self._stop.set()
+        # drain so worker can exit if blocked on full queue
+        try:
+            while True:
+                self._q.get_nowait()
+        except Exception:
+            pass
+
+
 def stream_hf_batches(
     batch_size: int,
     device,
@@ -1723,6 +1935,7 @@ def stream_hf_batches(
     """RAM-efficient HF streaming: yields training minibatches without full cache.
 
     Keeps at most ``shuffle_buffer`` rows in CPU memory at once.
+    Prefer ``load_or_build_hard_ballast`` + in-RAM sampling for training.
     """
     try:
         from datasets import load_dataset
@@ -1844,6 +2057,14 @@ if __name__ == "__main__":
     cache_p.add_argument("--min-depth", type=int, default=15)
     cache_p.add_argument("--seed", type=int, default=42)
 
+    # Hard ballast from HF train_main parquets
+    hard_p = sub.add_parser("hard-ballast", help="Build local hard ballast .pt from HF")
+    hard_p.add_argument("--n-total", type=int, default=2_000_000)
+    hard_p.add_argument("--min-depth", type=int, default=15)
+    hard_p.add_argument("--seed", type=int, default=42)
+    hard_p.add_argument("--path", type=str, default=None)
+    hard_p.add_argument("--max-files", type=int, default=None)
+
     # Pretokenize parquet shards
     pre_p = sub.add_parser("pretokenize", help="Pretokenize parquet shards")
     pre_p.add_argument("parquet_dir", help="Directory containing parquet files")
@@ -1866,6 +2087,15 @@ if __name__ == "__main__":
                 parquet_files, args.output_dir,
                 n_eval=args.n_eval, rows_per_shard=args.rows_per_shard,
             )
+    elif args.command == "hard-ballast":
+        data, path = load_or_build_hard_ballast(
+            n_total=args.n_total,
+            min_depth=args.min_depth,
+            seed=args.seed,
+            path=args.path,
+            max_files=args.max_files,
+        )
+        print(f"Ready: {data['board_array'].shape[0]:,} @ {path}")
     else:
         # Default/cache command
         n_total = getattr(args, 'n_total', 502500)

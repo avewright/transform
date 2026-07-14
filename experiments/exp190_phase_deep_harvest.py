@@ -215,16 +215,31 @@ def analyze(engine, board, depth, multipv, tau):
 
 def worker(wid, task_q, result_q, stop_ev, multipv, tau, hash_mb):
     rng = random.Random(20000 + wid)
-    eng = chess.engine.SimpleEngine.popen_uci(str(SF))
-    cfg = {"Threads": 1, "Hash": hash_mb}
-    if SYZYGY.exists() and any(SYZYGY.glob("*.rtbw")):
-        cfg["SyzygyPath"] = str(SYZYGY)
-    eng.configure(cfg)
-    # Full strength — never limit Elo
-    try:
-        eng.configure({"UCI_LimitStrength": False})
-    except Exception:
-        pass
+    # Stagger + retry: mass-parallel popen_uci often hits asyncio init timeouts.
+    time.sleep(0.15 * (wid % 16))
+    eng = None
+    for attempt in range(8):
+        try:
+            eng = chess.engine.SimpleEngine.popen_uci(str(SF))
+            cfg = {"Threads": 1, "Hash": hash_mb}
+            if SYZYGY.exists() and any(SYZYGY.glob("*.rtbw")):
+                cfg["SyzygyPath"] = str(SYZYGY)
+            eng.configure(cfg)
+            try:
+                eng.configure({"UCI_LimitStrength": False})
+            except Exception:
+                pass
+            break
+        except Exception:
+            try:
+                if eng is not None:
+                    eng.quit()
+            except Exception:
+                pass
+            eng = None
+            time.sleep(0.5 * (attempt + 1) + rng.random())
+    if eng is None:
+        return
     try:
         while not stop_ev.is_set():
             try:
@@ -643,17 +658,27 @@ def main():
                 if fen:
                     try_offer(fen, {"gen_source": "random_walk"})
 
+            # Keep workers fed: skip heavy HF pull when the queue is already healthy
+            try:
+                qsz = task_q.qsize()
+            except Exception:
+                qsz = 0
+            if qsz >= max(32, args.workers):
+                time.sleep(0.2)
+                continue
+
             repo = HF_SOURCES[epoch % len(HF_SOURCES)]
-            log(f"feed {repo} epoch={epoch} need={need} counts={dict(local_counts)}")
+            log(f"feed {repo} epoch={epoch} need={need} counts={dict(local_counts)} q={qsz}")
             try:
                 if "lichess-sf" in repo:
                     ds = load_dataset(repo, split="train", streaming=True).shuffle(
-                        seed=190 + epoch, buffer_size=30000,
+                        seed=190 + epoch, buffer_size=10000,
                     )
                     it = iter(ds)
                     offered = 0
                     scanned = 0
-                    while not stop_ev.is_set() and offered < 12000 and scanned < 80000:
+                    # Smaller HF batches so synthetics keep interleaving
+                    while not stop_ev.is_set() and offered < 1500 and scanned < 12000:
                         try:
                             row = next(it)
                         except StopIteration:
@@ -664,13 +689,19 @@ def main():
                             continue
                         if try_offer(fen, {"hf_repo": repo, "gen_source": "hf"}):
                             offered += 1
+                        if scanned % 400 == 0:
+                            # Mid-batch synthetic top-up so workers never idle
+                            for _ in range(16):
+                                fen_s = gen_endgame_fen(rng) if need == "endgame" else gen_book_playout_fen(rng)
+                                if fen_s:
+                                    try_offer(fen_s, {"gen_source": "endgame_template" if need == "endgame" else "book_playout"})
                 else:
                     ds = load_dataset(repo, split="train")
                     order = list(range(len(ds)))
                     rng.shuffle(order)
                     offered = 0
                     for i in order:
-                        if stop_ev.is_set() or offered >= 8000:
+                        if stop_ev.is_set() or offered >= 2000:
                             break
                         fen = ds[i].get("fen")
                         if fen and try_offer(fen, {"hf_repo": repo, "gen_source": "hf"}):
@@ -748,7 +779,7 @@ def main():
                 continue
             # Hard quota gate — openings label faster; don't let them flood
             ph = rec["phase"]
-            if not want_phase(ph, phase_counts, written, hard=True):
+            if not want_phase(ph, phase_counts, written, hard=False):
                 skip += 1
                 continue
             shard_f.write(json.dumps(rec, separators=(",", ":")) + "\n")
