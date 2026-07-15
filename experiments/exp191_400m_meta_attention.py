@@ -285,25 +285,57 @@ def save_checkpoint(model, optimizer, step, best_metric, path, args, config, sel
 
 
 class EpochSampler:
-    """Sample indices without replacement; reshuffle when an epoch is exhausted."""
+    """Sample indices without replacement; reshuffle when an epoch is exhausted.
 
-    def __init__(self, n: int, rng: torch.Generator):
+    If max_epochs > 0, stop after that many full shuffles (no further repeats).
+    take() then returns whatever remains (possibly fewer than k); callers should
+    check exhausted / returned length.
+    """
+
+    def __init__(self, n: int, rng: torch.Generator, max_epochs: int = 0):
         self.n = int(n)
         self.rng = rng
+        self.max_epochs = int(max_epochs)  # 0 = unlimited
         self.perm = torch.empty(0, dtype=torch.long)
         self.cursor = 0
+        self.epochs_started = 0
+        self.exhausted = self.n <= 0
+
+    def remaining(self) -> int:
+        if self.exhausted:
+            return 0
+        in_perm = max(0, self.perm.numel() - self.cursor)
+        if self.max_epochs <= 0:
+            return max(in_perm, self.n)  # at least one more reshuffle available
+        epochs_left_after = max(0, self.max_epochs - self.epochs_started)
+        # current partial epoch + future full epochs not yet started
+        future = epochs_left_after * self.n if self.perm.numel() == 0 else epochs_left_after * self.n
+        # if we've started current epoch, remaining in it + (max_epochs - epochs_started) full ones
+        if self.perm.numel() > 0:
+            return in_perm + max(0, self.max_epochs - self.epochs_started) * self.n
+        return future
 
     def take(self, k: int) -> torch.Tensor:
         out = []
         need = k
         while need > 0:
             if self.cursor >= self.perm.numel():
+                if self.max_epochs > 0 and self.epochs_started >= self.max_epochs:
+                    self.exhausted = True
+                    break
                 self.perm = torch.randperm(self.n, generator=self.rng)
                 self.cursor = 0
+                self.epochs_started += 1
             take_n = min(need, self.n - self.cursor)
+            if take_n <= 0:
+                break
             out.append(self.perm[self.cursor:self.cursor + take_n])
             self.cursor += take_n
             need -= take_n
+        if self.max_epochs > 0 and self.epochs_started >= self.max_epochs and self.cursor >= self.perm.numel():
+            self.exhausted = True
+        if not out:
+            return torch.empty(0, dtype=torch.long)
         return torch.cat(out, dim=0)
 
 
@@ -328,6 +360,12 @@ def main():
     )
     ap.add_argument("--deep-mix-frac", type=float, default=0.20,
                     help="Frac of soft steps drawn from deep cache (keep low if deep << shallow).")
+    ap.add_argument(
+        "--deep-max-epochs",
+        type=int,
+        default=0,
+        help="Max passes over deep soft cache (0=unlimited). Use 1 to never repeat deep rows.",
+    )
     ap.add_argument("--output-dir", default="outputs/exp191_400m_meta_attention")
     # A40-oriented defaults: large micro-batch, no accum waste, NorMuon LRs
     ap.add_argument("--steps", type=int, default=8000)
@@ -658,10 +696,19 @@ def main():
     accum_p = accum_v = accum_soft = accum_hard = 0.0
     accum_n = soft_steps = hard_steps = deep_steps = shallow_steps = 0
 
-    deep_sampler = EpochSampler(train_deep_n, rng) if (train_deep_n > 0 and deep_data is not None) else None
+    deep_sampler = (
+        EpochSampler(train_deep_n, rng, max_epochs=args.deep_max_epochs)
+        if (train_deep_n > 0 and deep_data is not None)
+        else None
+    )
     shallow_sampler = EpochSampler(train_soft_n, rng) if train_soft_n > 0 else None
     hard_sampler = EpochSampler(train_hard_n, rng) if train_hard_n > 0 else None
     use_deep_stream = deep_stream is not None
+    if deep_sampler is not None and args.deep_max_epochs > 0:
+        log(
+            f"  deep_max_epochs={args.deep_max_epochs} "
+            f"(no deep repeats after {args.deep_max_epochs} pass(es) over {train_deep_n:,} rows)"
+        )
 
     prep_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=max(1, min(2, args.prefetch_depth)),
@@ -682,18 +729,22 @@ def main():
         if use_soft and soft_data is not None:
             use_deep = (
                 (deep_sampler is not None or use_deep_stream)
+                and not (deep_sampler is not None and deep_sampler.exhausted)
                 and torch.rand(1, generator=rng).item() < args.deep_mix_frac
             )
             if use_deep and use_deep_stream:
                 return {"kind": "soft_stream", "tag": "deep"}
             if use_deep and deep_sampler is not None:
-                return {
-                    "kind": "soft",
-                    "tag": "deep",
-                    "data": deep_data,
-                    "idx": deep_sampler.take(args.batch_size),
-                    "rng": _hflip_rng(),
-                }
+                idx = deep_sampler.take(args.batch_size)
+                if idx.numel() > 0:
+                    return {
+                        "kind": "soft",
+                        "tag": "deep",
+                        "data": deep_data,
+                        "idx": idx,
+                        "rng": _hflip_rng(),
+                    }
+                # Deep just exhausted — fall through to shallow
             return {
                 "kind": "soft",
                 "tag": "shallow",
