@@ -39,8 +39,20 @@ class ChessTransformerConfig:
     full_dim_attention: bool = False
     # DeBERTa-style factored attention: content×position streams (4 logit terms).
     use_meta_attention: bool = False
+    # Original piece×square dual: Q/K/V on BOTH streams, cross + self, update both.
+    # (DeBERTa meta only puts V on content and never residual-updates position.)
+    use_piece_square_dual: bool = False
     # Shaw relative vectors on the position↔position term only (Δfile, Δrank buckets).
     use_shaw_on_pos: bool = True
+    # Modded-NanoGPT: RMSNorm on Q and K before attention scores.
+    use_qk_norm: bool = False
+    # Modded-NanoGPT / muP-like: zero-init attention out_proj and FFN down-projection.
+    zero_init_out_proj: bool = False
+    # Chessformer-2026 Geometric Attention Bias: board-conditioned additive attn bias.
+    use_gab: bool = False
+    gab_d1: int = 16
+    gab_d2: int = 64
+    gab_d3: int = 8
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ChessTransformerConfig":
@@ -278,6 +290,141 @@ class FullDimMultiheadAttention(nn.Module):
         return self.dropout(self.out_proj(out)), None
 
 
+class QKNormMultiheadAttention(nn.Module):
+    """Standard MHA (d_model // nhead per head) with RMSNorm on Q and K.
+
+    Ported idea from modded-nanogpt: stabilize attention logits without changing
+    board topology inductive bias.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def _shape(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        return x.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        need_weights: bool = False,
+    ):
+        del need_weights
+        B, T, _ = query.shape
+        q = self.q_norm(self._shape(self.q_proj(query)))
+        k = self.k_norm(self._shape(self.k_proj(key)))
+        v = self._shape(self.v_proj(value))
+
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                scale=self.scale,
+            )
+        else:
+            if attn_mask.dim() == 3:
+                bias = attn_mask.view(B, self.nhead, T, T)
+            else:
+                bias = attn_mask
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale + bias
+            attn = self.attn_dropout(torch.softmax(scores.float(), dim=-1).to(scores.dtype))
+            out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        return self.proj_dropout(self.out_proj(out)), None
+
+
+class PieceSquareDualAttention(nn.Module):
+    """Piece x square dual attention (original meta idea).
+
+    Streams stay separate: content = piece/what, position = square/where.
+
+    Cross (one stream Q, the other K; V from the keyed stream):
+      delta_c = softmax(Q_c @ K_p.T) @ V_p   # piece queries squares
+      delta_p = softmax(Q_p @ K_c.T) @ V_c   # square queries pieces
+
+    Then duplicate full QKV on each stream (self):
+      delta_c += softmax(Q_c @ K_c.T) @ V_c
+      delta_p += softmax(Q_p @ K_p.T) @ V_p
+
+    Unlike DeBERTa meta, both streams have V and both get residual updates.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by nhead={nhead}")
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = self.head_dim ** -0.5
+        self.use_qk_norm = False
+
+        self.q_c = nn.Linear(d_model, d_model, bias=False)
+        self.k_c = nn.Linear(d_model, d_model, bias=False)
+        self.v_c = nn.Linear(d_model, d_model, bias=False)
+        self.q_p = nn.Linear(d_model, d_model, bias=False)
+        self.k_p = nn.Linear(d_model, d_model, bias=False)
+        self.v_p = nn.Linear(d_model, d_model, bias=False)
+        self.out_c = nn.Linear(d_model, d_model)
+        self.out_p = nn.Linear(d_model, d_model)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def _shape(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        return x.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
+
+    def _merge(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, T, Dh = x.shape
+        return x.transpose(1, 2).contiguous().view(B, T, H * Dh)
+
+    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = self.attn_dropout(torch.softmax(scores.float(), dim=-1).to(scores.dtype))
+        return torch.matmul(attn, v)
+
+    def forward(
+        self, content: torch.Tensor, position: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qc = self._shape(self.q_c(content))
+        kc = self._shape(self.k_c(content))
+        vc = self._shape(self.v_c(content))
+        qp = self._shape(self.q_p(position))
+        kp = self._shape(self.k_p(position))
+        vp = self._shape(self.v_p(position))
+        if self.use_qk_norm:
+            qc, kc = self.q_norm(qc), self.k_norm(kc)
+            qp, kp = self.q_norm(qp), self.k_norm(kp)
+
+        # Cross: piece→square and square→piece
+        out_c = self._attn(qc, kp, vp) + self._attn(qc, kc, vc)
+        out_p = self._attn(qp, kc, vc) + self._attn(qp, kp, vp)
+
+        out_c = self.proj_dropout(self.out_c(self._merge(out_c)))
+        out_p = self.proj_dropout(self.out_p(self._merge(out_p)))
+        return out_c, out_p
+
+
 class MetaFactoredAttention(nn.Module):
     """4-term content×position attention + optional Shaw on position↔position.
 
@@ -303,12 +450,15 @@ class MetaFactoredAttention(nn.Module):
         self.n_ctx = n_ctx
         self.use_shaw = use_shaw
 
+        self.use_qk_norm = False  # set by builder
         self.q_c = nn.Linear(d_model, d_model, bias=False)
         self.k_c = nn.Linear(d_model, d_model, bias=False)
         self.v_c = nn.Linear(d_model, d_model, bias=False)
         self.q_p = nn.Linear(d_model, d_model, bias=False)
         self.k_p = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
 
@@ -343,6 +493,9 @@ class MetaFactoredAttention(nn.Module):
         vc = self._shape(self.v_c(content))
         qp = self._shape(self.q_p(position))
         kp = self._shape(self.k_p(position))
+        if self.use_qk_norm:
+            qc, kc = self.q_norm(qc), self.k_norm(kc)
+            qp, kp = self.q_norm(qp), self.k_norm(kp)
 
         # Four factored terms (B, H, T, T)
         cc = torch.matmul(qc, kc.transpose(-2, -1))
@@ -379,6 +532,25 @@ class MetaFactoredAttention(nn.Module):
         return self.proj_dropout(self.out_proj(out))
 
 
+def _zero_init_out_projections(attn: nn.Module, ffn: nn.Module) -> None:
+    """Zero-init residual branches (modded-nanogpt / muP-like)."""
+    if hasattr(attn, "out_proj") and hasattr(attn.out_proj, "weight"):
+        nn.init.zeros_(attn.out_proj.weight)
+        if attn.out_proj.bias is not None:
+            nn.init.zeros_(attn.out_proj.bias)
+    if isinstance(ffn, SwiGLUFFN):
+        nn.init.zeros_(ffn.w_down.weight)
+        if ffn.w_down.bias is not None:
+            nn.init.zeros_(ffn.w_down.bias)
+    elif isinstance(ffn, nn.Sequential):
+        for mod in reversed(list(ffn.modules())):
+            if isinstance(mod, nn.Linear):
+                nn.init.zeros_(mod.weight)
+                if mod.bias is not None:
+                    nn.init.zeros_(mod.bias)
+                break
+
+
 class MetaFactoredEncoderLayer(nn.Module):
     """Pre-norm encoder layer with meta-factored attention + SwiGLU/GELU FFN."""
 
@@ -391,14 +563,23 @@ class MetaFactoredEncoderLayer(nn.Module):
         use_swiglu: bool = True,
         use_shaw: bool = True,
         n_ctx: int = 4,
+        use_qk_norm: bool = False,
+        zero_init_out_proj: bool = False,
+        use_piece_square_dual: bool = False,
     ):
         super().__init__()
+        self.use_piece_square_dual = use_piece_square_dual
         self.norm_c = nn.LayerNorm(d_model)
         self.norm_p = nn.LayerNorm(d_model)
-        self.attn = MetaFactoredAttention(
-            d_model, nhead, dropout=dropout, use_shaw=use_shaw, n_ctx=n_ctx,
-        )
+        if use_piece_square_dual:
+            self.attn = PieceSquareDualAttention(d_model, nhead, dropout=dropout)
+        else:
+            self.attn = MetaFactoredAttention(
+                d_model, nhead, dropout=dropout, use_shaw=use_shaw, n_ctx=n_ctx,
+            )
+        self.attn.use_qk_norm = use_qk_norm
         self.norm_ff = nn.LayerNorm(d_model)
+        self.norm_ff_p = nn.LayerNorm(d_model) if use_piece_square_dual else None
         self.ffn = (
             SwiGLUFFN(d_model, ffn_dim, dropout) if use_swiglu
             else nn.Sequential(
@@ -409,12 +590,45 @@ class MetaFactoredEncoderLayer(nn.Module):
                 nn.Dropout(dropout),
             )
         )
+        # Light FFN on position stream so geometry can evolve (dual mode only).
+        self.ffn_p = (
+            (
+                SwiGLUFFN(d_model, ffn_dim, dropout) if use_swiglu
+                else nn.Sequential(
+                    nn.Linear(d_model, ffn_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(ffn_dim, d_model),
+                    nn.Dropout(dropout),
+                )
+            )
+            if use_piece_square_dual else None
+        )
         self.dropout = nn.Dropout(dropout)
+        if zero_init_out_proj:
+            if use_piece_square_dual:
+                for proj in (self.attn.out_c, self.attn.out_p):
+                    nn.init.zeros_(proj.weight)
+                    if proj.bias is not None:
+                        nn.init.zeros_(proj.bias)
+                _zero_init_out_projections(self.attn, self.ffn)
+                if self.ffn_p is not None:
+                    _zero_init_out_projections(self.attn, self.ffn_p)
+            else:
+                _zero_init_out_projections(self.attn, self.ffn)
 
     def forward(
         self, content: torch.Tensor, position: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_out = self.attn(self.norm_c(content), self.norm_p(position))
+        nc, np_ = self.norm_c(content), self.norm_p(position)
+        if self.use_piece_square_dual:
+            dc, dp = self.attn(nc, np_)
+            content = content + self.dropout(dc)
+            position = position + self.dropout(dp)
+            content = content + self.ffn(self.norm_ff(content))
+            position = position + self.ffn_p(self.norm_ff_p(position))
+            return content, position
+        attn_out = self.attn(nc, np_)
         content = content + self.dropout(attn_out)
         content = content + self.ffn(self.norm_ff(content))
         return content, position
@@ -431,11 +645,15 @@ class ChessTransformerEncoderLayer(nn.Module):
         dropout: float = 0.1,
         use_swiglu: bool = False,
         full_dim_attention: bool = False,
+        use_qk_norm: bool = False,
+        zero_init_out_proj: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         if full_dim_attention:
             self.attn = FullDimMultiheadAttention(d_model, nhead, dropout=dropout)
+        elif use_qk_norm:
+            self.attn = QKNormMultiheadAttention(d_model, nhead, dropout=dropout)
         else:
             self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
@@ -450,6 +668,8 @@ class ChessTransformerEncoderLayer(nn.Module):
             )
         )
         self.dropout = nn.Dropout(dropout)
+        if zero_init_out_proj:
+            _zero_init_out_projections(self.attn, self.ffn)
 
     def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
         normed = self.norm1(x)
@@ -457,6 +677,55 @@ class ChessTransformerEncoderLayer(nn.Module):
         x = x + self.dropout(attn_out)
         x = x + self.ffn(self.norm2(x))
         return x
+
+
+class GeometricAttentionBias(nn.Module):
+    """Board-conditioned attention bias (Chessformer GAB, arXiv:2605.19091).
+
+    Compresses the 64 square tokens into per-head coefficients that mix a shared
+    bank of 64×64 bias templates. Applied only on the square↔square block;
+    CLS/ctx rows/cols stay zero. Templates start at zero so early training
+    matches the no-GAB baseline.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        d1: int = 16,
+        d2: int = 64,
+        d3: int = 8,
+        n_ctx: int = 4,
+    ):
+        super().__init__()
+        self.nhead = nhead
+        self.n_ctx = n_ctx
+        self.d3 = d3
+        self.compress = nn.Linear(d_model, d1)
+        self.bottleneck = nn.Sequential(
+            nn.Linear(64 * d1, d2),
+            nn.GELU(),
+            nn.LayerNorm(d2),
+        )
+        self.to_coeffs = nn.Linear(d2, nhead * d3)
+        self.templates = nn.Linear(d3, 64 * 64, bias=False)
+        nn.init.zeros_(self.templates.weight)
+
+    def forward(self, sq_hidden: torch.Tensor) -> torch.Tensor:
+        """Return additive bias (B, H, seq, seq); squares start at index n_ctx."""
+        B = sq_hidden.shape[0]
+        if sq_hidden.shape[1] != 64:
+            raise ValueError(f"GAB expects 64 square tokens, got {sq_hidden.shape[1]}")
+        h = self.compress(sq_hidden).reshape(B, -1)
+        h = self.bottleneck(h)
+        coeffs = self.to_coeffs(h).view(B, self.nhead, self.d3)
+        bias64 = self.templates(coeffs).view(B, self.nhead, 64, 64)
+        # n_ctx already counts CLS (+ board ctx tokens) before the 64 squares.
+        seq = self.n_ctx + 64
+        out = sq_hidden.new_zeros(B, self.nhead, seq, seq)
+        s = self.n_ctx
+        out[:, :, s:s + 64, s:s + 64] = bias64
+        return out
 
 
 class SpatialPolicyHead(nn.Module):
@@ -543,6 +812,18 @@ class ChessTransformer(nn.Module):
             ChessRelativeBias(config.num_heads, n_ctx=config.n_ctx_tokens)
             if config.use_rel_bias and not config.use_meta_attention else None
         )
+        self.gab = (
+            GeometricAttentionBias(
+                config.hidden_dim,
+                config.num_heads,
+                d1=config.gab_d1,
+                d2=config.gab_d2,
+                d3=config.gab_d3,
+                n_ctx=config.n_ctx_tokens,
+            )
+            if config.use_gab and not config.use_meta_attention
+            else None
+        )
 
         ffn_dim = config.hidden_dim * config.ffn_ratio
         if config.use_meta_attention:
@@ -555,12 +836,18 @@ class ChessTransformer(nn.Module):
                     use_swiglu=config.use_swiglu,
                     use_shaw=config.use_shaw_on_pos,
                     n_ctx=config.n_ctx_tokens,
+                    use_qk_norm=config.use_qk_norm,
+                    zero_init_out_proj=config.zero_init_out_proj,
+                    use_piece_square_dual=config.use_piece_square_dual,
                 )
                 for _ in range(config.num_layers)
             ])
             self.transformer = None
         else:
-            use_custom = config.use_swiglu or config.use_rel_bias or config.full_dim_attention
+            use_custom = (
+                config.use_swiglu or config.use_rel_bias or config.full_dim_attention
+                or config.use_qk_norm or config.zero_init_out_proj or config.use_gab
+            )
             if use_custom:
                 self.layers = nn.ModuleList([
                     ChessTransformerEncoderLayer(
@@ -570,6 +857,8 @@ class ChessTransformer(nn.Module):
                         dropout=config.dropout,
                         use_swiglu=config.use_swiglu,
                         full_dim_attention=config.full_dim_attention,
+                        use_qk_norm=config.use_qk_norm,
+                        zero_init_out_proj=config.zero_init_out_proj,
                     )
                     for _ in range(config.num_layers)
                 ])
@@ -634,14 +923,22 @@ class ChessTransformer(nn.Module):
                 hidden = hidden + self.pos_embed
 
             if self.layers is not None:
-                attn_bias = None
+                nhead = self.config.num_heads
+                static_bias = None
                 if self.rel_bias is not None:
                     bias = self.rel_bias()  # (H, seq, seq)
-                    nhead = self.config.num_heads
-                    attn_bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(
+                    static_bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(
                         batch_size * nhead, hidden.shape[1], hidden.shape[1]
                     )
+                sq0 = self.config.n_ctx_tokens  # CLS+ctx count; squares follow
                 for layer in self.layers:
+                    attn_bias = static_bias
+                    if self.gab is not None:
+                        gab = self.gab(hidden[:, sq0:sq0 + 64, :])  # (B,H,T,T)
+                        gab_flat = gab.reshape(
+                            batch_size * nhead, hidden.shape[1], hidden.shape[1]
+                        )
+                        attn_bias = gab_flat if attn_bias is None else attn_bias + gab_flat
                     if self.config.gradient_checkpointing and self.training:
                         hidden = checkpoint(
                             layer, hidden, attn_bias,

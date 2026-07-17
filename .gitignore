@@ -47,3 +47,7 @@ archive/scratch/*.txt
 *.log
 build_*.txt
 unsloth_compiled_cache/
+
+# Upstream speedrun reference (local clone)
+modded-nanogpt/
+

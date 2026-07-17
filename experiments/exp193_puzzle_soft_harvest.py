@@ -224,7 +224,7 @@ def build_cache(dataset_dir: Path, out_path: Path, max_rows: int | None = None) 
     os.replace(tmp, out_path)
     ph = data["phase"]
     log(
-        f"soft_cache {ph.numel():,} → {out_path} "
+        f"soft_cache {ph.numel():,} -> {out_path} "
         f"phases={{o={int((ph==0).sum())} m={int((ph==1).sum())} e={int((ph==2).sum())}}} "
         f"skip={skipped}"
     )
