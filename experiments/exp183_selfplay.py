@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chess_inference import load_checkpoint, resolve_checkpoint
 from rl_selfplay.config import (
     SelfPlayConfig, a100_80gb_config, a40_45gb_config, laptop_8gb_config,
+    diverse_8gb_config, kl_anchored_config,
 )
 from rl_selfplay.generate import build_mcts, generate_positions
 from rl_selfplay.storage import append_dataset, load_positions, save_positions
@@ -46,7 +47,12 @@ from rl_selfplay.train import train_on_positions
 from rl_selfplay.utils import resolve_stockfish
 
 ROOT = Path(__file__).resolve().parent.parent
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 LOG_PATH: Path | None = None
 
 
@@ -146,7 +152,9 @@ def run_iteration(
 
     log(f"--- Iteration {iter_idx}: train ({cfg.train_epochs} epoch(s)) ---")
     n_value = model.config.n_value_classes if hasattr(model, "config") else 128
-    metrics = train_on_positions(model, positions, DEVICE, cfg, n_value, log_fn=log)
+    metrics = train_on_positions(
+        model, positions, DEVICE, cfg, n_value, log_fn=log, prior_model=prior_model,
+    )
 
     ckpt_path = iter_dir / "model.pt"
     save_rl_checkpoint(model, ckpt_path, iter_idx, meta)
@@ -164,7 +172,12 @@ def run_iteration(
 def main():
     parser = argparse.ArgumentParser(description="Expert-iteration self-play loop")
     parser.add_argument("--go", action="store_true", help="Run (default is dry-run)")
-    parser.add_argument("--preset", choices=["laptop", "a40", "a100"], default="laptop")
+    parser.add_argument(
+        "--preset",
+        choices=["laptop", "a40", "a100", "diverse", "kl"],
+        default="laptop",
+        help="kl = path-to-2500 Phase 4 KL-anchored expert-iter",
+    )
     parser.add_argument("--mode", choices=["self", "sf", "prior"], default=None)
     parser.add_argument("--checkpoint", "-c", type=str, default=None)
     parser.add_argument("--prior-checkpoint", type=str, default=None)
@@ -184,6 +197,10 @@ def main():
         cfg = a100_80gb_config()
     elif args.preset == "a40":
         cfg = a40_45gb_config()
+    elif args.preset == "diverse":
+        cfg = diverse_8gb_config()
+    elif args.preset == "kl":
+        cfg = kl_anchored_config()
     else:
         cfg = laptop_8gb_config()
     if args.mode:
@@ -199,7 +216,11 @@ def main():
     if args.output_dir:
         cfg = SelfPlayConfig(**{**cfg.to_dict(), "output_dir": args.output_dir})
     if args.prior_checkpoint:
-        cfg = SelfPlayConfig(**{**cfg.to_dict(), "prior_checkpoint": args.prior_checkpoint, "mode": "prior"})
+        # Keep generation mode unless user set --mode; always record prior path.
+        updates = {"prior_checkpoint": args.prior_checkpoint}
+        if args.mode == "prior":
+            updates["mode"] = "prior"
+        cfg = SelfPlayConfig(**{**cfg.to_dict(), **updates})
 
     if args.smoke:
         cfg = SelfPlayConfig(**{
@@ -244,11 +265,14 @@ def main():
     log(f"  loaded {n_params:.0f}M params")
 
     prior_model = None
-    if cfg.mode == "prior":
+    need_prior = cfg.mode == "prior" or cfg.prior_kl_weight > 0
+    if need_prior:
         prior_path = args.prior_checkpoint or cfg.prior_checkpoint or ckpt_path
-        log(f"  prior opponent: {prior_path}")
+        log(f"  frozen prior ({'opponent+KL' if cfg.mode == 'prior' else 'KL'}): {prior_path}")
         prior_model = load_checkpoint(prior_path, DEVICE)
         prior_model.eval()
+        for p in prior_model.parameters():
+            p.requires_grad_(False)
 
     if args.train_only:
         if not args.data:
@@ -256,7 +280,9 @@ def main():
         positions, meta = load_positions(Path(args.data))
         log(f"training on {len(positions)} positions from {args.data}")
         n_value = model.config.n_value_classes if hasattr(model, "config") else 128
-        train_on_positions(model, positions, DEVICE, cfg, n_value, log_fn=log)
+        train_on_positions(
+            model, positions, DEVICE, cfg, n_value, log_fn=log, prior_model=prior_model,
+        )
         save_rl_checkpoint(model, output_dir / "latest.pt", 0, meta)
         return
 

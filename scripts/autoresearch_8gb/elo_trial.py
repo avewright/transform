@@ -16,13 +16,17 @@ def run_elo_trial(
     *,
     model_config: Path | str | None = None,
     movetime: float = 0.05,
-    games_per_opening_per_color: int = 1,
+    games_per_opening_per_color: int | None = None,
     elos: list[int] | None = None,
     stop_after_bracket: bool = True,
     smoke: bool = False,
 ) -> dict[str, Any]:
     ckpt_path = Path(ckpt_path)
-    elos = elos or ([1320, 1450] if smoke else [1320, 1450, 1600, 1750, 1900])
+    # F0.3: denser gauntlet so we escape the 1320 floor noise.
+    # Stockfish 18 UCI_Elo min is 1320 — lower levels raise EngineError.
+    elos = elos or ([1320, 1450] if smoke else [1320, 1450, 1600, 1750, 1900, 2050, 2200])
+    if games_per_opening_per_color is None:
+        games_per_opening_per_color = 1 if smoke else 2
     if smoke:
         games_per_opening_per_color = 1
         # Keep smoke short: few levels, still real games

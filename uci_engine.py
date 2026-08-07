@@ -43,7 +43,20 @@ from move_vocab import (VOCAB_SIZE, index_to_move, legal_move_mask,
 from opening_book import get_book_move
 
 ROOT = Path(__file__).resolve().parent
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _pick_device(explicit: str | None = None) -> torch.device:
+    """CUDA > MPS > CPU, matching elo_eval_latest."""
+    if explicit:
+        return torch.device(explicit)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
 
 
 # ── Syzygy Tablebase ──
@@ -150,7 +163,9 @@ class MCTSSearch:
                  root_noise_alpha=0.3, root_noise_frac=0.25,
                  use_fp16=True, policy_temp=1.0,
                  root_widening=0, inner_temp=1.0,
-                 use_transpositions=True, dynamic_cpuct=False):
+                 use_transpositions=True, dynamic_cpuct=False,
+                 search_mode: str = "puct", gumbel_top_k: int = 16,
+                 gumbel_sim_threshold: int = 256):
         self.model = model
         self.device = device
         self.syzygy = syzygy
@@ -168,6 +183,10 @@ class MCTSSearch:
         self.inner_temp = inner_temp
         self.use_transpositions = use_transpositions
         self.dynamic_cpuct = dynamic_cpuct
+        # "puct" | "gumbel" | "auto" (gumbel when max_sims <= gumbel_sim_threshold)
+        self.search_mode = search_mode
+        self.gumbel_top_k = gumbel_top_k
+        self.gumbel_sim_threshold = gumbel_sim_threshold
         self.root = None
         self.root_board = None
         self.nn_evals = 0
@@ -493,11 +512,175 @@ class MCTSSearch:
                               is_root=True)
             self.root_board = board.copy()
 
+    def _sigma_gumbel(self, q, v_root, max_n, c_visit=5.0):
+        """Completed-Q transform for Gumbel action selection (Danihelka 2022)."""
+        q_centered = q - v_root
+        return c_visit * max_n * q_centered / (c_visit + max_n)
+
+    def _run_sim_forced_root(self, root, base_board, target_move):
+        """One PUCT sim that forces ``target_move`` at the root (Gumbel SH)."""
+        child = root.children[target_move]
+        board = base_board.copy()
+        board.push(target_move)
+        path = [root, child]
+        node = child
+
+        while node.is_expanded and node.children:
+            if board.is_game_over(claim_draw=True):
+                break
+            move, next_child = self._select_child(node)
+            if move is None:
+                break
+            board.push(move)
+            path.append(next_child)
+            node = next_child
+
+        if board.is_game_over(claim_draw=True):
+            outcome = board.outcome(claim_draw=True)
+            if outcome is None or outcome.winner is None:
+                value = 0.0
+            elif outcome.winner == board.turn:
+                value = 1.0
+            else:
+                value = -1.0
+        elif not node.is_expanded:
+            value = self._expand_node(node, board)
+        else:
+            value = node.q_value()
+
+        v = value
+        for n in reversed(path):
+            n.visit_count += 1
+            n.value_sum += v
+            v = -v
+        return value
+
+    def gumbel_search(self, board, max_sims=200):
+        """Root Gumbel + Sequential Halving; interior nodes use PUCT."""
+        self.reset_stats()
+        t0 = time.time()
+
+        tb_move = self.syzygy.get_move(board)
+        if tb_move is not None:
+            return tb_move, {"source": "syzygy", "nn_evals": 0, "sims": 0,
+                             "elapsed": time.time() - t0, "mode": "gumbel"}
+
+        book_move = get_book_move(board)
+        if book_move is not None:
+            return book_move, {"source": "book", "nn_evals": 0, "sims": 0,
+                               "elapsed": time.time() - t0, "mode": "gumbel"}
+
+        with self._lock:
+            # Fresh root for Gumbel (no Dirichlet noise / tree reuse)
+            self.root = MCTSNode()
+            self._expand_node(self.root, board, is_root=True)
+            self.root_board = board.copy()
+            root = self.root
+
+            if not root.children:
+                return list(board.legal_moves)[0], {
+                    "nn_evals": 0, "sims": 0, "elapsed": 0, "mode": "gumbel"}
+            if len(root.children) == 1:
+                move = next(iter(root.children))
+                return move, {"nn_evals": self.nn_evals, "sims": 0,
+                              "elapsed": time.time() - t0, "forced": True,
+                              "mode": "gumbel"}
+
+            moves = list(root.children.keys())
+            n_moves = len(moves)
+            log_priors = np.array(
+                [math.log(max(root.children[m].prior, 1e-8)) for m in moves]
+            )
+            gumbel_noise = np.random.gumbel(size=n_moves)
+            gumbel_scores = log_priors + gumbel_noise
+
+            K = min(self.gumbel_top_k, n_moves)
+            top_indices = np.argsort(gumbel_scores)[-K:][::-1]
+            selected_moves = [moves[i] for i in top_indices]
+            selected_gumbels = gumbel_scores[top_indices]
+
+            remaining = list(range(K))
+            sims_used = 0
+            n_halving_rounds = max(1, int(math.log2(K)))
+            sims_per_round = max_sims // max(1, n_halving_rounds)
+
+            for _round_idx in range(n_halving_rounds):
+                if len(remaining) <= 1:
+                    break
+                sims_each = max(1, sims_per_round // len(remaining))
+                for idx in remaining:
+                    move = selected_moves[idx]
+                    for _ in range(sims_each):
+                        self._run_sim_forced_root(root, board, move)
+                        sims_used += 1
+                        if sims_used >= max_sims:
+                            break
+                    if sims_used >= max_sims:
+                        break
+                if sims_used >= max_sims:
+                    break
+
+                completed_scores = []
+                max_n = max(
+                    (root.children[selected_moves[idx]].visit_count
+                     for idx in remaining),
+                    default=1,
+                )
+                v_root = root.q_value() if root.visit_count > 0 else 0.0
+                for idx in remaining:
+                    move = selected_moves[idx]
+                    child = root.children[move]
+                    if child.visit_count > 0:
+                        q = -child.q_value()
+                        score = selected_gumbels[idx] + self._sigma_gumbel(
+                            q, v_root, max_n
+                        )
+                    else:
+                        score = selected_gumbels[idx]
+                    completed_scores.append((idx, score))
+                completed_scores.sort(key=lambda x: -x[1])
+                keep = max(1, len(remaining) // 2)
+                remaining = [idx for idx, _ in completed_scores[:keep]]
+
+            while sims_used < max_sims and remaining:
+                for idx in remaining:
+                    if sims_used >= max_sims:
+                        break
+                    self._run_sim_forced_root(root, board, selected_moves[idx])
+                    sims_used += 1
+
+            best_move = max(root.children.items(),
+                            key=lambda x: x[1].visit_count)[0]
+            pv = self._extract_pv(root)
+            score_cp = self._q_to_cp(root.q_value())
+
+        elapsed = time.time() - t0
+        return best_move, {
+            "nn_evals": self.nn_evals,
+            "sims": sims_used,
+            "elapsed": elapsed,
+            "score_cp": score_cp,
+            "pv": pv,
+            "root_visits": root.visit_count,
+            "mode": "gumbel",
+        }
+
     def search(self, board, max_sims=None, time_limit=None):
         """Run MCTS search. Returns (best_move, info_dict).
 
         Uses either sim count or time limit (whichever stops first).
+        Dispatches to Gumbel when search_mode is gumbel/auto at low sims.
         """
+        # Gumbel path: fixed sim budget only (no time-based sequential halving)
+        if time_limit is None:
+            sims = max_sims or 200
+            use_gumbel = (
+                self.search_mode == "gumbel"
+                or (self.search_mode == "auto" and sims <= self.gumbel_sim_threshold)
+            )
+            if use_gumbel:
+                return self.gumbel_search(board, max_sims=sims)
+
         self.reset_stats()
         t0 = time.time()
 
@@ -766,15 +949,30 @@ class TimeManager:
 class UCIEngine:
     """UCI protocol handler."""
 
-    def __init__(self, checkpoint_path: str, syzygy_path: str = None,
-                 default_sims: int = 800, dynamic_cpuct: bool = False):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        syzygy_path: str = None,
+        default_sims: int = 800,
+        dynamic_cpuct: bool = False,
+        device: str | None = None,
+        batch_size: int = 16,
+        search_mode: str = "auto",
+        gumbel_top_k: int = 16,
+    ):
         self.model = None
         self.checkpoint_path = checkpoint_path
         self.search = None
+        self.device = _pick_device(device)
+        global DEVICE
+        DEVICE = self.device
         self.time_manager = TimeManager(default_sims=default_sims)
         self.syzygy = SyzygyProbe(syzygy_path)
         self.default_sims = default_sims
         self.dynamic_cpuct = dynamic_cpuct
+        self.batch_size = max(1, batch_size)
+        self.search_mode = search_mode
+        self.gumbel_top_k = gumbel_top_k
         self.board = chess.Board()
         self.ponder = False
         self.debug = False
@@ -784,11 +982,13 @@ class UCIEngine:
         self._load_model()
 
     def _load_model(self):
-        self.model = load_checkpoint(self.checkpoint_path, DEVICE)
+        self.model = load_checkpoint(self.checkpoint_path, self.device)
         self.search = MCTSSearch(
-            self.model, DEVICE, self.syzygy,
-            c_puct=2.5, batch_size=8,
+            self.model, self.device, self.syzygy,
+            c_puct=2.5, batch_size=self.batch_size,
             dynamic_cpuct=self.dynamic_cpuct,
+            search_mode=self.search_mode,
+            gumbel_top_k=self.gumbel_top_k,
         )
 
     def run(self):
@@ -837,6 +1037,11 @@ class UCIEngine:
         self._send("option name CPuct type string default 2.5")
         self._send("option name Ponder type check default true")
         self._send("option name SyzygyPath type string default syzygy")
+        self._send("option name SearchMode type combo default auto "
+                    "var auto var puct var gumbel")
+        self._send(f"option name BatchSize type spin default {self.batch_size} "
+                    "min 1 max 128")
+        self._send(f"id device {self.device}")
         self._send("uciok")
 
     def _cmd_isready(self):
@@ -860,6 +1065,14 @@ class UCIEngine:
             elif name.lower() == "syzygypath":
                 self.syzygy = SyzygyProbe(value)
                 self.search.syzygy = self.syzygy
+            elif name.lower() == "searchmode":
+                mode = value.lower().strip()
+                if mode in ("auto", "puct", "gumbel"):
+                    self.search_mode = mode
+                    self.search.search_mode = mode
+            elif name.lower() == "batchsize":
+                self.batch_size = max(1, int(value))
+                self.search.batch_size = self.batch_size
         except (ValueError, IndexError):
             pass
 
@@ -1063,15 +1276,35 @@ def main():
                         help="Path to model checkpoint")
     parser.add_argument("--syzygy", default=None,
                         help="Path to Syzygy tablebase directory")
-    parser.add_argument("--default-sims", type=int, default=200,
-                        help="Default MCTS simulations per move")
+    parser.add_argument("--default-sims", type=int, default=800,
+                        help="Default MCTS simulations per move (tournament: 800-1600)")
     parser.add_argument("--dynamic-cpuct", action="store_true",
                         help="Scale cPUCT by sqrt(value variance) per node (KataGo-style)")
+    parser.add_argument("--device", default=None,
+                        help="cuda | mps | cpu (default: auto)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batched leaf NN eval size (default 16)")
+    parser.add_argument("--search-mode", choices=("auto", "puct", "gumbel"),
+                        default="auto",
+                        help="auto=gumbel at low sims, puct at high (default auto)")
+    parser.add_argument("--gumbel-top-k", type=int, default=16,
+                        help="Gumbel Sequential Halving root width")
     args = parser.parse_args()
 
     ckpt = args.checkpoint or find_checkpoint()
-    engine = UCIEngine(ckpt, args.syzygy, args.default_sims,
-                       dynamic_cpuct=args.dynamic_cpuct)
+    engine = UCIEngine(
+        ckpt, args.syzygy, args.default_sims,
+        dynamic_cpuct=args.dynamic_cpuct,
+        device=args.device,
+        batch_size=args.batch_size,
+        search_mode=args.search_mode,
+        gumbel_top_k=args.gumbel_top_k,
+    )
+    # Log device once on stderr so UCI stdout stays clean for GUIs that
+    # only parse stdout after 'uci'.
+    print(f"info string device={engine.device} batch={engine.batch_size} "
+          f"search={engine.search_mode} sims={engine.default_sims}",
+          file=sys.stderr, flush=True)
     engine.run()
 
 

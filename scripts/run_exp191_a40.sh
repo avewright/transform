@@ -39,8 +39,21 @@ if [[ -n "${RESUME:-}" ]]; then
   fi
 fi
 
+INIT_ARGS=()
+if [[ -n "${INIT_CHECKPOINT:-}" ]]; then
+  INIT_ARGS=(--init-checkpoint "$INIT_CHECKPOINT")
+fi
+
+# Path-to-2500 defaults: prefer hf_soft_mix_5m when present
+if [[ -z "${SOFT_CACHE:-}" && -f outputs/hf_soft_mix/soft_cache.pt ]]; then
+  SOFT=outputs/hf_soft_mix/soft_cache.pt
+fi
+if [[ -z "${DEEP_SOFT_CACHE:-}" && -f outputs/hf_soft_mix/deep_soft.pt ]]; then
+  DEEP_ARGS=(--deep-soft-cache outputs/hf_soft_mix/deep_soft.pt --deep-mix-frac "${DEEP_MIX_FRAC:-0.25}")
+fi
+
 echo "=== exp191 A40 start $(date -Is) ===" | tee -a "$OUT/run.log"
-echo "soft=$SOFT soft_frac=${SOFT_FRAC:-0.88} soft_alpha=${SOFT_ALPHA:-0.50} steps=${STEPS:-22000} deep_args=${DEEP_ARGS[*]:-none} hard=${HARD_ARGS[*]} resume=${RESUME:-none}" | tee -a "$OUT/run.log"
+echo "soft=$SOFT soft_frac=${SOFT_FRAC:-0.88} soft_alpha=${SOFT_ALPHA:-0.50} steps=${STEPS:-22000} deep_args=${DEEP_ARGS[*]:-none} hard=${HARD_ARGS[*]} resume=${RESUME:-none} init=${INIT_CHECKPOINT:-none}" | tee -a "$OUT/run.log"
 
 python -u experiments/exp191_400m_meta_attention.py \
   --go \
@@ -55,19 +68,20 @@ python -u experiments/exp191_400m_meta_attention.py \
   --adam-lr 3e-4 \
   --grad-clip "${GRAD_CLIP:-0.5}" \
   --hflip-p 0.5 \
-  --min-depth 15 \
+  --min-depth "${MIN_DEPTH:-12}" \
   --shuffle-buffer 4096 \
   --log-interval 25 \
   --save-interval "${SAVE_INTERVAL:-500}" \
   --eval-interval "${EVAL_INTERVAL:-1500}" \
   --eval-n "${EVAL_N:-2048}" \
-  --select-metric soft_loss \
+  --select-metric "${SELECT_METRIC:-top1}" \
   --output-dir "$OUT" \
   --soft-cache "$SOFT" \
   "${HARD_ARGS[@]}" \
   "${DEEP_ARGS[@]}" \
   "${CKPT_ARGS[@]}" \
   "${RESUME_ARGS[@]}" \
+  "${INIT_ARGS[@]}" \
   2>&1 | tee -a "$OUT/run.log"
 
 echo "=== exp191 A40 end $(date -Is) ===" | tee -a "$OUT/run.log"

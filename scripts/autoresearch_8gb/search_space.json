@@ -1,582 +1,857 @@
 {
-  "baseline_id": "baseline_deep_small",
-  "elo_noise": 100,
-  "speed_promote_frac": 0.2,
-  "default_train_minutes": 90,
-  "default_max_steps": 8000,
-  "soft_cache_candidates": [
-    "outputs/autoresearch_8gb/soft_cache_200k.pt",
-    "outputs/exp186_sf_multipv/soft_cache_merged.pt",
-    "outputs/exp186_sf_multipv/soft_cache.pt",
-    "outputs/autoresearch_8gb/soft_cache.pt"
-  ],
-  "deep_cache_candidates": [
-    "outputs/autoresearch_8gb/puzzle_syzygy_mix.pt",
-    "outputs/syzygy_hf/soft_cache.pt",
-    "outputs/exp193_puzzle_soft/soft_cache.pt",
-    "outputs/exp190_phase_deep/soft_cache.pt",
-    "outputs/lichess_evals_soft/quality_deep_mix.pt",
-    "outputs/lichess_evals_soft/soft_cache.pt"
-  ],
-  "syzygy_hf_repo": "avewright/chess-soft-syzygy",
-  "trials": [
-    {
-      "id": "baseline_deep_small",
-      "desc": "28L/256d strengthened + rel_bias + SwiGLU + NorMuon",
-      "model": {
-        "encoder_dim": 256,
-        "encoder_type": "strengthened",
-        "encoder_conv_blocks": 2,
-        "normalize_stm": true,
-        "hidden_dim": 256,
-        "num_layers": 28,
-        "num_heads": 8,
-        "ffn_ratio": 4,
-        "dropout": 0.05,
-        "policy_head_dim": 192,
-        "value_hidden": 128,
-        "use_pos_embed": false,
-        "n_ctx_tokens": 4,
-        "value_head_type": "cls",
-        "n_value_classes": 3,
-        "use_swiglu": true,
-        "use_rel_bias": true,
-        "gradient_checkpointing": false,
-        "full_dim_attention": false,
-        "use_meta_attention": false,
-        "use_shaw_on_pos": true
-      },
-      "train": {
-        "batch_size": 96,
-        "accum_steps": 2,
-        "soft_frac": 1.0,
-        "soft_alpha": 0.45,
-        "deep_mix_frac": 0.35,
-        "hflip_p": 0.5,
-        "value_weight": 0.1,
-        "optimizer": "normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "weight_decay": 0.01,
-        "grad_clip": 1.0,
-        "warmup": 200,
-        "min_lr_frac": 0.05,
-        "min_depth": 12,
-        "torch_compile": false,
-        "grad_checkpoint": false
-      }
-    },
-    {
-      "id": "meta_shaw_no_relbias",
-      "desc": "Same size + meta attention + Shaw, no handcrafted rel_bias",
-      "model": {
-        "encoder_dim": 256,
-        "encoder_type": "strengthened",
-        "encoder_conv_blocks": 2,
-        "normalize_stm": true,
-        "hidden_dim": 256,
-        "num_layers": 24,
-        "num_heads": 8,
-        "ffn_ratio": 4,
-        "dropout": 0.05,
-        "policy_head_dim": 192,
-        "value_hidden": 128,
-        "use_pos_embed": false,
-        "n_ctx_tokens": 4,
-        "value_head_type": "cls",
-        "n_value_classes": 3,
-        "use_swiglu": true,
-        "use_rel_bias": false,
-        "gradient_checkpointing": false,
-        "full_dim_attention": false,
-        "use_meta_attention": true,
-        "use_shaw_on_pos": true
-      },
-      "train": {
-        "batch_size": 64,
-        "accum_steps": 3,
-        "soft_frac": 1.0,
-        "soft_alpha": 0.45,
-        "deep_mix_frac": 0.35,
-        "hflip_p": 0.5,
-        "value_weight": 0.1,
-        "optimizer": "normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "weight_decay": 0.01,
-        "grad_clip": 1.0,
-        "warmup": 200,
-        "min_lr_frac": 0.05,
-        "min_depth": 12,
-        "torch_compile": false,
-        "grad_checkpoint": true
-      }
-    },
-    {
-      "id": "wider_shallower",
-      "desc": "16L/384d width swap ~same params",
-      "model": {
-        "encoder_dim": 256,
-        "encoder_type": "strengthened",
-        "encoder_conv_blocks": 2,
-        "normalize_stm": true,
-        "hidden_dim": 384,
-        "num_layers": 16,
-        "num_heads": 8,
-        "ffn_ratio": 4,
-        "dropout": 0.05,
-        "policy_head_dim": 192,
-        "value_hidden": 128,
-        "use_pos_embed": false,
-        "n_ctx_tokens": 4,
-        "value_head_type": "cls",
-        "n_value_classes": 3,
-        "use_swiglu": true,
-        "use_rel_bias": true,
-        "gradient_checkpointing": false,
-        "full_dim_attention": false,
-        "use_meta_attention": false,
-        "use_shaw_on_pos": true
-      },
-      "train": {
-        "batch_size": 80,
-        "accum_steps": 2,
-        "soft_frac": 1.0,
-        "soft_alpha": 0.45,
-        "deep_mix_frac": 0.35,
-        "hflip_p": 0.5,
-        "value_weight": 0.1,
-        "optimizer": "normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "weight_decay": 0.01,
-        "grad_clip": 1.0,
-        "warmup": 200,
-        "min_lr_frac": 0.05,
-        "min_depth": 12,
-        "torch_compile": false,
-        "grad_checkpoint": false
-      }
-    },
-    {
-      "id": "gelu_no_swiglu",
-      "desc": "Baseline arch with GELU FFN",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_swiglu": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "fused_encoder",
-      "desc": "Fused encoder instead of strengthened",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "encoder_type": "fused",
-        "normalize_stm": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "adamw_only",
-      "desc": "Baseline + AdamW instead of NorMuon",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "optimizer": "adamw",
-        "adam_lr": 0.0003,
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "soft_heavy_mix",
-      "desc": "Data: softer mix (higher soft_frac/alpha)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_alpha": 0.6,
-        "deep_mix_frac": 0.5,
-        "hflip_p": 0.5
-      }
-    },
-    {
-      "id": "elo_safe_mix",
-      "desc": "Data: FT3f-like safer mix (less soft domination)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_alpha": 0.35,
-        "deep_mix_frac": 0.3,
-        "hflip_p": 0.5,
-        "value_weight": 0.08
-      }
-    },
-    {
-      "id": "compile_speed",
-      "desc": "Baseline + torch.compile for throughput",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "torch_compile": true,
-        "batch_size": 112,
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "no_relbias_vanilla",
-      "desc": "Drop handcrafted rel_bias, keep vanilla attn",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_rel_bias": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "qk_norm",
-      "desc": "Wave2 modded-nanogpt: QK-RMSNorm on attention",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_qk_norm": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "zero_init_out",
-      "desc": "Wave2 modded-nanogpt: zero-init attn out + FFN down",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "zero_init_out_proj": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "qk_norm_zero_init",
-      "desc": "Wave2: QK-Norm + zero-init residual branches",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_qk_norm": true,
-        "zero_init_out_proj": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "meta_qk_norm",
-      "desc": "Wave2: meta attention + Shaw + QK-Norm (no rel_bias)",
-      "inherits": "meta_shaw_no_relbias",
-      "model_overrides": {
-        "use_qk_norm": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "polar_normuon",
-      "desc": "Wave2: NorMuon with Polar Express orthogonalization",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "optimizer": "polar_normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "piece_square_dual",
-      "desc": "Original meta: piece x square dual QKV (cross+self, update both streams)",
-      "inherits": "meta_shaw_no_relbias",
-      "model_overrides": {
-        "use_piece_square_dual": true,
-        "use_shaw_on_pos": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "puzzle_syzygy_mix",
-      "desc": "Data: MultiPV soft + 45% puzzle/Syzygy deep mix (tactics+perfect EG)",
-      "inherits": "fused_encoder",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "deep_mix_frac": 0.45,
-        "soft_alpha": 0.55
-      }
-    },
-    {
-      "id": "puzzle_syzygy_heavy",
-      "desc": "Data: 70% puzzle/Syzygy deep mix (tactical+EG focus)",
-      "inherits": "fused_encoder",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "deep_mix_frac": 0.70,
-        "soft_alpha": 0.65,
-        "value_weight": 0.3
-      }
-    },
-    {
-      "id": "dual_puzzle_syzygy",
-      "desc": "piece_square_dual + puzzle/Syzygy deep mix",
-      "inherits": "piece_square_dual",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "deep_mix_frac": 0.45,
-        "soft_alpha": 0.55
-      }
-    },
-    {
-      "id": "dual_highelo_puzzle_syzygy",
-      "desc": "piece-square dual on high-Elo puzzles+Syzygy; fat batch, compile, Elo@500",
-      "inherits": "piece_square_dual",
-      "model_overrides": {
-        "use_piece_square_dual": true,
-        "use_meta_attention": true,
-        "use_rel_bias": false,
-        "use_shaw_on_pos": false,
-        "encoder_type": "strengthened",
-        "normalize_stm": true,
-        "gradient_checkpointing": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "deep_mix_frac": 0.0,
-        "soft_alpha": 0.75,
-        "value_weight": 0.25,
-        "hflip_p": 0.5,
-        "use_swa": true,
-        "swa_start_frac": 0.75,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.35,
-        "optimizer": "normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "batch_size": 256,
-        "accum_steps": 1,
-        "grad_checkpoint": true,
-        "torch_compile": true,
-        "elo_every_steps": 500,
-        "warmup": 150,
-        "max_vram_gb": 6.8
-      }
-    },
-    {
-      "id": "dual_highelo_a40",
-      "desc": "A40 ~45GB: dual meta, no grad-ckpt, fat batch, compile, Elo@500",
-      "inherits": "dual_highelo_puzzle_syzygy",
-      "model_overrides": {
-        "use_piece_square_dual": true,
-        "use_meta_attention": true,
-        "use_rel_bias": false,
-        "use_shaw_on_pos": false,
-        "encoder_type": "strengthened",
-        "normalize_stm": true,
-        "gradient_checkpointing": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "deep_mix_frac": 0.0,
-        "soft_alpha": 0.75,
-        "value_weight": 0.25,
-        "hflip_p": 0.5,
-        "use_swa": true,
-        "swa_start_frac": 0.75,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.35,
-        "optimizer": "normuon",
-        "muon_lr": 0.02,
-        "adam_lr": 0.0003,
-        "batch_size": 768,
-        "accum_steps": 1,
-        "grad_checkpoint": false,
-        "torch_compile": true,
-        "elo_every_steps": 500,
-        "warmup": 300,
-        "max_vram_gb": 40.0
-      }
-    },
-    {
-      "id": "cf_soft_temp",
-      "desc": "Wave3 Chessformer CF-240M: soft-policy aux T=4 (same head)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.5
-      }
-    },
-    {
-      "id": "cf_soft_temp_heavy",
-      "desc": "Wave3 Chessformer: T=4 soft aux + higher soft_alpha",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_alpha": 0.7,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.8
-      }
-    },
-    {
-      "id": "cf_swa",
-      "desc": "Wave3 Chessformer: stochastic weight averaging last 25%",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "use_swa": true,
-        "swa_start_frac": 0.75
-      }
-    },
-    {
-      "id": "cf_shaw_recipe",
-      "desc": "Wave3 Chessformer recipe: Shaw/meta, soft T=4, SWA, no handcrafted rel_bias",
-      "inherits": "meta_shaw_no_relbias",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.5,
-        "use_swa": true,
-        "swa_start_frac": 0.75
-      }
-    },
-    {
-      "id": "cf_value_heavy",
-      "desc": "Wave3 Chessformer-ish: stronger WDL value weight (paper c_value=1)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "value_weight": 1.0
-      }
-    },
-    {
-      "id": "gab",
-      "desc": "Wave4 GAB: board-conditioned geometric attn bias (+ keep rel_bias)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_gab": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "gab_no_relbias",
-      "desc": "Wave4 GAB alone (ablate handcrafted rel_bias)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_gab": true,
-        "use_rel_bias": false
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "gab_qk_norm",
-      "desc": "Wave4 GAB + QK-Norm (geometry + logit stability)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_gab": true,
-        "use_qk_norm": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "stack_ultimate",
-      "desc": "Wave4 fusion: GAB + QK-Norm + zero-init + soft T=4 + SWA",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "use_gab": true,
-        "use_qk_norm": true,
-        "zero_init_out_proj": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.5,
-        "use_swa": true,
-        "swa_start_frac": 0.75
-      }
-    },
-    {
-      "id": "meta_shaw_soft_swa",
-      "desc": "Wave4 fusion: meta/Shaw + soft T=4 + SWA + QK-Norm",
-      "inherits": "meta_shaw_no_relbias",
-      "model_overrides": {
-        "use_qk_norm": true
-      },
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "soft_temp": 4.0,
-        "soft_temp_weight": 0.5,
-        "use_swa": true,
-        "swa_start_frac": 0.75
-      }
-    },
-    {
-      "id": "muon_hot",
-      "desc": "Wave4 train: hotter NorMuon LR",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "muon_lr": 0.04,
-        "adam_lr": 0.0004
-      }
-    },
-    {
-      "id": "label_smooth",
-      "desc": "Wave4 train: policy label smoothing 0.05",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "label_smoothing": 0.05
-      }
-    },
-    {
-      "id": "dropout_zero",
-      "desc": "Wave4: no dropout (short-budget overfitting test)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {
-        "dropout": 0.0
-      },
-      "train_overrides": {
-        "soft_frac": 1.0
-      }
-    },
-    {
-      "id": "warmup_long",
-      "desc": "Wave4 train: longer warmup (800 steps)",
-      "inherits": "baseline_deep_small",
-      "model_overrides": {},
-      "train_overrides": {
-        "soft_frac": 1.0,
-        "warmup": 800
-      }
-    }
-  ]
+ "baseline_id": "baseline_deep_small",
+ "elo_noise": 100,
+ "speed_promote_frac": 0.2,
+ "default_train_minutes": 90,
+ "default_max_steps": 8000,
+ "soft_cache_candidates": [
+  "outputs/hf_soft_mix/soft_cache.pt",
+  "outputs/hf_elo_mix/soft_cache.pt",
+  "outputs/autoresearch_8gb/soft_cache_merged_550k.pt",
+  "outputs/autoresearch_8gb/soft_cache_200k.pt",
+  "outputs/exp186_sf_multipv/soft_cache_merged.pt",
+  "outputs/exp186_sf_multipv/soft_cache.pt",
+  "outputs/autoresearch_8gb/soft_cache.pt"
+ ],
+ "deep_cache_candidates": [
+  "outputs/hf_soft_mix/deep_soft.pt",
+  "outputs/hf_elo_mix/deep_cache.pt",
+  "outputs/hf_soft/syzygy_soft.pt",
+  "outputs/autoresearch_8gb/puzzle_syzygy_mix.pt",
+  "outputs/syzygy_hf/soft_cache.pt",
+  "outputs/exp193_puzzle_soft/soft_cache.pt",
+  "outputs/exp190_phase_deep/soft_cache.pt",
+  "outputs/lichess_evals_soft/quality_deep_mix.pt",
+  "outputs/lichess_evals_soft/soft_cache.pt"
+ ],
+ "soft_hf_repo": "avewright/chess-soft-multipv-lichess",
+ "syzygy_hf_repo": "avewright/chess-soft-syzygy",
+ "trials": [
+  {
+   "id": "baseline_deep_small",
+   "desc": "28L/256d strengthened + rel_bias + SwiGLU + NorMuon",
+   "model": {
+    "encoder_dim": 256,
+    "encoder_type": "strengthened",
+    "encoder_conv_blocks": 2,
+    "normalize_stm": true,
+    "hidden_dim": 256,
+    "num_layers": 28,
+    "num_heads": 8,
+    "ffn_ratio": 4,
+    "dropout": 0.05,
+    "policy_head_dim": 192,
+    "value_hidden": 128,
+    "use_pos_embed": false,
+    "n_ctx_tokens": 4,
+    "value_head_type": "cls",
+    "n_value_classes": 3,
+    "use_swiglu": true,
+    "use_rel_bias": true,
+    "gradient_checkpointing": false,
+    "full_dim_attention": false,
+    "use_meta_attention": false,
+    "use_shaw_on_pos": true
+   },
+   "train": {
+    "batch_size": 96,
+    "accum_steps": 2,
+    "soft_frac": 1.0,
+    "soft_alpha": 0.45,
+    "deep_mix_frac": 0.35,
+    "hflip_p": 0.5,
+    "value_weight": 0.1,
+    "optimizer": "normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "warmup": 200,
+    "min_lr_frac": 0.05,
+    "min_depth": 12,
+    "torch_compile": false,
+    "grad_checkpoint": false
+   }
+  },
+  {
+   "id": "meta_shaw_no_relbias",
+   "desc": "Same size + meta attention + Shaw, no handcrafted rel_bias",
+   "model": {
+    "encoder_dim": 256,
+    "encoder_type": "strengthened",
+    "encoder_conv_blocks": 2,
+    "normalize_stm": true,
+    "hidden_dim": 256,
+    "num_layers": 24,
+    "num_heads": 8,
+    "ffn_ratio": 4,
+    "dropout": 0.05,
+    "policy_head_dim": 192,
+    "value_hidden": 128,
+    "use_pos_embed": false,
+    "n_ctx_tokens": 4,
+    "value_head_type": "cls",
+    "n_value_classes": 3,
+    "use_swiglu": true,
+    "use_rel_bias": false,
+    "gradient_checkpointing": false,
+    "full_dim_attention": false,
+    "use_meta_attention": true,
+    "use_shaw_on_pos": true
+   },
+   "train": {
+    "batch_size": 64,
+    "accum_steps": 3,
+    "soft_frac": 1.0,
+    "soft_alpha": 0.45,
+    "deep_mix_frac": 0.35,
+    "hflip_p": 0.5,
+    "value_weight": 0.1,
+    "optimizer": "normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "warmup": 200,
+    "min_lr_frac": 0.05,
+    "min_depth": 12,
+    "torch_compile": false,
+    "grad_checkpoint": true
+   }
+  },
+  {
+   "id": "wider_shallower",
+   "desc": "16L/384d width swap ~same params",
+   "model": {
+    "encoder_dim": 256,
+    "encoder_type": "strengthened",
+    "encoder_conv_blocks": 2,
+    "normalize_stm": true,
+    "hidden_dim": 384,
+    "num_layers": 16,
+    "num_heads": 8,
+    "ffn_ratio": 4,
+    "dropout": 0.05,
+    "policy_head_dim": 192,
+    "value_hidden": 128,
+    "use_pos_embed": false,
+    "n_ctx_tokens": 4,
+    "value_head_type": "cls",
+    "n_value_classes": 3,
+    "use_swiglu": true,
+    "use_rel_bias": true,
+    "gradient_checkpointing": false,
+    "full_dim_attention": false,
+    "use_meta_attention": false,
+    "use_shaw_on_pos": true
+   },
+   "train": {
+    "batch_size": 80,
+    "accum_steps": 2,
+    "soft_frac": 1.0,
+    "soft_alpha": 0.45,
+    "deep_mix_frac": 0.35,
+    "hflip_p": 0.5,
+    "value_weight": 0.1,
+    "optimizer": "normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "warmup": 200,
+    "min_lr_frac": 0.05,
+    "min_depth": 12,
+    "torch_compile": false,
+    "grad_checkpoint": false
+   }
+  },
+  {
+   "id": "gelu_no_swiglu",
+   "desc": "Baseline arch with GELU FFN",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_swiglu": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "fused_encoder",
+   "desc": "Fused encoder instead of strengthened",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "encoder_type": "fused",
+    "normalize_stm": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "adamw_only",
+   "desc": "Baseline + AdamW instead of NorMuon",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "optimizer": "adamw",
+    "adam_lr": 0.0003,
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "soft_heavy_mix",
+   "desc": "Data: softer mix (higher soft_frac/alpha)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.6,
+    "deep_mix_frac": 0.5,
+    "hflip_p": 0.5
+   }
+  },
+  {
+   "id": "elo_safe_mix",
+   "desc": "Data: FT3f-like safer mix (less soft domination)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.35,
+    "deep_mix_frac": 0.3,
+    "hflip_p": 0.5,
+    "value_weight": 0.08
+   }
+  },
+  {
+   "id": "compile_speed",
+   "desc": "Baseline + torch.compile for throughput",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "torch_compile": true,
+    "batch_size": 112,
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "no_relbias_vanilla",
+   "desc": "Drop handcrafted rel_bias, keep vanilla attn",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_rel_bias": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "qk_norm",
+   "desc": "Wave2 modded-nanogpt: QK-RMSNorm on attention",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_qk_norm": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "zero_init_out",
+   "desc": "Wave2 modded-nanogpt: zero-init attn out + FFN down",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "qk_norm_zero_init",
+   "desc": "Wave2: QK-Norm + zero-init residual branches",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "meta_qk_norm",
+   "desc": "Wave2: meta attention + Shaw + QK-Norm (no rel_bias)",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {
+    "use_qk_norm": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "polar_normuon",
+   "desc": "Wave2: NorMuon with Polar Express orthogonalization",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "optimizer": "polar_normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "piece_square_dual",
+   "desc": "Original meta: piece x square dual QKV (cross+self, update both streams)",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {
+    "use_piece_square_dual": true,
+    "use_shaw_on_pos": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "puzzle_syzygy_mix",
+   "desc": "Data: MultiPV soft + 45% puzzle/Syzygy deep mix (tactics+perfect EG)",
+   "inherits": "fused_encoder",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "deep_mix_frac": 0.45,
+    "soft_alpha": 0.55
+   }
+  },
+  {
+   "id": "puzzle_syzygy_heavy",
+   "desc": "Data: 70% puzzle/Syzygy deep mix (tactical+EG focus)",
+   "inherits": "fused_encoder",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "deep_mix_frac": 0.7,
+    "soft_alpha": 0.65,
+    "value_weight": 0.3
+   }
+  },
+  {
+   "id": "dual_puzzle_syzygy",
+   "desc": "piece_square_dual + puzzle/Syzygy deep mix",
+   "inherits": "piece_square_dual",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "deep_mix_frac": 0.45,
+    "soft_alpha": 0.55
+   }
+  },
+  {
+   "id": "dual_highelo_puzzle_syzygy",
+   "desc": "piece-square dual on high-Elo puzzles+Syzygy; fat batch, compile, Elo@500",
+   "inherits": "piece_square_dual",
+   "model_overrides": {
+    "use_piece_square_dual": true,
+    "use_meta_attention": true,
+    "use_rel_bias": false,
+    "use_shaw_on_pos": false,
+    "encoder_type": "strengthened",
+    "normalize_stm": true,
+    "gradient_checkpointing": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "deep_mix_frac": 0.0,
+    "soft_alpha": 0.75,
+    "value_weight": 0.25,
+    "hflip_p": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.35,
+    "optimizer": "normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "batch_size": 256,
+    "accum_steps": 1,
+    "grad_checkpoint": true,
+    "torch_compile": true,
+    "elo_every_steps": 500,
+    "warmup": 150,
+    "max_vram_gb": 6.8
+   }
+  },
+  {
+   "id": "dual_highelo_a40",
+   "desc": "A40 ~45GB: dual meta, no grad-ckpt, fat batch, compile, Elo@500",
+   "inherits": "dual_highelo_puzzle_syzygy",
+   "model_overrides": {
+    "use_piece_square_dual": true,
+    "use_meta_attention": true,
+    "use_rel_bias": false,
+    "use_shaw_on_pos": false,
+    "encoder_type": "strengthened",
+    "normalize_stm": true,
+    "gradient_checkpointing": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "deep_mix_frac": 0.0,
+    "soft_alpha": 0.75,
+    "value_weight": 0.25,
+    "hflip_p": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.35,
+    "optimizer": "normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "batch_size": 768,
+    "accum_steps": 1,
+    "grad_checkpoint": false,
+    "torch_compile": true,
+    "elo_every_steps": 500,
+    "warmup": 300,
+    "max_vram_gb": 40.0
+   }
+  },
+  {
+   "id": "cf_soft_temp",
+   "desc": "Wave3 Chessformer CF-240M: soft-policy aux T=4 (same head)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5
+   }
+  },
+  {
+   "id": "cf_soft_temp_heavy",
+   "desc": "Wave3 Chessformer: T=4 soft aux + higher soft_alpha",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.7,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.8
+   }
+  },
+  {
+   "id": "cf_swa",
+   "desc": "Wave3 Chessformer: stochastic weight averaging last 25%",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "cf_shaw_recipe",
+   "desc": "Wave3 Chessformer recipe: Shaw/meta, soft T=4, SWA, no handcrafted rel_bias",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "cf_value_heavy",
+   "desc": "Wave3 Chessformer-ish: stronger WDL value weight (paper c_value=1)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "value_weight": 1.0
+   }
+  },
+  {
+   "id": "gab",
+   "desc": "Wave4 GAB: board-conditioned geometric attn bias (+ keep rel_bias)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_gab": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "gab_no_relbias",
+   "desc": "Wave4 GAB alone (ablate handcrafted rel_bias)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_gab": true,
+    "use_rel_bias": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "gab_qk_norm",
+   "desc": "Wave4 GAB + QK-Norm (geometry + logit stability)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_gab": true,
+    "use_qk_norm": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "stack_ultimate",
+   "desc": "Wave4 fusion: GAB + QK-Norm + zero-init + soft T=4 + SWA",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_gab": true,
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "meta_shaw_soft_swa",
+   "desc": "Wave4 fusion: meta/Shaw + soft T=4 + SWA + QK-Norm",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {
+    "use_qk_norm": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "muon_hot",
+   "desc": "Wave4 train: hotter NorMuon LR",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "muon_lr": 0.04,
+    "adam_lr": 0.0004
+   }
+  },
+  {
+   "id": "label_smooth",
+   "desc": "Wave4 train: policy label smoothing 0.05",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "label_smoothing": 0.05
+   }
+  },
+  {
+   "id": "dropout_zero",
+   "desc": "Wave4: no dropout (short-budget overfitting test)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "dropout": 0.0
+   },
+   "train_overrides": {
+    "soft_frac": 1.0
+   }
+  },
+  {
+   "id": "warmup_long",
+   "desc": "Wave4 train: longer warmup (800 steps)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "warmup": 800
+   }
+  },
+  {
+   "id": "micro_12l192",
+   "desc": "Wave5 cheap probe: 12L/192d (~param-light) for fast ranking",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "encoder_dim": 192,
+    "hidden_dim": 192,
+    "num_layers": 12,
+    "num_heads": 6,
+    "policy_head_dim": 128,
+    "value_hidden": 96
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "batch_size": 128,
+    "accum_steps": 1
+   }
+  },
+  {
+   "id": "micro_qk_swa_soft",
+   "desc": "Wave5: micro + QK-Norm + SWA + soft T=4 (train/infer recipe probe)",
+   "inherits": "micro_12l192",
+   "model_overrides": {
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "eff_batch_large",
+   "desc": "Wave5 train: larger effective batch (throughput / generalization)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "batch_size": 128,
+    "accum_steps": 2
+   }
+  },
+  {
+   "id": "soft_temp_t2",
+   "desc": "Wave5 Chessformer: softer aux T=2 (less peaked than T=4)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_temp": 2.0,
+    "soft_temp_weight": 0.5
+   }
+  },
+  {
+   "id": "infer_speed_recipe",
+   "desc": "Wave5: arch+train knobs that help inference (no meta, no gab, swiglu+relbias)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "use_meta_attention": false,
+    "use_gab": false,
+    "use_rel_bias": true,
+    "use_swiglu": true,
+    "dropout": 0.0,
+    "gradient_checkpointing": false
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "use_swa": true,
+    "swa_start_frac": 0.8,
+    "grad_checkpoint": false,
+    "torch_compile": false
+   }
+  },
+  {
+   "id": "sota_stack_v1",
+   "desc": "Wave5 SOTA candidate: GAB+QK+zero-init+softT4+SWA+hot NorMuon",
+   "inherits": "stack_ultimate",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "muon_lr": 0.03,
+    "adam_lr": 0.00035,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.5,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "meta_shaw_elo",
+   "desc": "Wave6: meta+Shaw (no dual) \u2014 content\u00d7pos geometry for Elo",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.55,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.4,
+    "use_swa": true,
+    "swa_start_frac": 0.75,
+    "batch_size": 80,
+    "accum_steps": 2
+   }
+  },
+  {
+   "id": "meta_latent_search",
+   "desc": "Wave6: meta dual + neural latent search value head (no MCTS)",
+   "inherits": "piece_square_dual",
+   "model_overrides": {
+    "use_search_value_head": true,
+    "value_topk": 16,
+    "value_search_steps": 3,
+    "num_layers": 18,
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.65,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.35,
+    "value_weight": 0.2,
+    "batch_size": 48,
+    "accum_steps": 3,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "speed_micro_hot",
+   "desc": "Wave6 speed: 12L/192d fat batch \u2014 Elo/pos_s Pareto probe",
+   "inherits": "micro_12l192",
+   "model_overrides": {
+    "use_qk_norm": true,
+    "dropout": 0.0
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "batch_size": 192,
+    "accum_steps": 1,
+    "soft_alpha": 0.5,
+    "muon_lr": 0.03,
+    "use_swa": true,
+    "swa_start_frac": 0.7
+   }
+  },
+  {
+   "id": "eff_mps_fat",
+   "desc": "Wave6 efficiency: baseline + fat MPS batch (throughput)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "dropout": 0.0
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "batch_size": 160,
+    "accum_steps": 1,
+    "mps_batch_cap": 192,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.4,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "data_soft_peak",
+   "desc": "Wave6 data: peak soft supervision (alpha 0.75, T=4)",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {},
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.75,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.6,
+    "value_weight": 0.15,
+    "hflip_p": 0.5
+   }
+  },
+  {
+   "id": "arch_deep_thin",
+   "desc": "Wave6 arch: deeper/thinner 36L/192d ~iso-params",
+   "inherits": "baseline_deep_small",
+   "model_overrides": {
+    "encoder_dim": 192,
+    "hidden_dim": 192,
+    "num_layers": 36,
+    "num_heads": 6,
+    "policy_head_dim": 160,
+    "value_hidden": 96
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "batch_size": 96,
+    "accum_steps": 2
+   }
+  },
+  {
+   "id": "linear_meta_trunk",
+   "desc": "O(N) linear meta attention trunk (content\u00d7position kernelized), no value search",
+   "inherits": "meta_shaw_no_relbias",
+   "model_overrides": {
+    "use_linear_meta_attention": true,
+    "use_meta_attention": false,
+    "meta_kernel_dim": null,
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.55,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.4,
+    "use_swa": true,
+    "swa_start_frac": 0.75,
+    "batch_size": 80,
+    "accum_steps": 2
+   }
+  },
+  {
+   "id": "search_value_head",
+   "desc": "Stockfish-style: meta trunk + search-transformer value head (refine top-k children + backup)",
+   "inherits": "meta_shaw_elo",
+   "model_overrides": {
+    "use_search_value_head": true,
+    "value_topk": 8,
+    "value_search_steps": 3,
+    "num_layers": 18
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.65,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.35,
+    "value_weight": 0.2,
+    "batch_size": 48,
+    "accum_steps": 3,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  },
+  {
+   "id": "linear_meta_search_policy",
+   "desc": "Stockfish-style: linear meta trunk + neural search POLICY head (refined argmax)",
+   "inherits": "linear_meta_trunk",
+   "model_overrides": {
+    "num_layers": 18,
+    "use_search_policy_head": true,
+    "policy_topk": 16,
+    "policy_search_steps": 3
+   },
+   "train_overrides": {
+    "soft_frac": 1.0,
+    "soft_alpha": 0.65,
+    "soft_temp": 4.0,
+    "soft_temp_weight": 0.35,
+    "value_weight": 0.2,
+    "batch_size": 48,
+    "accum_steps": 3,
+    "use_swa": true,
+    "swa_start_frac": 0.75
+   }
+  }
+ ]
 }

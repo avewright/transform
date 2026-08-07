@@ -46,7 +46,15 @@ from chess_transformer_factory import build_model, ChessTransformerConfig
 from opening_book import get_book_move
 
 ROOT = Path(__file__).resolve().parent
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _pick_device()
 DEFAULT_CHECKPOINT = ROOT / "outputs" / "hf" / "chess-transformer-200m-latest" / "best_model.pt"
 DEFAULT_MODEL_CONFIG = None
 
@@ -194,9 +202,11 @@ def get_model_move_generic(model, board: chess.Board, device: torch.device, temp
     from move_vocab import IDX_TO_UCI, index_to_move, legal_move_mask
 
     board_input = batch_boards_to_fused_token_ids([board], device)
+    mask = legal_move_mask(board).to(device)
+    # Latent-search heads use this for legal-aware top-K candidate selection.
+    board_input["legal_mask"] = mask.unsqueeze(0)
     result = model(board_input)
     logits = result["policy_logits"][0].float()
-    mask = legal_move_mask(board).to(device)
     logits[~mask] = float("-inf")
 
     if temperature <= 0:

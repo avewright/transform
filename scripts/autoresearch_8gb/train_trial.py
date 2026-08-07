@@ -1,6 +1,7 @@
 """Train one autoresearch trial on ~25M chess transformer (8GB-friendly)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -22,6 +23,21 @@ ADAM_NAME_HINTS = (
     "embed", "policy_head", "value_head", "cls_token", "cls_pos",
     "pos_embed", "norm", "bn", "shaw_", "rel_bias",
 )
+
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def amp_context(device: torch.device):
+    """BF16 on CUDA; disable AMP on MPS (view/stride autograd bugs)."""
+    if device.type == "cuda":
+        return autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 def _log(path: Path | None, msg: str) -> None:
@@ -154,6 +170,13 @@ def prepare_soft_batch(data, indices, device, hflip_p=0.0, rng=None):
     )
 
 
+def _is_oom(err: BaseException) -> bool:
+    if isinstance(err, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(err).lower()
+    return "out of memory" in msg or "oom" in msg
+
+
 def resolve_trial_config(raw: dict, space: dict) -> dict:
     """Expand inherits / overrides into a concrete trial dict."""
     if "inherits" not in raw:
@@ -206,7 +229,7 @@ def train_trial(
     from data_loader import stream_hf_batches
     from move_vocab import VOCAB_SIZE
 
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or pick_device()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train.log"
@@ -225,6 +248,18 @@ def train_trial(
         train["warmup"] = 2
         train["elo_every_steps"] = 0
         train["torch_compile"] = False
+
+    # MPS / Apple unified memory (e.g. M5 Pro 24GB): fat micro-batches are fine;
+    # only clamp extreme CUDA-oriented sizes. torch.compile still flaky on MPS.
+    if device.type == "mps" and not smoke:
+        bs = int(train.get("batch_size", 96))
+        mps_cap = int(train.get("mps_batch_cap", 192))
+        if bs > mps_cap:
+            scale = math.ceil(bs / mps_cap)
+            train["batch_size"] = mps_cap
+            train["accum_steps"] = int(train.get("accum_steps", 1)) * scale
+        if train.get("torch_compile"):
+            train["torch_compile"] = False
 
     model_cfg = ChessTransformerConfig(**{
         k: v for k, v in model_kw.items()
@@ -249,8 +284,10 @@ def train_trial(
 
     try:
         model = build_model(model_cfg).to(device)
-    except torch.cuda.OutOfMemoryError as e:
-        return {"status": "oom", "error": str(e), "pos_s": 0.0, "ckpt_path": None}
+    except Exception as e:
+        if _is_oom(e):
+            return {"status": "oom", "error": str(e), "pos_s": 0.0, "ckpt_path": None}
+        raise
 
     n_params = count_parameters(model)
     _log(log_path, f"params={n_params/1e6:.2f}M")
@@ -303,9 +340,10 @@ def train_trial(
     if soft_cache and soft_cache.exists():
         soft_data = torch.load(soft_cache, map_location="cpu", weights_only=False)
         n = soft_data["board_array"].shape[0]
-        hold = min(2000, max(512, n // 40))
+        # Cap holdout so tiny caches (smoke / early harvest) still train.
+        hold = min(2000, max(64 if smoke else 512, n // 40), max(0, n // 5))
         train_soft_n = max(1, n - hold)
-        _log(log_path, f"soft train={train_soft_n:,}")
+        _log(log_path, f"soft train={train_soft_n:,} holdout={hold}")
     elif not smoke:
         return {
             "status": "failed",
@@ -499,7 +537,7 @@ def train_trial(
                     bi, hard, wdl, si, sp = prepare_soft_batch(
                         src, idx, device, hflip_p=hflip_p, rng=rng,
                     )
-                    with autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    with amp_context(device):
                         out = model(bi)
                         hard_ce = F.cross_entropy(
                             out["policy_logits"], hard, label_smoothing=label_smoothing,
@@ -512,6 +550,13 @@ def train_trial(
                             )
                         v_loss = F.cross_entropy(out["value_logits"], wdl)
                         loss = (p_loss + value_weight * v_loss) / accum
+                    # Search-value-head aux: learn the backed-up best-child scalar
+                    # against the game-result scalar (Stockfish-style retrogression).
+                    if "searched_value" in out:
+                        # wdl is a (B, 3) probability distribution.
+                        scalar_t = wdl[:, 0] - wdl[:, 2]
+                        sv_loss = F.mse_loss(out["searched_value"], scalar_t)
+                        loss = loss + 0.1 * sv_loss
                     loss.backward()
                 elif smoke:
                     bi = {
@@ -522,7 +567,7 @@ def train_trial(
                     }
                     hard = torch.randint(0, VOCAB_SIZE, (bs,), device=device)
                     wdl = torch.randint(0, 3, (bs,), device=device)
-                    with autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    with amp_context(device):
                         out = model(bi)
                         loss = (
                             F.cross_entropy(
@@ -540,7 +585,7 @@ def train_trial(
                             shuffle_buffer=2048, min_depth=int(train.get("min_depth", 12)),
                         ))
                         bi, move_t, wdl_t = next(hard_iter)
-                    with autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    with amp_context(device):
                         out = model(bi)
                         loss = (
                             F.cross_entropy(
@@ -602,7 +647,9 @@ def train_trial(
     except KeyboardInterrupt:
         interrupted = True
         _log(log_path, f"KeyboardInterrupt at step {step}; saving and exiting")
-    except torch.cuda.OutOfMemoryError as e:
+    except Exception as e:
+        if not _is_oom(e):
+            raise
         return {
             "status": "oom",
             "error": str(e),

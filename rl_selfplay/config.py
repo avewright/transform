@@ -35,6 +35,18 @@ class SelfPlayConfig:
     grad_clip: float = 0.5
     mix_sf_frac: float = 0.0  # fraction of batches from external supervised shards
     sf_shard_dir: str | None = None
+    # Entropy bonus on MCTS batches: softens the policy toward more diverse
+    # (multi-modal) play, countering mode collapse like the exp195 degenerate
+    # policy that put all mass on one opening move. Safe: only softens the
+    # target distribution vs overriding the visit-based signal.
+    entropy_weight: float = 0.0
+    # If >0, add a diversity bonus toward agreeing with a frozen prior policy
+    # ONLY on near-equal move options; gates by prior so it does not force
+    # blunders. 0 = off.
+    prior_diversity_weight: float = 0.0
+    # KL(current || frozen_prior) trust region — prevents RL collapse away from
+    # the supervised soft-FT prior. Typical 0.05–0.2. Requires prior_model in train.
+    prior_kl_weight: float = 0.0
     # Within collected positions: fraction of batches that use SF hard moves
     # (rest use soft MCTS visit targets). Only applies when SF records exist.
     mix_sf_move_frac: float = 0.5
@@ -94,6 +106,28 @@ def laptop_8gb_config(**overrides) -> SelfPlayConfig:
     return replace(cfg, **overrides) if overrides else cfg
 
 
+def diverse_8gb_config(**overrides) -> SelfPlayConfig:
+    """Diversity-oriented RL for the M5/MPS: higher temperature + root noise
+    (broader openings/exploration) + a policy-entropy bonus against mode
+    collapse, so play develops a range of lines instead of Stockfish-imitation
+    or a single over-confident move."""
+    cfg = SelfPlayConfig(
+        n_games=6,
+        mcts_sims=24,
+        mcts_batch_size=4,
+        train_batch_size=8,
+        ply_cap=140,
+        visit_temp=1.6,          # softer visit targets -> more diverse moves
+        root_noise_frac=0.35,    # more Dirichlet exploration at the root
+        value_weight=0.5,
+        entropy_weight=0.15,     # anti-collapse softness on MCTS batches
+        train_lr=1e-5,
+        train_epochs=2,
+        output_dir="outputs/rl_selfplay_diverse",
+    )
+    return replace(cfg, **overrides) if overrides else cfg
+
+
 def a100_80gb_config(**overrides) -> SelfPlayConfig:
     """A100 80GB: high sims, large MCTS batches, more games per iter."""
     cfg = SelfPlayConfig(
@@ -140,5 +174,40 @@ def a40_45gb_config(**overrides) -> SelfPlayConfig:
         use_fp16=False,
         use_bf16=True,
         output_dir="outputs/rl_selfplay_a40_soft",
+    )
+    return replace(cfg, **overrides) if overrides else cfg
+
+
+def kl_anchored_config(**overrides) -> SelfPlayConfig:
+    """Path-to-2500 Phase 4: expert-iter with KL trust region to soft-FT prior.
+
+    Use only after policy Elo ≥~1900–2000. LR ≪ pretrain; SF or self MCTS
+    visit targets; prior_kl_weight keeps the policy near the supervised prior.
+    """
+    cfg = SelfPlayConfig(
+        mode="sf",
+        n_games=8,
+        mcts_sims=64,
+        mcts_batch_size=8,
+        train_batch_size=8,
+        ply_cap=160,
+        eval_games=4,
+        eval_sims=32,
+        iterations=5,
+        games_per_iter=8,
+        sf_full_strength=False,
+        sf_elo=1900,
+        record_sf_moves=True,
+        visit_temp=1.0,
+        root_noise_frac=0.25,
+        mix_sf_move_frac=0.4,
+        train_lr=3e-6,           # ≪ pretrain
+        train_epochs=1,
+        value_weight=0.5,
+        entropy_weight=0.05,
+        prior_kl_weight=0.1,     # KL(current || prior)
+        use_fp16=False,
+        use_bf16=False,
+        output_dir="outputs/rl_selfplay_kl_anchored",
     )
     return replace(cfg, **overrides) if overrides else cfg

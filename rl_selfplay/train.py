@@ -47,6 +47,21 @@ def policy_kl_loss(logits: torch.Tensor, visit_targets: torch.Tensor,
     return -ce.sum(dim=-1).mean()
 
 
+def model_policy_entropy(logits: torch.Tensor, boards, device: torch.device) -> torch.Tensor:
+    """Mean entropy of the (legal-masked) policy across the batch.
+
+    Higher entropy => more diverse/uncertain play. Returning this as a loss
+    with a negative coefficient maximises it (anti-collapse).
+    """
+    lg = logits.float()
+    for i, board in enumerate(boards or []):
+        mask = legal_move_mask(board).to(device)
+        lg[i][~mask] = -1e9
+    p = F.softmax(lg, dim=-1)
+    logp = F.log_softmax(lg, dim=-1)
+    return -(p * logp).sum(dim=-1).mean()
+
+
 def value_loss(logits: torch.Tensor, targets: torch.Tensor, n_bins: int) -> torch.Tensor:
     log_probs = F.log_softmax(logits, dim=-1)
     if n_bins == 3:
@@ -89,6 +104,24 @@ def _split_sources(positions: list[dict]) -> tuple[list[int], list[int]]:
     return mcts_idx, sf_idx
 
 
+def prior_kl_loss(
+    student_logits: torch.Tensor,
+    prior_logits: torch.Tensor,
+    boards: list[chess.Board] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """KL(student || prior) over legal moves — trust region vs frozen prior."""
+    s = student_logits.float()
+    p = prior_logits.float()
+    for i, board in enumerate(boards or []):
+        mask = legal_move_mask(board).to(device)
+        s[i][~mask] = -1e9
+        p[i][~mask] = -1e9
+    log_s = F.log_softmax(s, dim=-1)
+    prior_p = F.softmax(p, dim=-1)
+    return F.kl_div(log_s, prior_p, reduction="batchmean")
+
+
 def train_on_positions(
     model: nn.Module,
     positions: list[dict],
@@ -96,12 +129,15 @@ def train_on_positions(
     cfg: SelfPlayConfig,
     n_value_classes: int,
     log_fn=print,
+    prior_model: nn.Module | None = None,
 ) -> dict[str, float]:
     if not positions:
         log_fn("  no positions to train on")
         return {"loss": 0.0, "policy": 0.0, "value": 0.0}
 
     model.train()
+    if prior_model is not None:
+        prior_model.eval()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train_lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     amp_dtype = torch.bfloat16 if cfg.use_bf16 else torch.float16
@@ -113,7 +149,7 @@ def train_on_positions(
 
     log_fn(
         f"  train mix: {len(mcts_idx)} soft-MCTS + {len(sf_idx)} SF-hard "
-        f"(sf_move_frac={cfg.mix_sf_move_frac})"
+        f"(sf_move_frac={cfg.mix_sf_move_frac} prior_kl={cfg.prior_kl_weight})"
     )
 
     totals = {"loss": 0.0, "policy": 0.0, "value": 0.0, "batches": 0, "sf_batches": 0, "mcts_batches": 0}
@@ -194,6 +230,32 @@ def train_on_positions(
                     )
                     v_loss = value_loss(out["value_logits"], value_batch, n_value_classes)
                 loss = p_loss + cfg.value_weight * v_loss
+
+            # Diversity / anti-collapse: add an entropy bonus so the policy is
+            # pushed toward a multi-modal (diverse) distribution. Only on MCTS
+            # self-play batches; never on hard-SF matches (those are already
+            # single-point targets). Entropy bonus = +entropy_weight * H(policy)
+            # with the entropy computed over legal moves for safer scaling.
+            diversity = 0.0
+            if mode == "mcts" and cfg.entropy_weight > 0:
+                # policy logits -> legal-softmax, mean entropy across batch.
+                e = model_policy_entropy(out["policy_logits"], boards if boards else None,
+                                         device)
+                diversity = -cfg.entropy_weight * e
+                loss = loss + diversity
+
+            # KL trust region vs frozen supervised prior (path-to-2500 Phase 4).
+            if (
+                cfg.prior_kl_weight > 0
+                and prior_model is not None
+                and boards is not None
+            ):
+                with torch.no_grad():
+                    prior_out = prior_model(batch_input)
+                kl = prior_kl_loss(
+                    out["policy_logits"], prior_out["policy_logits"], boards, device,
+                )
+                loss = loss + cfg.prior_kl_weight * kl
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)

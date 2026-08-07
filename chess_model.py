@@ -85,10 +85,10 @@ class BoardEncoder(nn.Module):
 
         # Square tokens: reshape to (B, 64, C)
         B, C, H, W = x.shape
-        square_tokens = x.view(B, C, 64).permute(0, 2, 1)  # (B, 64, C)
+        square_tokens = x.reshape(B, C, 64).permute(0, 2, 1)  # (B, 64, C)
 
         # Global token: (B, C, 1, 1) -> (B, 1, C)
-        global_feat = self.global_pool(x).view(B, C)
+        global_feat = self.global_pool(x).reshape(B, C)
         global_token = self.global_proj(global_feat).unsqueeze(1)  # (B, 1, C)
 
         return torch.cat([global_token, square_tokens], dim=1)  # (B, 65, C)
@@ -354,9 +354,9 @@ class StrengthenedBoardEncoder(nn.Module):
         sq_idx = torch.arange(64, device=fused_ids.device)
         content_sq = self.piece_color_embed(fused_ids)
         conv_feat = self.conv_blocks(self.plane_conv(fused_ids_to_planes(fused_ids)))
-        content_sq = content_sq + conv_feat.view(
+        content_sq = content_sq + conv_feat.reshape(
             fused_ids.shape[0], self.embed_dim, 64
-        ).permute(0, 2, 1)
+        ).permute(0, 2, 1).contiguous()
         pos_sq = self.square_embed(sq_idx).unsqueeze(0).expand(fused_ids.shape[0], -1, -1)
 
         turn_tok = self.turn_embed(turn).unsqueeze(1)
@@ -380,7 +380,9 @@ class StrengthenedBoardEncoder(nn.Module):
         sq_emb = self.piece_color_embed(fused_ids) + self.square_embed(sq_idx)
 
         conv_feat = self.conv_blocks(self.plane_conv(fused_ids_to_planes(fused_ids)))
-        sq_emb = sq_emb + conv_feat.view(fused_ids.shape[0], self.embed_dim, 64).permute(0, 2, 1)
+        sq_emb = sq_emb + conv_feat.reshape(
+            fused_ids.shape[0], self.embed_dim, 64
+        ).permute(0, 2, 1).contiguous()
 
         turn_tok = self.turn_embed(turn).unsqueeze(1)
         castle_tok = self.castling_embed(castling).unsqueeze(1)

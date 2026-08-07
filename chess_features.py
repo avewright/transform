@@ -204,7 +204,12 @@ def fused_ids_to_planes(fused_ids: torch.Tensor) -> torch.Tensor:
         (B, 13, 8, 8) float tensor
     """
     one_hot = torch.nn.functional.one_hot(fused_ids.long(), num_classes=NUM_FUSED_TOKENS).float()
-    return one_hot.permute(0, 2, 1).reshape(fused_ids.shape[0], NUM_FUSED_TOKENS, 8, 8)
+    # contiguous required: MPS Conv2d/BN backward fails on permute-strided views
+    return (
+        one_hot.permute(0, 2, 1)
+        .reshape(fused_ids.shape[0], NUM_FUSED_TOKENS, 8, 8)
+        .contiguous()
+    )
 
 
 def batch_boards_to_fused_token_ids(
