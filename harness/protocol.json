@@ -1,0 +1,26 @@
+{
+  "name": "maxelo_policy_v1",
+  "mode": "policy",
+  "book": false,
+  "syzygy": false,
+  "movetime": 0.05,
+  "ply_cap": 160,
+  "games_per_opening_per_color": 2,
+  "stop_after_bracket": true,
+  "threads": 1,
+  "hash": 32,
+  "elos": [1450, 1600, 1750, 1900, 2050, 2200],
+  "openings": [
+    [],
+    ["e2e4", "e7e5"],
+    ["d2d4", "d7d5"],
+    ["e2e4", "c7c5"],
+    ["d2d4", "g8f6"],
+    ["e2e4", "e7e6"],
+    ["c2c4", "e7e5"],
+    ["g1f3", "d7d5"]
+  ],
+  "vocab": "compact",
+  "noise_band": 100,
+  "notes": "Champion metric: greedy policy only. Book/Syzygy off. Pin STOCKFISH_PATH."
+}

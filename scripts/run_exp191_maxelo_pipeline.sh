@@ -1,4 +1,6 @@
 #!/bin/bash
+# LEGACY — soft_loss crowning. Do not use for the max-Elo push.
+# Prefer: python -m harness.loop --name ... --soft-cache ...
 # Resumable max-Elo pipeline. Safe to re-run: completed stages are skipped via
 # marker files under outputs/exp191_soft_merged/stages/.
 #

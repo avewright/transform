@@ -22,9 +22,13 @@ env/
 # Outputs (large, regeneratable)
 outputs/
 stockfish/
+syzygy/
+logs/
+.hf_cache/
 
-# Data caches
+# Data (local downloads / labels — not in git)
 data/cache/
+data/*.jsonl
 *.json.bak
 
 # OS
@@ -45,6 +49,7 @@ desktop.ini
 # Local archive / generated logs (optional regen)
 archive/scratch/*.txt
 *.log
+*.local-backup
 build_*.txt
 unsloth_compiled_cache/
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Path-to-2500 orchestrator. Stages can be run independently.
+# Path-to-2500 orchestrator (max-Elo harness).
+# Champion metric = pure policy Elo via `python -m harness.elo` (no book/syzygy).
+# Soft FT / promote: `python -m harness.loop` (also used by p2-ft).
 #
-#   bash scripts/run_path_2500.sh p0          # baselines
+#   bash scripts/run_path_2500.sh p0          # pure-policy baseline (+ MCTS report)
 #   bash scripts/run_path_2500.sh p1          # soft mix
 #   bash scripts/run_path_2500.sh p2-lora     # M5 LoRA soft
-#   bash scripts/run_path_2500.sh p2-ft       # A40 full soft FT
-#   bash scripts/run_path_2500.sh p3          # tournament MCTS Elo
+#   bash scripts/run_path_2500.sh p2-ft       # full soft FT + Elo promote
+#   bash scripts/run_path_2500.sh p3          # tournament MCTS report
 #   bash scripts/run_path_2500.sh p4          # KL expert-iter (after ~1900 policy)
 #   bash scripts/run_path_2500.sh all-m5      # p0 → p1 → p2-lora → p3 (M5 path)
 set -euo pipefail

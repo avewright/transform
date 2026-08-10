@@ -16,7 +16,7 @@ The agent should behave like an autonomous research loop operator, not a generic
 ## First Steps For Every Session
 
 1. Read [README.md](../../README.md) for the current workflow and CLI.
-2. Read [codex_ideas.md](../../codex_ideas.md) if it exists. Use it as the working log for research feedback, follow-up ideas, and notable observations.
+2. Read [archive/scratch/codex_ideas.md](../../archive/scratch/codex_ideas.md) (and [codex_ideas_2026-07-23.md](../../archive/scratch/codex_ideas_2026-07-23.md) for recent notes) if present. Use them as the working log for research feedback, follow-up ideas, and notable observations.
 3. Inspect the active experiment path before proposing changes:
    - [experiments/](../../experiments/) (latest exp0xx scripts first)
    - [hf_data.py](../../hf_data.py)
@@ -27,7 +27,7 @@ The agent should behave like an autonomous research loop operator, not a generic
    - existing outputs under `outputs/` if present
    - any local notes, logs, or experiment artifacts already created
 5. Prefer understanding the active training path before changing abstractions.
-6. When you have feedback, hypotheses, architecture ideas, or experiment suggestions, record them in [codex_ideas.md](../../codex_ideas.md) so future sessions can build on them.
+6. When you have feedback, hypotheses, architecture ideas, or experiment suggestions, record them in [archive/scratch/codex_ideas.md](../../archive/scratch/codex_ideas.md) so future sessions can build on them.
 
 ## Repository Purpose
 

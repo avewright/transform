@@ -54,9 +54,32 @@ python -u experiments/exp055_joint_policy_value.py   # policy + value
 python -u experiments/exp054_search_baseline.py      # vs Stockfish
 ```
 
+## Max Elo harness
+
+Champion metric is **greedy policy Elo only** (no opening book, no Syzygy), frozen in [`harness/protocol.json`](harness/protocol.json). Train may screen on `top1`; **never promote on soft_loss**. Seed weights: `avewright/chess-transformer-437m-ft3h` → `outputs/hf_437m_ft3h_hub/best_model.pt`.
+
+```bash
+# Pure-policy Elo (promotion protocol)
+python -m harness.elo --ckpt outputs/hf_437m_ft3h_hub/best_model.pt --mode policy
+
+# Soft FT → Elo → promote (writes outputs/champion/)
+python -m harness.loop --name ft3j --soft-cache outputs/hf_soft_mix/soft_cache.pt \
+  --init outputs/champion/champion.pt
+
+# Inspect champion
+python -m harness.promote --show
+
+# Path-to-2500 stages (p0/p2-ft/p3 wired to harness)
+bash scripts/run_path_2500.sh p0
+bash scripts/run_path_2500.sh p2-ft
+```
+
+Pin Stockfish with `STOCKFISH_PATH`. MCTS Elo is report-only until policy clears ~2000.
+
 ## Layout
 
 ```
+├── harness/                    # max-Elo train/eval/promote
 ├── chess_model.py              # encoder, spatial head, ChessTransformerV2
 ├── chess_transformer_factory.py
 ├── chess_features.py / move_vocab.py / config.py
@@ -69,5 +92,7 @@ python -u experiments/exp054_search_baseline.py      # vs Stockfish
 ├── archive/                    # legacy Qwen path, scratch, early exps
 └── scripts/compact_repo.ps1    # one-shot tidy (moves, never deletes)
 ```
+
+`syzygy/` tablebases and `data/*.jsonl` labels stay local (gitignored) — download or regenerate as needed. Checkpoints live under `outputs/` (also gitignored).
 
 Legacy Qwen backbone + text self-play code is under `archive/legacy/` if you need it.

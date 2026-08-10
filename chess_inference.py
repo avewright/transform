@@ -34,13 +34,23 @@ def resolve_checkpoint(path: str | Path | None = None) -> Path:
     )
 
 
+def _pick_device(explicit: torch.device | str | None = None) -> torch.device:
+    if explicit is not None:
+        return torch.device(explicit)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def load_checkpoint(
     path: str | Path | None = None,
     device: torch.device | str | None = None,
 ) -> ChessTransformer:
     """Load a trained ChessTransformer for inference."""
     ckpt_path = resolve_checkpoint(path)
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    dev = _pick_device(device)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config_data = ckpt.get("config")
