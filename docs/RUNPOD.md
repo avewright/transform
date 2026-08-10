@@ -77,3 +77,14 @@ Stopped pods still cost for disk; **terminate** when done.
 ## Why SSH failed before
 
 We offered `~/.ssh/runpod` over public TCP; the server rejected it (`authorized_keys` never got the key). Setting env `PUBLIC_KEY` alone is not enough — account SSH keys + image start script that writes `authorized_keys` are required. New pods use a start command that does that injection.
+
+## Active pod (updated by agent)
+
+| Field | Value |
+|-------|-------|
+| Host alias | `runpod-transform` |
+| Pod ID | `aywi9oap3c03zd` |
+| GPU | RTX 3090 @ **$0.22/hr** |
+| Connect | Remote-SSH → `runpod-transform` or `ssh runpod-transform` |
+
+Terminate when done: `curl -X DELETE https://rest.runpod.io/v1/pods/aywi9oap3c03zd -H "Authorization: Bearer $RUNPOD_API"`
