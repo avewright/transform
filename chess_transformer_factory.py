@@ -169,6 +169,45 @@ DEFAULT_A40_WIDE_CONFIG = ChessTransformerConfig(
     full_dim_attention=True,
 )
 
+# ~1B linear-attention trunk for A100-class GPUs.
+# Absolute fused piece-color embeds (W/B queen are distinct tokens) — no STM flip,
+# no separate color channel. Compact move vocab assumed via MOVE_VOCAB_VERSION=compact.
+# Linear (kernelized) attention keeps O(N) board mixing cheap at this width.
+# Target ≈1.0–1.05B params (20L / 2048d / SwiGLU×4 with 2/3 inner). Verify with count_parameters.
+DEFAULT_1B_LINEAR_CONFIG = ChessTransformerConfig(
+    encoder_dim=768,
+    encoder_type="fused",
+    encoder_conv_blocks=0,
+    normalize_stm=False,
+    hidden_dim=2048,
+    num_layers=20,
+    num_heads=16,
+    ffn_ratio=4,
+    dropout=0.05,
+    policy_head_dim=512,
+    value_hidden=512,
+    use_pos_embed=False,
+    n_ctx_tokens=4,
+    value_head_type="cls",
+    n_value_classes=3,  # WDL aux only — moves come from policy argmax, not search
+    use_swiglu=True,
+    use_rel_bias=False,
+    gradient_checkpointing=True,
+    full_dim_attention=False,
+    use_meta_attention=False,
+    use_piece_square_dual=False,
+    use_shaw_on_pos=False,
+    use_qk_norm=True,
+    zero_init_out_proj=True,
+    use_gab=False,
+    use_linear_attention=True,
+    la_use_qk_norm=True,
+    la_n_heads=16,
+    use_linear_meta_attention=False,
+    use_search_value_head=False,
+    use_search_policy_head=False,
+)
+
 # ≥400M meta-factored attention: content×position streams + Shaw on ss only.
 # No handcrafted rel-bias, no absolute seq PE, no full-dim attention.
 # Train from scratch (incompatible with 200M checkpoints).

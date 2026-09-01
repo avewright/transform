@@ -362,7 +362,7 @@ def load_bnb_peft_qwen(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=quant,
-        dtype=compute_dtype if quant is None else None,
+        torch_dtype=compute_dtype if quant is None else None,
         device_map={"": str(device)},
         trust_remote_code=True,
     )
@@ -470,7 +470,7 @@ def load_qwen_backbone(
     torch_dtype = _resolve_dtype(config)
     full = AutoModelForCausalLM.from_pretrained(
         config.qwen_name_or_path,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         trust_remote_code=True,
     )
     if hasattr(full, "model"):
@@ -649,7 +649,7 @@ def _load_backbone_with_adapter(
     base = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=quant,
-        dtype=compute_dtype if quant is None else None,
+        torch_dtype=compute_dtype if quant is None else None,
         device_map={"": str(device)},
         trust_remote_code=True,
     )

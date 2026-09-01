@@ -83,8 +83,8 @@ We offered `~/.ssh/runpod` over public TCP; the server rejected it (`authorized_
 | Field | Value |
 |-------|-------|
 | Host alias | `runpod-transform` |
-| Pod ID | `aywi9oap3c03zd` |
-| GPU | RTX 3090 @ **$0.22/hr** |
-| Connect | Remote-SSH → `runpod-transform` or `ssh runpod-transform` |
+| Pod ID | *(none — terminated)* |
+| GPU | — |
+| Connect | — |
 
-Terminate when done: `curl -X DELETE https://rest.runpod.io/v1/pods/aywi9oap3c03zd -H "Authorization: Bearer $RUNPOD_API"`
+No active pod. Last run: `hjmko0s4lcwavj` (RTX 3090) terminated on request.

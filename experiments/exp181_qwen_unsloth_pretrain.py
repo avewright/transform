@@ -55,6 +55,10 @@ OUT_DIR = ROOT / "outputs" / "exp181_qwen_unsloth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _resolve_out_dir(full_ft: bool) -> Path:
+    return ROOT / "outputs" / ("exp181_qwen_fullft" if full_ft else "exp181_qwen_unsloth")
+
+
 def _cuda_hint() -> str:
     if torch.cuda.is_available():
         return ""
@@ -458,6 +462,11 @@ def main():
     parser.add_argument("--tower-layers", type=int, default=4)
     parser.add_argument("--peak-lr", type=float, default=2e-4)
     parser.add_argument("--no-4bit", action="store_true")
+    parser.add_argument(
+        "--full-ft",
+        action="store_true",
+        help="Train all Qwen weights (no LoRA/4-bit). Uses backbone_mode=full.",
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--shard-dir", type=Path, default=DEFAULT_SHARD_DIR)
     parser.add_argument("--hf", action="store_true", help="Stream from avewright/chess-positions-lichess-sf")
@@ -468,8 +477,9 @@ def main():
     parser.add_argument("--resume", type=Path, default=None, help="Checkpoint dir (e.g. outputs/.../step_004000)")
     args = parser.parse_args()
 
-    if not args.smoke and DEVICE.type == "cuda" and args.batch_size > 4:
-        args.batch_size = min(args.batch_size, 4)  # 8GB VRAM default cap
+    # Full FT needs bf16 weights + Adam; allow larger batches on 24GB+.
+    if not args.smoke and DEVICE.type == "cuda" and not args.full_ft and args.batch_size > 4:
+        args.batch_size = min(args.batch_size, 4)  # 8GB VRAM default cap for LoRA/4bit
 
     if args.resume and not args.hf:
         args.hf = True
@@ -479,16 +489,48 @@ def main():
         args.tower_layers = min(args.tower_layers, 3)
         args.eval_every = min(args.eval_every, 50)
 
+    if args.full_ft:
+        backbone_mode = "full"
+        load_in_4bit = False
+        # Keep tower LR from --peak-lr; backbone stays much lower.
+        lr_tower = args.peak_lr
+        lr_heads = args.peak_lr
+        lr_backbone = min(5e-6, args.peak_lr / 40)
+    elif not args.smoke or DEVICE.type == "cuda":
+        backbone_mode = "unsloth"
+        load_in_4bit = not args.no_4bit
+        lr_tower = lr_heads = args.peak_lr
+        lr_backbone = 1e-4
+    else:
+        backbone_mode = "lora"
+        load_in_4bit = False
+        lr_tower = lr_heads = args.peak_lr
+        lr_backbone = 1e-4
+
     config = ChessQwenConfig(
         qwen_name_or_path=args.model,
-        backbone_mode="unsloth" if not args.smoke or DEVICE.type == "cuda" else "lora",
+        backbone_mode=backbone_mode,
+        full_finetuning=args.full_ft,
         lora_rank=args.lora_rank,
         tower_layers=args.tower_layers,
-        load_in_4bit=not args.no_4bit,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=False,
         max_seq_length=128,
+        lr_tower=lr_tower,
+        lr_heads=lr_heads,
+        lr_backbone=lr_backbone,
+        lr_lora=lr_backbone,
     )
 
+    global OUT_DIR
+    OUT_DIR = _resolve_out_dir(args.full_ft)
+
     print(f"Device: {DEVICE}{_cuda_hint()}")
+    print(
+        f"Config: mode={config.backbone_mode} full_ft={args.full_ft} "
+        f"4bit={config.load_in_4bit} tower={config.tower_layers}L "
+        f"lr_tower={config.lr_tower:.1e} lr_backbone={config.lr_backbone:.1e}"
+    )
     if not args.smoke and DEVICE.type != "cuda":
         raise SystemExit("Full training requires CUDA." + _cuda_hint())
     start_step = 0
