@@ -83,8 +83,8 @@ We offered `~/.ssh/runpod` over public TCP; the server rejected it (`authorized_
 | Field | Value |
 |-------|-------|
 | Host alias | `runpod-transform` |
-| Pod ID | *(none — terminated)* |
-| GPU | — |
-| Connect | — |
+| Pod ID | *(user pod — SSH below)* |
+| GPU | *(check `ssh runpod-transform nvidia-smi`)* |
+| Connect | `ssh runpod-transform` → `root@69.30.85.104:22186` |
 
 No active pod. Last run: `hjmko0s4lcwavj` (RTX 3090) terminated on request.
