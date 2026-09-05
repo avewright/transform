@@ -219,6 +219,47 @@ def train(args: argparse.Namespace) -> dict:
         train["adam_lr"] = float(train.get("adam_lr", 3e-4)) * float(train.get("min_lr_frac", 0.05))
         train["min_lr_frac"] = 1.0
         train["warmup"] = 0
+    extra_soft = []
+    if args.attach_from_manifest:
+        man = json.loads(Path(args.attach_from_manifest).read_text(encoding="utf-8"))
+        extra_soft.extend(Path(p) for p in man.get("shards") or [])
+    if args.attach_ready_shards or args.attach_attached_shards:
+        from autoresearch_8gb.pipeline import list_attached_shards, list_ready_shards
+        qdir = ROOT / "outputs" / "hf_elo_mix_queue"
+        if args.attach_ready_shards:
+            extra_soft.extend(list_ready_shards(qdir))
+        if args.attach_attached_shards:
+            extra_soft.extend(list_attached_shards(qdir))
+    if extra_soft:
+        seen: set[str] = set()
+        deduped = []
+        for p in extra_soft:
+            key = str(Path(p).resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(p)
+        extra_soft = deduped
+        print(f"attach shards: {len(extra_soft)}", flush=True)
+        for p in extra_soft:
+            print(f"  {p}", flush=True)
+    if args.muon_lr is not None:
+        trial["train"]["muon_lr"] = float(args.muon_lr)
+    if args.adam_lr is not None:
+        trial["train"]["adam_lr"] = float(args.adam_lr)
+    if args.force_lr:
+        trial["train"]["force_lr"] = True
+    if args.bonus_mix_frac is not None:
+        trial["train"]["bonus_mix_frac"] = float(args.bonus_mix_frac)
+    if args.bonus_inbox:
+        trial["train"]["bonus_inbox"] = str(Path(args.bonus_inbox))
+    if args.bonus_exclude:
+        trial["train"]["bonus_exclude"] = [str(Path(p)) for p in args.bonus_exclude]
+    if args.bonus_soft_temp_weight is not None:
+        trial["train"]["bonus_soft_temp_weight"] = float(args.bonus_soft_temp_weight)
+    bonus = Path(args.bonus_cache) if args.bonus_cache else None
+    if bonus is not None and not bonus.exists():
+        raise SystemExit(f"bonus cache missing: {bonus}")
     result = train_trial(
         trial,
         out,
@@ -228,6 +269,8 @@ def train(args: argparse.Namespace) -> dict:
         max_minutes=args.train_minutes,
         smoke=False,
         resume_ckpt=resume,
+        extra_soft_caches=extra_soft or None,
+        bonus_cache=bonus,
     )
     (out / "train_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2), flush=True)
@@ -262,6 +305,57 @@ def main() -> None:
         type=float,
         default=0.4,
         help="Fraction of batches drawn from Syzygy deep_cache",
+    )
+    ap.add_argument(
+        "--attach-ready-shards",
+        action="store_true",
+        help="Load READY disjoint SF soft shards in-memory (does not rewrite live cache).",
+    )
+    ap.add_argument(
+        "--attach-attached-shards",
+        action="store_true",
+        help="Reload ATTACHED shards (for new-output-dir continuations that need the same mix).",
+    )
+    ap.add_argument(
+        "--attach-from-manifest",
+        default=None,
+        help="Attach the shards listed in a dataset_manifest.json (same mix as that run).",
+    )
+    ap.add_argument("--muon-lr", type=float, default=None, help="Override Polar/NorMuon LR")
+    ap.add_argument("--adam-lr", type=float, default=None, help="Override AdamW aux LR")
+    ap.add_argument(
+        "--force-lr",
+        action="store_true",
+        help="After full resume, overwrite optimizer param-group LRs (keeps momentum).",
+    )
+    ap.add_argument(
+        "--bonus-cache",
+        default=None,
+        help="Small corrective soft cache (e.g. lapse pack). Sampled at --bonus-mix-frac.",
+    )
+    ap.add_argument(
+        "--bonus-mix-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of batches drawn from --bonus-cache (before deep/shallow).",
+    )
+    ap.add_argument(
+        "--bonus-inbox",
+        default=None,
+        help="Dir of READY harvest shards. Trainer concat-ingests them mid-run.",
+    )
+    ap.add_argument(
+        "--bonus-exclude",
+        nargs="*",
+        default=None,
+        help="Holdout caches whose hashes must never enter the bonus mix.",
+    )
+    ap.add_argument(
+        "--bonus-soft-temp-weight",
+        type=float,
+        default=None,
+        help="Override Chessformer soft-temp aux weight on bonus batches only. "
+        "None keeps the general weight (0.4). 0 disables flattening on mistakes.",
     )
     args = ap.parse_args()
     _assert_compact()

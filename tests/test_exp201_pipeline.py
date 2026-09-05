@@ -32,11 +32,20 @@ from autoresearch_8gb.pipeline import (
     classify_checkpoint,
     cheap_eval_losses,
     collect_rng_state,
+    concat_soft_tables,
     exposure_report,
+    filter_disjoint,
+    ingest_ready_bonus_shards,
+    list_attached_shards,
+    list_ready_shards,
     load_model_state,
     lr_scale,
     make_val_membership,
     muon_update_scale_note,
+    pick_mix_source,
+    policy_soft_temp_weight,
+    position_hashes,
+    session_throughput,
     prepare_soft_batch,
     restore_rng_state,
     save_training_checkpoint,
@@ -191,6 +200,45 @@ def test_val_membership_blocks_flip_equivalents():
     assert 1 in val_idx.tolist()
     assert 1 not in train_idx.tolist()
     assert 2 not in train_idx.tolist()  # flip equivalent blocked
+
+
+def test_filter_disjoint_drops_internal_and_prior():
+    b_e4 = chess.Board()
+    b_e4.push_uci("e2e4")
+    b_d4 = chess.Board()
+    b_d4.push_uci("d2d4")
+    e4 = board_to_cache_row(b_e4, chess.Move.from_uci("e7e5"))
+    d4 = board_to_cache_row(b_d4, chess.Move.from_uci("d7d5"))
+    out, hs, rep = filter_disjoint(stack_rows([e4, e4, d4]), None)
+    assert rep["n_in"] == 3
+    assert rep["n_out"] == 2
+    assert rep["internal_dups"] == 1
+    assert rep["vs_seen"] == 0
+    assert int(out["board_array"].shape[0]) == 2
+    assert int(hs.size) == 2
+
+    seen = position_hashes(stack_rows([e4]))
+    out2, hs2, rep2 = filter_disjoint(stack_rows([e4, d4]), seen)
+    assert rep2["n_out"] == 1
+    assert rep2["vs_seen"] == 1
+    assert int(hs2.size) == 1
+
+
+def test_list_ready_shards_ignores_attached():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ready = td / "shard_014"
+        attached = td / "shard_008"
+        both = td / "shard_019"
+        for p in (ready, attached, both):
+            p.mkdir()
+            (p / "soft_cache.pt").write_bytes(b"x")
+        (ready / "READY").write_text("n=1\n")
+        (attached / "ATTACHED").write_text("step=1\n")
+        (both / "READY").write_text("n=1\n")
+        (both / "ATTACHED").write_text("step=1\n")
+        assert list_ready_shards(td) == [ready, both]
+        assert list_attached_shards(td) == [attached]
 
 
 def test_audit_and_exposure():
@@ -351,6 +399,56 @@ def test_recurrent_grad_avg_does_not_scale_muon_like_adam():
 
 def test_lr_scale_constant_continuation():
     assert lr_scale(100, warmup=0, max_steps=46488, min_lr_frac=1.0) == 1.0
+
+
+def test_pick_mix_and_bonus_soft_temp_override():
+    assert pick_mix_source(0.07, 0.08, 0.20, has_bonus=True, has_deep=True) == "bonus"
+    assert pick_mix_source(0.15, 0.08, 0.20, has_bonus=True, has_deep=True) == "deep"
+    assert pick_mix_source(0.50, 0.08, 0.20, has_bonus=True, has_deep=True) == "shallow"
+    assert pick_mix_source(0.07, 0.08, 0.20, has_bonus=False, has_deep=True) == "deep"
+    n = 20_000
+    draws = [i / n for i in range(n)]
+    counts = {"bonus": 0, "deep": 0, "shallow": 0}
+    for d in draws:
+        counts[pick_mix_source(d, 0.08, 0.20, has_bonus=True, has_deep=True)] += 1
+    assert abs(counts["bonus"] / n - 0.08) < 0.002
+    assert abs(counts["deep"] / n - 0.20) < 0.002
+    assert abs(counts["shallow"] / n - 0.72) < 0.002
+    assert policy_soft_temp_weight(False, 0.4, 0.0) == 0.4
+    assert policy_soft_temp_weight(True, 0.4, 0.0) == 0.0
+    assert policy_soft_temp_weight(True, 0.4, None) == 0.4
+    assert session_throughput(192 * 25, 10.0) == 480.0
+    # resume-cumulative 20M / 10s must not be used
+    assert session_throughput(192 * 25, 10.0) < 1_000_000
+
+
+def test_ingest_ready_bonus_shards_drops_seen_and_marks_attached():
+    b_e4 = chess.Board()
+    b_e4.push_uci("e2e4")
+    b_d4 = chess.Board()
+    b_d4.push_uci("d2d4")
+    e4 = board_to_cache_row(b_e4, chess.Move.from_uci("e7e5"))
+    d4 = board_to_cache_row(b_d4, chess.Move.from_uci("d7d5"))
+    seen = position_hashes(stack_rows([e4]))
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        sh = td / "shard_000000"
+        sh.mkdir()
+        torch.save(stack_rows([e4, d4]), sh / "soft_cache.pt")
+        (sh / "READY").write_text("n=2\n")
+        chunks, new_seen, reports = ingest_ready_bonus_shards(td, seen)
+        assert len(chunks) == 1
+        assert int(chunks[0]["board_array"].shape[0]) == 1
+        assert reports[0]["n_out"] == 1
+        assert reports[0]["vs_seen"] == 1
+        assert not (sh / "READY").exists()
+        assert (sh / "ATTACHED").exists()
+        merged = concat_soft_tables([stack_rows([e4]), chunks[0]])
+        assert int(merged["board_array"].shape[0]) == 2
+        # second ingest is a no-op
+        chunks2, _, reports2 = ingest_ready_bonus_shards(td, new_seen)
+        assert chunks2 == []
+        assert reports2 == []
 
 
 if __name__ == "__main__":

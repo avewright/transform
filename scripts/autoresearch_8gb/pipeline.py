@@ -86,6 +86,116 @@ def teacher_kl(logits, soft_indices, soft_probs):
     return kl.mean()
 
 
+def pick_mix_source(
+    draw: float,
+    bonus_mix: float,
+    deep_mix: float,
+    *,
+    has_bonus: bool,
+    has_deep: bool,
+) -> str:
+    """bonus, then deep, else shallow. ``draw`` is Uniform[0, 1)."""
+    if has_bonus and draw < bonus_mix:
+        return "bonus"
+    if has_deep and draw < (bonus_mix + deep_mix):
+        return "deep"
+    return "shallow"
+
+
+def policy_soft_temp_weight(
+    use_bonus: bool,
+    default_weight: float,
+    bonus_weight: float | None,
+) -> float:
+    """Per-pool override for the Chessformer softened-target aux."""
+    if use_bonus and bonus_weight is not None:
+        return float(bonus_weight)
+    return float(default_weight)
+
+
+def session_throughput(session_positions: int, session_elapsed_s: float) -> float:
+    """Positions processed this process / session wall time. Not cumulative resume."""
+    return float(session_positions) / max(float(session_elapsed_s), 1e-6)
+
+
+def concat_soft_tables(chunks: list[dict]) -> dict:
+    """Concat cache dicts on shared tensor keys (does not rewrite files)."""
+    if not chunks:
+        raise ValueError("no chunks")
+    if len(chunks) == 1:
+        return chunks[0]
+    keys = [k for k in chunks[0] if all(k in c and torch.is_tensor(c[k]) for c in chunks)]
+    return {k: torch.cat([c[k] for c in chunks], dim=0) for k in keys}
+
+
+def load_extra_soft_shards(paths: list[Path], log=None) -> list[tuple[str, dict]]:
+    loaded = []
+    for p in paths:
+        p = Path(p)
+        cache = p / "soft_cache.pt" if p.is_dir() else p
+        if not cache.exists():
+            if log:
+                log(f"skip extra soft {p}: missing {cache}")
+            continue
+        data = torch.load(cache, map_location="cpu", weights_only=False)
+        attach_static_targets(data)
+        loaded.append((str(p), data))
+        if log:
+            log(f"loaded extra soft {p} n={int(data['board_array'].shape[0]):,}")
+    return loaded
+
+
+def filter_disjoint(data: dict, seen: np.ndarray | None) -> tuple[dict, np.ndarray, dict[str, int]]:
+    """Keep first copy of each position hash; drop any already in ``seen``."""
+    hs = position_hashes(data)
+    n = int(hs.size)
+    _, first = np.unique(hs, return_index=True)
+    keep = np.zeros(n, dtype=np.bool_)
+    keep[first] = True
+    internal = n - int(first.size)
+    vs_seen = 0
+    if seen is not None and seen.size:
+        collide = np.isin(hs, seen)
+        vs_seen = int((collide & keep).sum())
+        keep &= ~collide
+    n_keep = int(keep.sum())
+    if n_keep != n:
+        data = {
+            k: (v[keep] if torch.is_tensor(v) or isinstance(v, np.ndarray) else v)
+            for k, v in data.items()
+        }
+        hs = hs[keep]
+    return data, hs.astype(np.uint64, copy=False), {
+        "n_in": n,
+        "n_out": n_keep,
+        "internal_dups": internal,
+        "vs_seen": vs_seen,
+    }
+
+
+def load_position_hashes(path: Path) -> np.ndarray:
+    """Unique position hashes from a shard dir or soft_cache.pt. Drops the table."""
+    cache = Path(path)
+    if cache.is_dir():
+        cache = cache / "soft_cache.pt"
+    data = torch.load(cache, map_location="cpu", weights_only=False)
+    hs = np.unique(position_hashes(data).astype(np.uint64, copy=False))
+    del data
+    return hs
+
+
+def list_attached_shards(queue_dir: Path) -> list[Path]:
+    found: list[Path] = []
+    for p in sorted(Path(queue_dir).glob("shard_*/ATTACHED")):
+        if not p.is_file():
+            continue
+        sh = p.parent
+        if (sh / "READY").exists() or not (sh / "soft_cache.pt").exists():
+            continue
+        found.append(sh)
+    return found
+
+
 def attach_static_targets(data: dict) -> dict:
     """Precompute WDL and ep_file so the train loop does not redo them."""
     from data_loader import compute_wdl, ep_square_to_file
@@ -256,7 +366,12 @@ def apply_membership(data: dict, manifest: dict) -> tuple[torch.Tensor, torch.Te
 def audit_soft_targets(data: dict, max_rows: int = 4096) -> dict[str, Any]:
     n = int(data["soft_indices"].shape[0])
     take = min(n, max_rows)
-    idx = torch.linspace(0, n - 1, take).long() if n > take else torch.arange(n)
+    if take <= 0:
+        return {"rows_checked": 0, "empty_rows": 0, "negative_probs": 0, "unnormalized_rows": 0, "mean_valid_mass": 0.0, "ok": True}
+    if n <= take:
+        idx = torch.arange(n)
+    else:
+        idx = (torch.arange(take, dtype=torch.int64) * (n // take)).clamp(max=n - 1)
     si = data["soft_indices"][idx]
     sp = data["soft_probs"][idx].float()
     valid = soft_target_valid_mask(si, sp)
@@ -387,7 +502,7 @@ def save_training_checkpoint(
         "n_params": int(n_params),
         "rng": collect_rng_state(sampler_rng, include_cuda=include_cuda_rng),
         "manifest": manifest,
-        "swa_n": 0,
+        "swa_n": int(swa_n),
         "status": status,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -607,7 +722,51 @@ def exposure_report(
 
 
 def list_ready_shards(queue_dir: Path) -> list[Path]:
-    return sorted(p.parent for p in Path(queue_dir).glob("shard_*/READY") if p.is_file())
+    """Shards not yet trained. ATTACHED shards stay out of the next attach."""
+    found: list[Path] = []
+    for p in sorted(Path(queue_dir).glob("shard_*/READY")):
+        if not p.is_file():
+            continue
+        sh = p.parent
+        if not (sh / "soft_cache.pt").exists():
+            continue
+        found.append(sh)
+    return found
+
+
+def ingest_ready_bonus_shards(
+    inbox_dir: Path,
+    seen: np.ndarray | None,
+) -> tuple[list[dict], np.ndarray, list[dict[str, Any]]]:
+    """Consume READY inbox shards; drop hashes in ``seen`` (bonus + holdout).
+
+    Marks each shard ATTACHED and removes READY so a live trainer can pick
+    new hunts without rewriting the 10M+ soft cache.
+    """
+    inbox = Path(inbox_dir)
+    chunks: list[dict] = []
+    reports: list[dict[str, Any]] = []
+    seen_h = None if seen is None or not getattr(seen, "size", 0) else seen.astype(np.uint64, copy=False)
+    if not inbox.is_dir():
+        empty = np.array([], dtype=np.uint64) if seen_h is None else seen_h
+        return chunks, empty, reports
+    for sh in list_ready_shards(inbox):
+        data = torch.load(sh / "soft_cache.pt", map_location="cpu", weights_only=False)
+        data, hs, stats = filter_disjoint(data, seen_h)
+        n_out = int(stats["n_out"])
+        if n_out:
+            chunks.append(data)
+            if seen_h is None:
+                seen_h = np.unique(hs.astype(np.uint64, copy=False))
+            else:
+                seen_h = np.unique(np.concatenate([seen_h, hs.astype(np.uint64, copy=False)]))
+        ready = sh / "READY"
+        if ready.exists():
+            ready.unlink()
+        (sh / "ATTACHED").write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), **stats}), encoding="utf-8")
+        reports.append({"shard": sh.name, **stats})
+    empty = np.array([], dtype=np.uint64) if seen_h is None else seen_h
+    return chunks, empty, reports
 
 
 def write_shard_manifest(

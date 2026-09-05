@@ -57,6 +57,12 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     apply_membership,
     attach_static_targets,
     audit_soft_targets,
+    concat_soft_tables,
+    filter_disjoint,
+    ingest_ready_bonus_shards,
+    list_attached_shards,
+    load_extra_soft_shards,
+    load_position_hashes,
     cheap_eval_losses,
     classify_checkpoint,
     exposure_report,
@@ -65,11 +71,16 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     lr_scale,
     make_val_membership,
     muon_update_scale_note,
+    pick_mix_source,
+    policy_soft_temp_weight,
+    position_hashes,
     prepare_soft_batch,
+    session_throughput,
     restore_rng_state,
     save_training_checkpoint,
     soft_policy_loss,
     soft_temp_policy_loss,
+    unwrap_model,
     write_shard_manifest,
 )
 
@@ -182,6 +193,8 @@ def train_trial(
     smoke: bool = False,
     device: torch.device | None = None,
     resume_ckpt: Path | None = None,
+    extra_soft_caches: list[Path] | None = None,
+    bonus_cache: Path | None = None,
 ) -> dict[str, Any]:
     """Train one trial. Returns metrics dict including ckpt_path / pos_s / status."""
     os.environ.setdefault("MOVE_VOCAB_VERSION", "compact")
@@ -350,6 +363,13 @@ def train_trial(
             resume_kind = "weights_only"
             _log(log_path, f"optimizer state load failed ({e}); continuing as weights-only warm start")
 
+    if train.get("force_lr"):
+        muon_lr = float(train.get("muon_lr", 0.02))
+        adam_lr = float(train.get("adam_lr", 3e-4))
+        for pg in optimizer.param_groups:
+            pg["lr"] = muon_lr if pg.get("use_muon") else adam_lr
+        _log(log_path, f"force_lr muon={muon_lr:g} adam={adam_lr:g}")
+
     compiled = False
     if train.get("torch_compile") and hasattr(torch, "compile"):
         try:
@@ -364,6 +384,7 @@ def train_trial(
     train_soft_idx = train_deep_idx = None
     val_soft_idx = val_deep_idx = None
     train_soft_n = train_deep_n = 0
+    attached_names: list[str] = []
     val_manifests: dict[str, Any] = {}
     if soft_cache and soft_cache.exists():
         soft_data = torch.load(soft_cache, map_location="cpu", weights_only=False)
@@ -376,6 +397,61 @@ def train_trial(
         else:
             val_manifests["soft"] = make_val_membership(soft_data, n_hold=hold, seed=201, source="soft")
             man_path.write_text(json.dumps(val_manifests["soft"], indent=2), encoding="utf-8")
+        attached_names: list[str] = []
+        extra_soft_caches = extra_soft_caches or []
+        import numpy as _np
+        soft_data, seen_h, live_rep = filter_disjoint(soft_data, None)
+        if live_rep["internal_dups"]:
+            _log(log_path, f"live soft dropped {live_rep['internal_dups']:,} internal hash dups")
+        extra_resolved = {str(Path(p).resolve()) for p in extra_soft_caches}
+        if extra_soft_caches:
+            qdir = Path(extra_soft_caches[0]).parent
+            prior_h = [seen_h]
+            n_prior_rows = 0
+            n_prior_shards = 0
+            for sh in list_attached_shards(qdir):
+                if str(sh.resolve()) in extra_resolved:
+                    continue
+                ph = load_position_hashes(sh)
+                prior_h.append(ph)
+                n_prior_rows += int(ph.size)
+                n_prior_shards += 1
+            if n_prior_shards:
+                seen_h = _np.unique(_np.concatenate(prior_h))
+                _log(
+                    log_path,
+                    f"exclude {n_prior_shards} prior ATTACHED shards "
+                    f"({n_prior_rows:,} hashes) seen={int(seen_h.size):,}",
+                )
+        if extra_soft_caches:
+            extras = load_extra_soft_shards(
+                [Path(p) for p in extra_soft_caches],
+                log=lambda m: _log(log_path, m),
+            )
+            kept_extras: list[dict] = []
+            for name, data in extras:
+                data, new_h, rep = filter_disjoint(data, seen_h)
+                _log(
+                    log_path,
+                    f"disjoint {Path(name).name}: in={rep['n_in']:,} out={rep['n_out']:,} "
+                    f"internal_dups={rep['internal_dups']} vs_prior={rep['vs_seen']}",
+                )
+                if rep["n_out"] <= 0:
+                    continue
+                kept_extras.append(data)
+                attached_names.append(name)
+                seen_h = _np.unique(_np.concatenate([seen_h, new_h]))
+                sp = Path(name)
+                if sp.is_dir():
+                    (sp / "READY").unlink(missing_ok=True)
+                    (sp / "ATTACHED").write_text(f"step={start_step} kept={rep['n_out']}\n", encoding="utf-8")
+            if kept_extras:
+                soft_data = concat_soft_tables([soft_data] + kept_extras)
+                _log(
+                    log_path,
+                    f"attached {len(kept_extras)} disjoint SF shards → n={int(soft_data['board_array'].shape[0]):,} "
+                    f"unique_hashes={int(seen_h.size):,}",
+                )
         train_soft_idx, val_soft_idx = apply_membership(soft_data, val_manifests["soft"])
         train_soft_n = int(train_soft_idx.numel())
         audit = audit_soft_targets(soft_data)
@@ -393,6 +469,69 @@ def train_trial(
             "ckpt_path": None,
             "n_params": n_params,
         }
+
+    bonus_data = None
+    train_bonus_idx = None
+    train_bonus_n = 0
+    bonus_seen_h = None
+    bonus_path = Path(bonus_cache) if bonus_cache else None
+    if bonus_path is not None:
+        if bonus_path.exists():
+            bonus_data = torch.load(bonus_path, map_location="cpu", weights_only=False)
+            attach_static_targets(bonus_data)
+            train_bonus_n = int(bonus_data["board_array"].shape[0])
+            train_bonus_idx = torch.arange(train_bonus_n)
+            _log(log_path, f"bonus cache {bonus_path} n={train_bonus_n:,}")
+        else:
+            _log(log_path, f"bonus cache missing: {bonus_path}")
+
+    import numpy as np
+
+    if bonus_data is not None:
+        bonus_seen_h = np.unique(position_hashes(bonus_data).astype(np.uint64, copy=False))
+    for raw_ex in train.get("bonus_exclude") or []:
+        ex = Path(raw_ex)
+        if not ex.exists():
+            _log(log_path, f"bonus exclude missing: {ex}")
+            continue
+        extra = load_position_hashes(ex)
+        bonus_seen_h = extra if bonus_seen_h is None else np.unique(
+            np.concatenate([bonus_seen_h, extra.astype(np.uint64, copy=False)])
+        )
+        _log(log_path, f"bonus exclude {ex} hashes={int(extra.size):,}")
+
+    bonus_inbox = Path(train["bonus_inbox"]) if train.get("bonus_inbox") else None
+
+    def _persist_bonus() -> None:
+        if bonus_data is None or bonus_path is None:
+            return
+        keys = [k for k, v in bonus_data.items() if torch.is_tensor(v)]
+        payload = {k: bonus_data[k] for k in keys}
+        tmp = bonus_path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, bonus_path)
+
+    def _ingest_bonus_inbox() -> int:
+        nonlocal bonus_data, train_bonus_idx, train_bonus_n, bonus_seen_h
+        if bonus_inbox is None:
+            return 0
+        chunks, bonus_seen_h, reports = ingest_ready_bonus_shards(bonus_inbox, bonus_seen_h)
+        if not chunks:
+            return 0
+        if bonus_data is None:
+            bonus_data = concat_soft_tables(chunks)
+        else:
+            bonus_data = concat_soft_tables([bonus_data, *chunks])
+        attach_static_targets(bonus_data)
+        train_bonus_n = int(bonus_data["board_array"].shape[0])
+        train_bonus_idx = torch.arange(train_bonus_n)
+        added = sum(int(r["n_out"]) for r in reports)
+        names = ",".join(str(r["shard"]) for r in reports if int(r["n_out"]))
+        _log(log_path, f"bonus inbox +{added:,} n={train_bonus_n:,} shards={names}")
+        _persist_bonus()
+        return added
+
+    _ingest_bonus_inbox()
 
     if deep_cache and deep_cache.exists():
         deep_data = torch.load(deep_cache, map_location="cpu", weights_only=False)
@@ -501,6 +640,14 @@ def train_trial(
     soft_frac = float(train.get("soft_frac", 0.85))
     soft_alpha = float(train.get("soft_alpha", 0.45))
     deep_mix = float(train.get("deep_mix_frac", 0.35))
+    bonus_mix = float(train.get("bonus_mix_frac", 0.0))
+    bonus_soft_temp_weight = train.get("bonus_soft_temp_weight", None)
+    if bonus_soft_temp_weight is not None:
+        bonus_soft_temp_weight = float(bonus_soft_temp_weight)
+    if bonus_mix > 0:
+        _log(log_path, f"bonus_mix_frac={bonus_mix:g} n={train_bonus_n:,}")
+    if bonus_soft_temp_weight is not None:
+        _log(log_path, f"bonus_soft_temp_weight={bonus_soft_temp_weight:g} (general={float(train.get('soft_temp_weight', 0.5)):g})")
     hflip_p = float(train.get("hflip_p", 0.5))
     value_weight = float(train.get("value_weight", 0.1))
     grad_clip = float(train.get("grad_clip", 1.0))
@@ -539,15 +686,28 @@ def train_trial(
     last_tick = t0
     step = start_step
     positions = int((resume_payload or {}).get("positions") or 0)
+    session_positions = 0
     peak_vram = 0.0
     window_loss_t: torch.Tensor | None = None
     window_n = 0
     clip_hits = 0
     shallow_seen = 0
     deep_seen = 0
+    bonus_seen = 0
     swa_state: dict[str, torch.Tensor] | None = None
     swa_n = 0
     swa_start_step = int(max_steps * swa_start_frac) if use_swa else max_steps + 1
+    eval_swa_path = out_dir / "eval_swa.pt"
+    if use_swa and eval_swa_path.exists():
+        ev = torch.load(eval_swa_path, map_location="cpu", weights_only=False)
+        ev_n = int(ev.get("swa_n") or 0)
+        if ev_n > 0:
+            to_dev = next(unwrap_model(model).parameters()).device
+            swa_state = {k: v.to(to_dev) for k, v in ev["model_state_dict"].items()}
+            swa_n = ev_n
+            # Keep averaging across max_steps extensions.
+            swa_start_step = min(swa_start_step, start_step)
+            _log(log_path, f"restored SWA eval weights n={swa_n} from {eval_swa_path.name}")
     if soft_temp > 0:
         _log(log_path, f"chessformer soft_temp={soft_temp} weight={soft_temp_weight}")
     if use_swa:
@@ -556,9 +716,12 @@ def train_trial(
     write_shard_manifest(
         out_dir / "dataset_manifest.json",
         live=Path(soft_cache) if soft_cache else out_dir,
-        shards=[],
+        shards=[Path(n) for n in attached_names],
         val_manifests=val_manifests,
-        notes="Live process tensors; READY shards are NOT auto-merged.",
+        notes=(
+            f"In-memory attach of {len(attached_names)} disjoint SF shards. "
+            f"Live soft_cache.pt unchanged. deep_mix_frac={deep_mix}."
+        ),
     )
     exp = exposure_report(
         shallow_n=train_soft_n, deep_n=train_deep_n, deep_mix_frac=deep_mix,
@@ -576,7 +739,7 @@ def train_trial(
     def _save_ckpt(status: str, *, also_step: bool = False) -> dict[str, Any]:
         wall = max(time.time() - t0, 1e-6)
         elapsed = max(active_elapsed, 1e-6)
-        pos_s = positions / elapsed if positions else 0.0
+        pos_s = session_throughput(session_positions, wall)
         ckpt_path = out_dir / "latest.pt"
         known = out_dir / "known_good.pt"
         eval_path = out_dir / "eval_swa.pt"
@@ -649,18 +812,25 @@ def train_trial(
             )
             for _ in range(accum):
                 if use_soft and soft_data is not None:
-                    use_deep = (
-                        deep_data is not None and train_deep_n > 0
-                        and torch.rand(1, generator=rng).item() < deep_mix
+                    draw = torch.rand(1, generator=rng).item()
+                    mix_src = pick_mix_source(
+                        draw, bonus_mix, deep_mix,
+                        has_bonus=bonus_data is not None and train_bonus_n > 0,
+                        has_deep=deep_data is not None and train_deep_n > 0,
                     )
-                    src = deep_data if use_deep else soft_data
-                    pool = train_deep_idx if use_deep else train_soft_idx
-                    local = torch.randint(0, int(pool.numel()), (bs,), generator=rng)
-                    idx = pool[local]
-                    if use_deep:
+                    use_bonus = mix_src == "bonus"
+                    use_deep = mix_src == "deep"
+                    if use_bonus:
+                        src, pool = bonus_data, train_bonus_idx
+                        bonus_seen += bs
+                    elif use_deep:
+                        src, pool = deep_data, train_deep_idx
                         deep_seen += bs
                     else:
+                        src, pool = soft_data, train_soft_idx
                         shallow_seen += bs
+                    local = torch.randint(0, int(pool.numel()), (bs,), generator=rng)
+                    idx = pool[local]
                     bi, hard, wdl, si, sp = prepare_soft_batch(
                         src, idx, device, hflip_p=hflip_p, rng=rng,
                     )
@@ -671,8 +841,11 @@ def train_trial(
                         )
                         soft_ce = soft_policy_loss(out["policy_logits"], si, sp)
                         p_loss = (1.0 - soft_alpha) * hard_ce + soft_alpha * soft_ce
-                        if soft_temp > 0:
-                            p_loss = p_loss + soft_temp_weight * soft_temp_policy_loss(
+                        st_w = policy_soft_temp_weight(
+                            use_bonus, soft_temp_weight, bonus_soft_temp_weight,
+                        )
+                        if soft_temp > 0 and st_w > 0:
+                            p_loss = p_loss + st_w * soft_temp_policy_loss(
                                 out["policy_logits"], si, sp, temperature=soft_temp,
                             )
                         v_loss = F.cross_entropy(out["value_logits"], wdl)
@@ -722,6 +895,7 @@ def train_trial(
                         ) / accum
                     loss.backward()
                 positions += bs
+                session_positions += bs
                 det = loss.detach()
                 window_loss_t = det if window_loss_t is None else window_loss_t + det
                 window_n += 1
@@ -754,17 +928,19 @@ def train_trial(
                 avg_loss = float((window_loss_t or torch.zeros(1)).float().item()) * accum / max(window_n, 1)
                 finite = math.isfinite(avg_loss)
                 lrs = [f"{pg['lr']:.2e}" for pg in optimizer.param_groups]
+                pos_s = session_throughput(session_positions, elapsed)
                 _log(
                     log_path,
                     f"step {step}/{max_steps} | loss={avg_loss:.4f} | "
                     f"lr={','.join(lrs)} | clip={clip_hits}/25 | "
-                    f"mix s/d={shallow_seen}/{deep_seen} | "
-                    f"{positions/max(elapsed, 1e-6):.0f} pos/s | vram={peak_vram:.2f}GB"
+                    f"mix s/d/b={shallow_seen}/{deep_seen}/{bonus_seen} | "
+                    f"{pos_s:.0f} pos/s | vram={peak_vram:.2f}GB"
                     + ("" if finite else " NON-FINITE"),
                 )
                 window_loss_t = None
                 window_n = 0
                 clip_hits = 0
+                _ingest_bonus_inbox()
                 if not finite:
                     interrupted = True
                     _log(log_path, f"stopping: non-finite loss at step {step}")

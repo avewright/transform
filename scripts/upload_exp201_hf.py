@@ -32,6 +32,37 @@ def load_hf_token() -> str:
     raise SystemExit("HF_TOKEN not found in env or .env")
 
 
+def format_elo_md(path: Path) -> str:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    proto = data.get("protocol") or {}
+    est = data.get("estimate") or {}
+    lines = [
+        "Search-free greedy policy (legal-masked argmax). No book, no Syzygy, no MCTS.",
+        f"Opponent: {proto.get('sf_version', 'Stockfish')} `UCI_LimitStrength` / `UCI_Elo`, "
+        f"movetime={proto.get('movetime', 0.05)}s, ply cap {proto.get('ply_cap', 160)}.",
+        "This is **not** FIDE or Lichess Elo.",
+        "",
+    ]
+    elo = est.get("estimated_elo")
+    lo, hi = est.get("lower_bound"), est.get("upper_bound")
+    if elo is not None:
+        band = f" (bracket {lo}–{hi})" if lo is not None and hi is not None else ""
+        lines.append(f"**Estimate: {elo} UCI_Elo**{band}.")
+        lines.append("")
+    lines.append("| SF UCI_Elo | Score | W-D-L | Ply-cap (counted as draw) |")
+    lines.append("|---|---|---|---|")
+    for s in data.get("summaries") or []:
+        caps = (s.get("terminations") or {}).get("PLY_CAP", 0)
+        lines.append(
+            f"| {s['sf_elo']} | {s['score']:.3f} ({s['games']}g) | "
+            f"{s['w']}-{s['d']}-{s['l']} | {caps} |"
+        )
+    note = est.get("note")
+    if note:
+        lines.extend(["", f"_{note}_"])
+    return "\n".join(lines)
+
+
 def ckpt_steps(path: Path) -> int:
     import torch
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -41,6 +72,10 @@ def ckpt_steps(path: Path) -> int:
 def write_card(repo: str, steps: int, extra: dict) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     loss = extra.get("recent_loss", "—")
+    elo_md = extra.get("elo_md") or (
+        "Greedy policy, no book, no Syzygy. Treat as Stockfish `UCI_Elo` "
+        "(not FIDE / Lichess). Older ~30k-step probe was ~1500–1650."
+    )
     card = OUT / "HF_README.md"
     card.write_text(
         f"""---
@@ -146,15 +181,9 @@ export MOVE_VOCAB_VERSION=compact
 python play_factory_gui.py -c latest.pt --policy-only --device cpu -p 8080
 ```
 
-## Rough Elo (noisy)
+## Elo (Stockfish UCI_Elo, not FIDE / Lichess)
 
-Greedy policy, no book, no Syzygy. 18 games vs Stockfish 14.1 `UCI_Elo` (3 openings × both colors), CPU, step 30750:
-
-- SF 1350: 5.5/6
-- SF 1450: 4/6
-- SF 1600: 3/6
-
-Treat as **~1500–1650** policy Elo, not a rating.
+{elo_md}
 
 ## Files
 
@@ -171,6 +200,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--ckpt", default=str(OUT / "latest.pt"))
+    ap.add_argument("--elo-json", default=None, help="Optional elo_eval_*.json to embed in the model card")
+    ap.add_argument("--elo-md", default=None, help="Optional markdown snippet that replaces the Elo section")
     ap.add_argument("--private", action="store_true")
     args = ap.parse_args()
 
@@ -202,6 +233,10 @@ def main() -> None:
         losses = re.findall(r"loss=([\d.]+)", log.read_text(errors="replace"))
         if losses:
             extra["recent_loss"] = losses[-1]
+    if args.elo_md:
+        extra["elo_md"] = Path(args.elo_md).read_text(encoding="utf-8").strip()
+    elif args.elo_json:
+        extra["elo_md"] = format_elo_md(Path(args.elo_json))
     card = write_card(args.repo, steps, extra)
 
     create_repo(args.repo, repo_type="model", exist_ok=True, private=args.private, token=token)
