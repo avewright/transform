@@ -47,8 +47,8 @@ while true; do
   fi
   cur=$(latest_steps)
   nxt=$((cur + SEGMENT))
-  log "merging any READY disjoint soft shards into live mix"
-  python3 -u scripts/queue_exp201_disjoint.py --consume >>"$LOG" 2>&1 || log "mix consume failed"
+  log "registering READY disjoint shards (will not rewrite live cache while training)"
+  python3 -u scripts/queue_exp201_disjoint.py --register >>"$LOG" 2>&1 || log "shard register failed"
   log "continue train steps ${cur} -> ${nxt}"
   python3 -u experiments/exp201_recurrent_64.py --go --skip-mix \
     --resume "$OUT/latest.pt" \

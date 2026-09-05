@@ -19,8 +19,11 @@ Recurrent gradient averaging
 ----------------------------
 Autograd already *sums* grads across the 3 unrolls of each bank block. Call
 ``average_recurrent_grads(model)`` after ``loss.backward()`` and before
-``optimizer.step()`` to divide bank-parameter grads by ``recurrent_unrolls``
-so the recurrent LR scale matches the unique layers.
+``optimizer.step()`` to divide bank-parameter *gradients* by
+``recurrent_unrolls``. This does **not** divide Polar-NorMuon (or RMS-Adam)
+updates by the same factor; those updates are approximately scale-invariant.
+It does shrink the pre-clip global grad norm. Use param-group LRs if you
+want different update sizes.
 """
 from __future__ import annotations
 
@@ -225,8 +228,9 @@ def average_recurrent_grads(
 ) -> None:
     """Divide recurrent-bank grads by unroll count (call after backward).
 
-    Gradients from the three bank passes are summed by autograd; averaging
-    keeps update magnitude comparable to the unique prefix/suffix layers.
+    Autograd sums the three bank passes. Averaging shrinks ``.grad`` and the
+    global clip norm; Polar-NorMuon / RMS-Adam update *sizes* stay about the
+    same because those updates are scale-normalized.
     """
     n = unrolls if unrolls is not None else model.config.recurrent_unrolls
     if n <= 1:

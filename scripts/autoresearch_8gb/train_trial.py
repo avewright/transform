@@ -19,6 +19,10 @@ from torch.amp import autocast
 from torch.optim import AdamW
 
 ROOT = Path(__file__).resolve().parents[2]
+import sys
+for _p in (str(ROOT), str(ROOT / "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 ADAM_NAME_HINTS = (
     "embed", "policy_head", "value_head", "cls_token", "cls_pos",
@@ -49,20 +53,25 @@ def _log(path: Path | None, msg: str) -> None:
             f.write(line + "\n")
 
 
-def soft_policy_loss(logits, soft_indices, soft_probs):
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    valid = (soft_indices >= 0) & (soft_probs > 0)
-    safe = soft_indices.clamp(min=0).long()
-    gathered = log_probs.gather(1, safe) * valid.float()
-    return -(soft_probs.float() * gathered).sum(dim=-1).mean()
-
-
-def soft_temp_policy_loss(logits, soft_indices, soft_probs, temperature: float = 4.0):
-    """Chessformer soft-policy aux: visit dist raised to 1/T (paper T=4, c_softpol=8)."""
-    p = soft_probs.float().clamp_min(1e-8)
-    p_t = p.pow(1.0 / max(temperature, 1e-6))
-    p_t = p_t / p_t.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-    return soft_policy_loss(logits, soft_indices, p_t)
+from autoresearch_8gb.pipeline import (  # noqa: E402
+    apply_membership,
+    attach_static_targets,
+    audit_soft_targets,
+    cheap_eval_losses,
+    classify_checkpoint,
+    exposure_report,
+    legal_policy_diagnostics,
+    load_model_state,
+    lr_scale,
+    make_val_membership,
+    muon_update_scale_note,
+    prepare_soft_batch,
+    restore_rng_state,
+    save_training_checkpoint,
+    soft_policy_loss,
+    soft_temp_policy_loss,
+    write_shard_manifest,
+)
 
 
 def _ema_update(ema_state: dict[str, torch.Tensor], model: nn.Module, n: int) -> int:
@@ -124,53 +133,6 @@ def build_polar_normuon_optimizer(model, muon_lr, adam_lr, weight_decay, compile
     return opt, muon_n, adam_n
 
 
-def prepare_soft_batch(data, indices, device, hflip_p=0.0, rng=None):
-    from data_loader import (
-        board_array_to_fused, compute_wdl, ep_square_to_file,
-        hflip_board_array, hflip_ep_square, hflip_move_idx,
-    )
-
-    ba = data["board_array"][indices].clone()
-    turn = data["turn"][indices].clone()
-    castling = data["castling"][indices].clone()
-    ep = data["ep_square"][indices].clone()
-    move_idx = data["move_idx"][indices].clone()
-    cp = data["cp"][indices]
-    mate = data["mate"][indices]
-    soft_i = data["soft_indices"][indices].clone()
-    soft_p = data["soft_probs"][indices].clone()
-
-    if hflip_p > 0:
-        flip_mask = torch.rand(ba.shape[0], generator=rng) < hflip_p
-        if flip_mask.any():
-            ba[flip_mask] = hflip_board_array(ba[flip_mask])
-            move_idx[flip_mask] = hflip_move_idx(move_idx[flip_mask]).to(move_idx.dtype)
-            castling[flip_mask] = 0
-            ep[flip_mask] = hflip_ep_square(ep[flip_mask]).to(ep.dtype)
-            si = soft_i[flip_mask]
-            valid = si >= 0
-            if valid.any():
-                si2 = si.clone()
-                si2[valid] = hflip_move_idx(si[valid]).to(si.dtype)
-                soft_i[flip_mask] = si2
-
-    nb = device.type == "cuda"
-    board_input = {
-        "fused_ids": board_array_to_fused(ba).to(device, non_blocking=nb),
-        "turn": turn.long().to(device, non_blocking=nb),
-        "castling": castling.long().to(device, non_blocking=nb),
-        "ep_file": ep_square_to_file(ep).long().to(device, non_blocking=nb),
-    }
-    wdl = compute_wdl(cp, mate).to(device, non_blocking=nb)
-    return (
-        board_input,
-        move_idx.long().to(device, non_blocking=nb),
-        wdl,
-        soft_i.to(device, non_blocking=nb),
-        soft_p.to(device, non_blocking=nb),
-    )
-
-
 def _is_oom(err: BaseException) -> bool:
     if isinstance(err, torch.cuda.OutOfMemoryError):
         return True
@@ -226,6 +188,9 @@ def train_trial(
     import sys
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
 
     from data_loader import stream_hf_batches
     from move_vocab import VOCAB_SIZE
@@ -312,16 +277,31 @@ def train_trial(
     _log(log_path, f"params={n_params/1e6:.2f}M")
 
     start_step = 0
+    resume_kind = "fresh"
+    resume_payload: dict[str, Any] | None = None
     if resume_ckpt is not None:
         resume_ckpt = Path(resume_ckpt)
         if not resume_ckpt.exists():
             raise FileNotFoundError(f"resume ckpt missing: {resume_ckpt}")
         ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
-        state = ckpt.get("model_state_dict", ckpt)
-        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
-        model.load_state_dict(state, strict=True)
-        start_step = int(ckpt.get("steps", 0))
-        _log(log_path, f"resume {resume_ckpt} steps={start_step}")
+        if ckpt.get("eval_only"):
+            raise SystemExit(
+                f"{resume_ckpt} is an evaluation/SWA snapshot, not a training resume file. "
+                "Use latest.pt or known_good.pt (live weights)."
+            )
+        model.load_state_dict(load_model_state(ckpt), strict=True)
+        start_step = int(ckpt.get("steps", ckpt.get("global_step", 0)) or 0)
+        resume_kind = classify_checkpoint(ckpt)
+        resume_payload = ckpt if isinstance(ckpt, dict) else None
+        if resume_kind == "full":
+            _log(log_path, f"FULL RESUME {resume_ckpt} steps={start_step}")
+        else:
+            _log(
+                log_path,
+                f"WEIGHTS-ONLY WARM START {resume_ckpt} steps={start_step} "
+                f"(no optimizer/RNG in checkpoint; optimizer is re-initialized; "
+                f"LR follows this process's train config)",
+            )
 
     opt_name = train.get("optimizer", "normuon")
     try:
@@ -362,6 +342,14 @@ def train_trial(
         )
         _log(log_path, f"optimizer fallback AdamW ({e})")
 
+    if resume_kind == "full" and resume_payload and resume_payload.get("optimizer_state_dict"):
+        try:
+            optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+            _log(log_path, "optimizer state restored")
+        except Exception as e:
+            resume_kind = "weights_only"
+            _log(log_path, f"optimizer state load failed ({e}); continuing as weights-only warm start")
+
     compiled = False
     if train.get("torch_compile") and hasattr(torch, "compile"):
         try:
@@ -373,14 +361,30 @@ def train_trial(
 
     soft_data = None
     deep_data = None
+    train_soft_idx = train_deep_idx = None
+    val_soft_idx = val_deep_idx = None
     train_soft_n = train_deep_n = 0
+    val_manifests: dict[str, Any] = {}
     if soft_cache and soft_cache.exists():
         soft_data = torch.load(soft_cache, map_location="cpu", weights_only=False)
-        n = soft_data["board_array"].shape[0]
-        # Cap holdout so tiny caches (smoke / early harvest) still train.
+        attach_static_targets(soft_data)
+        n = int(soft_data["board_array"].shape[0])
         hold = min(2000, max(64 if smoke else 512, n // 40), max(0, n // 5))
-        train_soft_n = max(1, n - hold)
-        _log(log_path, f"soft train={train_soft_n:,} holdout={hold}")
+        man_path = out_dir / "val_manifest_soft.json"
+        if man_path.exists() and not smoke:
+            val_manifests["soft"] = json.loads(man_path.read_text(encoding="utf-8"))
+        else:
+            val_manifests["soft"] = make_val_membership(soft_data, n_hold=hold, seed=201, source="soft")
+            man_path.write_text(json.dumps(val_manifests["soft"], indent=2), encoding="utf-8")
+        train_soft_idx, val_soft_idx = apply_membership(soft_data, val_manifests["soft"])
+        train_soft_n = int(train_soft_idx.numel())
+        audit = audit_soft_targets(soft_data)
+        _log(
+            log_path,
+            f"soft train={train_soft_n:,} val={int(val_soft_idx.numel()):,} "
+            f"blocked={val_manifests['soft']['n_blocked']} "
+            f"targets empty={audit['empty_rows']} unnorm={audit['unnormalized_rows']}",
+        )
     elif not smoke:
         return {
             "status": "failed",
@@ -392,10 +396,18 @@ def train_trial(
 
     if deep_cache and deep_cache.exists():
         deep_data = torch.load(deep_cache, map_location="cpu", weights_only=False)
-        n = deep_data["board_array"].shape[0]
-        hold = min(1000, max(256, n // 40))
-        train_deep_n = max(1, n - hold)
-        _log(log_path, f"deep soft train={train_deep_n:,}")
+        attach_static_targets(deep_data)
+        n = int(deep_data["board_array"].shape[0])
+        hold = min(1000, max(64 if smoke else 256, n // 40))
+        man_path = out_dir / "val_manifest_deep.json"
+        if man_path.exists() and not smoke:
+            val_manifests["deep"] = json.loads(man_path.read_text(encoding="utf-8"))
+        else:
+            val_manifests["deep"] = make_val_membership(deep_data, n_hold=hold, seed=202, source="deep")
+            man_path.write_text(json.dumps(val_manifests["deep"], indent=2), encoding="utf-8")
+        train_deep_idx, val_deep_idx = apply_membership(deep_data, val_manifests["deep"])
+        train_deep_n = int(train_deep_idx.numel())
+        _log(log_path, f"deep train={train_deep_n:,} val={int(val_deep_idx.numel()):,}")
 
     hard_iter = None
     if float(train.get("soft_frac", 1.0)) < 1.0 and not smoke:
@@ -503,14 +515,13 @@ def train_trial(
     keep_step_every = int(train.get("keep_step_every", 0) or 0)
     keep_last = int(train.get("keep_last_ckpts", 4))
     elo_history_path = out_dir / "elo_gauntlet.jsonl"
+    val_every = int(train.get("val_every_steps", 500) or 0)
+    legal_every = int(train.get("legal_eval_every", 0) or 0)
+    train["max_steps"] = max_steps
+    train["batch_size"] = bs
 
     def set_lrs(step: int) -> None:
-        if step < warmup:
-            scale = (step + 1) / max(warmup, 1)
-        else:
-            progress = (step - warmup) / max(max_steps - warmup, 1)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
-            scale = min_lr_frac + (1.0 - min_lr_frac) * cosine
+        scale = lr_scale(step, warmup=warmup, max_steps=max_steps, min_lr_frac=min_lr_frac)
         for pg, base in zip(optimizer.param_groups, base_lrs):
             pg["lr"] = base * scale
 
@@ -518,23 +529,46 @@ def train_trial(
     optimizer.zero_grad(set_to_none=True)
     rng = torch.Generator(device="cpu")
     rng.manual_seed(hash(trial["id"]) % (2**31 - 1))
+    if resume_kind == "full" and resume_payload and resume_payload.get("rng"):
+        restore_rng_state(resume_payload["rng"], sampler_rng=rng)
+        _log(log_path, "RNG state restored")
     t0 = time.time()
     # Active-time budget: ignore laptop sleep gaps (>120s between steps).
     active_budget_s = max_minutes * 60.0
     active_elapsed = 0.0
     last_tick = t0
     step = start_step
-    positions = 0
+    positions = int((resume_payload or {}).get("positions") or 0)
     peak_vram = 0.0
-    window_loss = 0.0
+    window_loss_t: torch.Tensor | None = None
     window_n = 0
+    clip_hits = 0
+    shallow_seen = 0
+    deep_seen = 0
     swa_state: dict[str, torch.Tensor] | None = None
     swa_n = 0
     swa_start_step = int(max_steps * swa_start_frac) if use_swa else max_steps + 1
     if soft_temp > 0:
         _log(log_path, f"chessformer soft_temp={soft_temp} weight={soft_temp_weight}")
     if use_swa:
-        _log(log_path, f"chessformer SWA from step {swa_start_step}/{max_steps}")
+        _log(log_path, f"chessformer SWA from step {swa_start_step}/{max_steps} (eval_swa.pt only)")
+    _log(log_path, muon_update_scale_note())
+    write_shard_manifest(
+        out_dir / "dataset_manifest.json",
+        live=Path(soft_cache) if soft_cache else out_dir,
+        shards=[],
+        val_manifests=val_manifests,
+        notes="Live process tensors; READY shards are NOT auto-merged.",
+    )
+    exp = exposure_report(
+        shallow_n=train_soft_n, deep_n=train_deep_n, deep_mix_frac=deep_mix,
+        shallow_seen=0, deep_seen=0,
+    )
+    _log(
+        log_path,
+        f"exposure deep/shallow odds={exp['deep_vs_shallow_odds']:.1f}x "
+        f"(mix={deep_mix} deep_n={train_deep_n} shallow_n={train_soft_n})",
+    )
 
     stop_path = out_dir / "STOP"
     interrupted = False
@@ -542,26 +576,32 @@ def train_trial(
     def _save_ckpt(status: str, *, also_step: bool = False) -> dict[str, Any]:
         wall = max(time.time() - t0, 1e-6)
         elapsed = max(active_elapsed, 1e-6)
-        pos_s = positions / elapsed
+        pos_s = positions / elapsed if positions else 0.0
         ckpt_path = out_dir / "latest.pt"
-        to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
-        state = to_save.state_dict()
-        if use_swa and swa_state is not None and swa_n > 0:
-            state = swa_state
-            _log(log_path, f"saving SWA weights (n={swa_n})")
-        torch.save({
-            "model_state_dict": state,
-            "config": asdict(model_cfg),
-            "arch": arch,
-            "vocab": "compact",
-            "vocab_version": "compact",
-            "trial_id": trial["id"],
-            "steps": step,
-            "pos_s": pos_s,
-            "n_params": n_params,
-            "swa_n": swa_n if use_swa else 0,
-            "status": status,
-        }, ckpt_path)
+        known = out_dir / "known_good.pt"
+        eval_path = out_dir / "eval_swa.pt"
+        save_training_checkpoint(
+            path=ckpt_path,
+            model=model,
+            optimizer=optimizer,
+            step=step,
+            positions=positions,
+            model_cfg=asdict(model_cfg),
+            train_cfg=train,
+            trial_id=trial["id"],
+            arch=arch,
+            n_params=n_params,
+            sampler_rng=rng,
+            manifest=val_manifests,
+            swa_state=swa_state,
+            swa_n=swa_n,
+            resume_kind="full",
+            status=status,
+            extra={"pos_s": pos_s},
+            eval_path=eval_path if swa_n > 0 else None,
+            known_good_path=known if also_step or status in ("trained", "interrupted") else None,
+            include_cuda_rng=device.type == "cuda",
+        )
         with open(out_dir / "model_config.json", "w", encoding="utf-8") as f:
             json.dump(asdict(model_cfg), f, indent=2)
         if also_step and step > 0:
@@ -573,12 +613,14 @@ def train_trial(
                     old.unlink()
                 except OSError:
                     pass
-            _log(log_path, f"ckpt {step_path.name} + latest.pt steps={step} status={status}")
+            _log(log_path, f"ckpt {step_path.name} + latest.pt (live) steps={step} status={status} kind=full")
         elif status in ("trained", "interrupted"):
             _log(log_path, f"timing wall={wall:.0f}s active={elapsed:.0f}s steps={step} status={status}")
-            _log(log_path, f"done steps={step} pos_s={pos_s:.1f} params={n_params/1e6:.2f}M status={status}")
+            _log(log_path, f"done steps={step} pos_s={pos_s:.1f} params={n_params/1e6:.2f}M status={status} kind=full")
         else:
-            _log(log_path, f"ckpt latest.pt steps={step} status={status}")
+            _log(log_path, f"ckpt latest.pt (live weights) steps={step} status={status}")
+            if swa_n > 0:
+                _log(log_path, f"eval_swa.pt n={swa_n}")
         return {
             "status": status,
             "ckpt_path": str(ckpt_path),
@@ -588,6 +630,7 @@ def train_trial(
             "steps": step,
             "n_params": n_params,
             "elapsed_s": elapsed,
+            "resume_kind": "full",
         }
 
     try:
@@ -611,8 +654,13 @@ def train_trial(
                         and torch.rand(1, generator=rng).item() < deep_mix
                     )
                     src = deep_data if use_deep else soft_data
-                    n_src = train_deep_n if use_deep else train_soft_n
-                    idx = torch.randint(0, n_src, (bs,), generator=rng)
+                    pool = train_deep_idx if use_deep else train_soft_idx
+                    local = torch.randint(0, int(pool.numel()), (bs,), generator=rng)
+                    idx = pool[local]
+                    if use_deep:
+                        deep_seen += bs
+                    else:
+                        shallow_seen += bs
                     bi, hard, wdl, si, sp = prepare_soft_batch(
                         src, idx, device, hflip_p=hflip_p, rng=rng,
                     )
@@ -674,13 +722,18 @@ def train_trial(
                         ) / accum
                     loss.backward()
                 positions += bs
-                window_loss += float(loss.detach().float()) * accum
+                det = loss.detach()
+                window_loss_t = det if window_loss_t is None else window_loss_t + det
                 window_n += 1
 
             if average_recurrent_grads is not None:
                 raw = model._orig_mod if hasattr(model, "_orig_mod") else model
                 average_recurrent_grads(raw)
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            total_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            try:
+                clip_hits += int(float(total_norm) > grad_clip)
+            except TypeError:
+                clip_hits += 0
             set_lrs(step + 1)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -698,20 +751,40 @@ def train_trial(
                 peak_vram = max(peak_vram, torch.cuda.max_memory_allocated() / 1e9)
             if step % 25 == 0 or step == 1:
                 elapsed = max(time.time() - t0, 1e-6)
-                avg_loss = window_loss / max(window_n, 1)
+                avg_loss = float((window_loss_t or torch.zeros(1)).float().item()) * accum / max(window_n, 1)
                 finite = math.isfinite(avg_loss)
+                lrs = [f"{pg['lr']:.2e}" for pg in optimizer.param_groups]
                 _log(
                     log_path,
                     f"step {step}/{max_steps} | loss={avg_loss:.4f} | "
-                    f"{positions/elapsed:.0f} pos/s | vram={peak_vram:.2f}GB"
+                    f"lr={','.join(lrs)} | clip={clip_hits}/25 | "
+                    f"mix s/d={shallow_seen}/{deep_seen} | "
+                    f"{positions/max(elapsed, 1e-6):.0f} pos/s | vram={peak_vram:.2f}GB"
                     + ("" if finite else " NON-FINITE"),
                 )
-                window_loss = 0.0
+                window_loss_t = None
                 window_n = 0
+                clip_hits = 0
                 if not finite:
                     interrupted = True
                     _log(log_path, f"stopping: non-finite loss at step {step}")
                     break
+            if val_every > 0 and step % val_every == 0 and not smoke:
+                raw_m = model._orig_mod if hasattr(model, "_orig_mod") else model
+                if val_soft_idx is not None and val_soft_idx.numel():
+                    take = val_soft_idx[torch.arange(min(256, int(val_soft_idx.numel())))]
+                    metrics = cheap_eval_losses(raw_m, soft_data, take, device, soft_temp=soft_temp or 4.0)
+                    _log(log_path, "val/soft " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                if val_deep_idx is not None and val_deep_idx.numel() and deep_data is not None:
+                    take = val_deep_idx[torch.arange(min(256, int(val_deep_idx.numel())))]
+                    metrics = cheap_eval_losses(raw_m, deep_data, take, device, soft_temp=soft_temp or 4.0)
+                    _log(log_path, "val/deep " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                if legal_every > 0 and step % legal_every == 0 and val_soft_idx is not None:
+                    take = val_soft_idx[torch.arange(min(48, int(val_soft_idx.numel())))]
+                    diag = legal_policy_diagnostics(raw_m, soft_data, take, device)
+                    _log(log_path, "val/legal " + " ".join(f"{k}={v:.4f}" for k, v in diag.items()))
+                model.train()
+                last_tick = time.time()
             if save_every > 0 and step % save_every == 0:
                 _save_ckpt(
                     "mid",

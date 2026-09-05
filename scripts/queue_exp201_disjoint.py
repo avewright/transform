@@ -89,12 +89,51 @@ def build_one(soft_n: int) -> Path:
     return out
 
 
-def consume() -> dict:
+def trainer_is_live() -> bool:
+    try:
+        import subprocess
+        out = subprocess.check_output(["pgrep", "-f", "experiments/exp201_recurrent_64.py"], text=True)
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def register_ready(manifest_path: Path | None = None) -> dict:
+    """Record READY shards without rewriting the live monolithic cache."""
+    shards = list_ready()
     live_path = LIVE / "soft_cache.pt"
-    shards = sorted(p.parent for p in QUEUE.glob("shard_*/READY"))
+    man = {
+        "live": str(live_path),
+        "ready_shards": [str(s) for s in shards],
+        "soft_n_live": _soft_n_cached(),
+        "note": (
+            "Replacing soft_cache.pt does not update tensors already loaded by "
+            "a running trainer. Integrate shards at an explicit restart boundary."
+        ),
+    }
+    dest = manifest_path or (LIVE / "shard_manifest.json")
+    dest.write_text(json.dumps(man, indent=2), encoding="utf-8")
+    log(f"register: {len(shards)} READY shards -> {dest}")
+    return man
+
+
+def list_ready() -> list[Path]:
+    return sorted(p.parent for p in QUEUE.glob("shard_*/READY") if p.is_file())
+
+
+def consume(*, concat_live: bool = False) -> dict:
+    live_path = LIVE / "soft_cache.pt"
+    shards = list_ready()
     if not shards:
         log("consume: no READY shards")
-        return {"merged": 0, "soft_n": _soft_n(live_path)}
+        return {"merged": 0, "soft_n": _soft_n_cached()}
+    if trainer_is_live() and concat_live:
+        raise SystemExit(
+            "refuse --concat-live: exp201 trainer is running and would not see "
+            "a rewritten cache. Stop the trainer, then consume at a restart boundary."
+        )
+    if not concat_live:
+        return register_ready()
     live = torch.load(live_path, map_location="cpu", weights_only=False)
     chunks = [live]
     used = []
@@ -127,6 +166,16 @@ def consume() -> dict:
     return {"merged": len(used), "soft_n": n, "shards": [p.name for p in used]}
 
 
+def _soft_n_cached() -> int:
+    report = LIVE / "mix_report.json"
+    if report.exists():
+        try:
+            return int(json.loads(report.read_text()).get("soft_n") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return 0
+
+
 def _soft_n(path: Path) -> int:
     if not path.exists():
         return 0
@@ -151,13 +200,18 @@ def build_loop(max_ready: int, soft_n: int, stop_file: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", action="store_true")
-    ap.add_argument("--consume", action="store_true")
+    ap.add_argument("--consume", action="store_true", help="Register READY shards (default) or concat with --concat-live")
+    ap.add_argument("--concat-live", action="store_true", help="Rewrite monolithic soft_cache.pt (refuses if trainer is live)")
+    ap.add_argument("--register", action="store_true", help="Write shard_manifest.json only")
     ap.add_argument("--max-ready", type=int, default=6, help="Unused shards to keep queued")
     ap.add_argument("--soft-n", type=int, default=SOFT_N)
     ap.add_argument("--stop-file", default=str(QUEUE / "STOP_QUEUE"))
     args = ap.parse_args()
+    if args.register:
+        print(json.dumps(register_ready()), flush=True)
+        return
     if args.consume:
-        print(json.dumps(consume()), flush=True)
+        print(json.dumps(consume(concat_live=args.concat_live)), flush=True)
         return
     if args.build:
         build_loop(args.max_ready, args.soft_n, Path(args.stop_file))

@@ -247,7 +247,11 @@ def main() -> None:
     ap.add_argument("--soft-n", type=int, default=1_500_000)
     ap.add_argument("--syzygy-n", type=int, default=400_000)
     ap.add_argument("--skip-mix", action="store_true")
-    ap.add_argument("--resume", default=None, help="Warm-start from a checkpoint (continues step count)")
+    ap.add_argument(
+        "--resume",
+        default=None,
+        help="Resume training. Full resume if optimizer/RNG present; otherwise a labeled weights-only warm start.",
+    )
     ap.add_argument(
         "--continue-min-lr",
         action="store_true",
