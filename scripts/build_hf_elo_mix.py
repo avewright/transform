@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -73,6 +74,48 @@ def concat(chunks: list[dict]) -> dict:
     return {k: torch.cat([c[k] for c in chunks], dim=0) for k in keys}
 
 
+def position_hashes(data: dict) -> np.ndarray:
+    """Stable uint64 id for board + turn + castling + ep (disjoint-position key)."""
+    ba = np.ascontiguousarray(data["board_array"].numpy(), dtype=np.int8)
+    n = int(ba.shape[0])
+    view = ba.view(np.uint8).reshape(n, -1)
+    h = np.zeros(n, dtype=np.uint64)
+    mul = np.uint64(1315423911)
+    for i in range(view.shape[1]):
+        h = h * mul + view[:, i].astype(np.uint64)
+    h ^= (data["turn"].numpy().astype(np.uint64) + np.uint64(1))
+    h ^= (data["castling"].numpy().astype(np.uint64) + np.uint64(1)) << np.uint64(8)
+    h ^= (data["ep_square"].numpy().astype(np.uint64) + np.uint64(1)) << np.uint64(16)
+    return h
+
+
+def load_hash_set(path: Path | None) -> set[int]:
+    if path is None or not path.exists():
+        return set()
+    arr = np.load(path, allow_pickle=False)
+    return {int(x) for x in np.asarray(arr, dtype=np.uint64).tolist()}
+
+
+def save_hashes(path: Path, hashes: set[int] | np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.fromiter(hashes, dtype=np.uint64) if isinstance(hashes, set) else np.asarray(hashes, dtype=np.uint64)
+    with path.open("wb") as f:
+        np.save(f, arr)
+
+
+def filter_excluded(data: dict, exclude: set[int]) -> dict:
+    if not exclude:
+        return data
+    hs = position_hashes(data)
+    keep = np.fromiter((int(h) not in exclude for h in hs), dtype=np.bool_, count=len(hs))
+    n_drop = int((~keep).sum())
+    if n_drop:
+        log(f"  excluded {n_drop:,} already-used positions")
+    if not keep.any():
+        return {k: v[:0] for k, v in data.items()}
+    return {k: v[keep] for k, v in data.items()}
+
+
 def phase_subsample(data: dict, n_target: int, rng: random.Random) -> dict:
     ph = data["phase"].numpy()
     want = {pid: int(round(n_target * frac)) for pid, frac in PHASE_FRAC.items()}
@@ -97,14 +140,19 @@ def phase_subsample(data: dict, n_target: int, rng: random.Random) -> dict:
     return {k: v[chosen].contiguous() for k, v in data.items()}
 
 
-def build_soft(n_target: int, seed: int, max_shards: int | None) -> dict:
+def build_soft(
+    n_target: int,
+    seed: int,
+    max_shards: int | None,
+    exclude: set[int] | None = None,
+) -> dict:
     files = [f for f in list_repo_files(SOFT_REPO, repo_type="dataset") if f.endswith(".parquet")]
     rng = random.Random(seed)
     rng.shuffle(files)
     if max_shards is not None:
         files = files[:max_shards]
-    # Oversample pool ~1.6x then phase-cap.
-    pool_target = int(n_target * 1.6)
+    # Oversample pool ~1.6x then phase-cap. Extra headroom if excluding a used set.
+    pool_target = int(n_target * (2.2 if exclude else 1.6))
     cols = list(CORE) + [c for c in META]
     chunks: list[dict] = []
     n = 0
@@ -117,16 +165,21 @@ def build_soft(n_target: int, seed: int, max_shards: int | None) -> dict:
         keep = np.nonzero(depth >= 12)[0]
         if len(keep) < chunk["board_array"].shape[0]:
             chunk = {k: v[keep] for k, v in chunk.items()}
+        chunk = filter_excluded(chunk, exclude or set())
+        if chunk["board_array"].shape[0] == 0:
+            log(f"  soft shard {i+1}/{len(files)} all excluded")
+            continue
         chunks.append(chunk)
         n += chunk["board_array"].shape[0]
         log(f"  soft shard {i+1}/{len(files)} +{chunk['board_array'].shape[0]:,} total={n:,}")
         if n >= pool_target:
             break
     if not chunks:
-        raise SystemExit("no soft shards loaded")
+        raise SystemExit("no soft shards loaded (all excluded?)")
     data = concat(chunks)
-    log(f"soft pool={data['board_array'].shape[0]:,} in {time.time()-t0:.1f}s → subsample {n_target:,}")
-    return phase_subsample(data, n_target, rng)
+    take = min(n_target, int(data["board_array"].shape[0]))
+    log(f"soft pool={data['board_array'].shape[0]:,} in {time.time()-t0:.1f}s → subsample {take:,}")
+    return phase_subsample(data, take, rng)
 
 
 def build_syzygy(max_rows: int | None = None) -> dict:
@@ -163,10 +216,21 @@ def main() -> None:
     ap.add_argument("--syzygy-n", type=int, default=400_000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-shards", type=int, default=None, help="Cap soft shards (debug)")
+    ap.add_argument("--soft-only", action="store_true", help="Skip syzygy / deep_cache")
+    ap.add_argument("--exclude-cache", action="append", default=[], help="Existing soft_cache.pt to treat as used")
+    ap.add_argument("--exclude-hashes", default="", help="used_hashes.pt to union into the exclude set")
+    ap.add_argument("--write-hashes", default="", help="Write updated used-position hashes here")
     args = ap.parse_args()
     if not args.go:
         print("Pass --go")
         return
+    env_path = ROOT / ".env"
+    if env_path.exists() and not os.environ.get("HF_TOKEN"):
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("HF_TOKEN=") or line.startswith("HUGGING_FACE_HUB_TOKEN="):
+                os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("'").strip('"')
+                break
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -174,23 +238,43 @@ def main() -> None:
     syz_n = 5_000 if args.smoke else args.syzygy_n
     max_shards = 1 if args.smoke else args.max_shards
 
-    log(f"building soft n={soft_n:,} from {SOFT_REPO}")
-    soft = build_soft(soft_n, args.seed, max_shards)
+    exclude: set[int] = set()
+    if args.exclude_hashes:
+        exclude |= load_hash_set(Path(args.exclude_hashes))
+    for p in args.exclude_cache:
+        cache = torch.load(p, map_location="cpu", weights_only=False)
+        exclude |= {int(x) for x in position_hashes(cache).tolist()}
+        log(f"exclude from {p}: running exclude={len(exclude):,}")
+
+    log(f"building soft n={soft_n:,} from {SOFT_REPO} exclude={len(exclude):,}")
+    soft = build_soft(soft_n, args.seed, max_shards, exclude=exclude)
+    new_h = position_hashes(soft)
+    overlap = sum(1 for x in new_h.tolist() if int(x) in exclude)
+    if overlap:
+        raise SystemExit(f"disjoint check failed: {overlap} hashes already used")
     soft_path = out / "soft_cache.pt"
     torch.save(soft, soft_path)
     log(f"wrote {soft_path} n={soft['board_array'].shape[0]:,}")
 
-    log(f"building syzygy deep n≤{syz_n:,} from {SYZYGY_REPO}")
-    deep = build_syzygy(syz_n)
-    deep_path = out / "deep_cache.pt"
-    torch.save(deep, deep_path)
-    log(f"wrote {deep_path} n={deep['board_array'].shape[0]:,}")
+    deep_n = 0
+    if not args.soft_only:
+        log(f"building syzygy deep n≤{syz_n:,} from {SYZYGY_REPO}")
+        deep = build_syzygy(syz_n)
+        deep_path = out / "deep_cache.pt"
+        torch.save(deep, deep_path)
+        deep_n = int(deep["board_array"].shape[0])
+        log(f"wrote {deep_path} n={deep_n:,}")
+
+    if args.write_hashes:
+        union = exclude | {int(x) for x in new_h.tolist()}
+        save_hashes(Path(args.write_hashes), union)
+        log(f"wrote hashes {args.write_hashes} n={len(union):,}")
 
     report = {
         "soft_repo": SOFT_REPO,
         "syzygy_repo": SYZYGY_REPO,
         "soft_n": int(soft["board_array"].shape[0]),
-        "deep_n": int(deep["board_array"].shape[0]),
+        "deep_n": deep_n,
         "soft_depth": {
             "min": int(soft["label_depth"].min()),
             "p50": int(soft["label_depth"].median()),
@@ -201,6 +285,8 @@ def main() -> None:
         },
         "seed": args.seed,
         "smoke": args.smoke,
+        "soft_only": bool(args.soft_only),
+        "excluded_prior": len(exclude),
     }
     (out / "mix_report.json").write_text(json.dumps(report, indent=2))
     log(f"report {report}")

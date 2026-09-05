@@ -5,6 +5,7 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 ADAM_NAME_HINTS = (
     "embed", "policy_head", "value_head", "cls_token", "cls_pos",
-    "pos_embed", "norm", "bn", "shaw_", "rel_bias",
+    "pos_embed", "norm", "bn", "shaw_", "rel_bias", "film",
 )
 
 
@@ -106,7 +107,7 @@ def build_normuon_optimizer(model, muon_lr, adam_lr, weight_decay):
     return opt, muon_n, adam_n
 
 
-def build_polar_normuon_optimizer(model, muon_lr, adam_lr, weight_decay):
+def build_polar_normuon_optimizer(model, muon_lr, adam_lr, weight_decay, compile_polar=True):
     from polar_normuon import SingleDeviceNorMuonPolarWithAuxAdam
 
     muon_params, adam_params, muon_n, adam_n = _split_muon_adam_params(model)
@@ -118,7 +119,7 @@ def build_polar_normuon_optimizer(model, muon_lr, adam_lr, weight_decay):
                  weight_decay=weight_decay),
         ],
         cautious_wd=True,
-        compile_polar=False,  # safer on Windows / 8GB
+        compile_polar=compile_polar,
     )
     return opt, muon_n, adam_n
 
@@ -218,6 +219,7 @@ def train_trial(
     max_minutes: float = 45.0,
     smoke: bool = False,
     device: torch.device | None = None,
+    resume_ckpt: Path | None = None,
 ) -> dict[str, Any]:
     """Train one trial. Returns metrics dict including ckpt_path / pos_s / status."""
     os.environ.setdefault("MOVE_VOCAB_VERSION", "compact")
@@ -225,7 +227,6 @@ def train_trial(
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-    from chess_transformer_factory import ChessTransformerConfig, build_model, count_parameters
     from data_loader import stream_hf_batches
     from move_vocab import VOCAB_SIZE
 
@@ -239,6 +240,23 @@ def train_trial(
     model_kw = dict(trial["model"])
     if "grad_checkpoint" in train:
         model_kw["gradient_checkpointing"] = bool(train["grad_checkpoint"])
+
+    arch = str(trial.get("arch") or train.get("arch") or "factory")
+    average_recurrent_grads = None
+    if arch == "squares64":
+        from chess_squares64 import (
+            Squares64RecurrentConfig,
+            average_recurrent_grads as _avg_rec_grads,
+            build_squares64,
+            count_parameters,
+        )
+        average_recurrent_grads = _avg_rec_grads
+        cfg_cls = Squares64RecurrentConfig
+        model_builder = build_squares64
+    else:
+        from chess_transformer_factory import ChessTransformerConfig, build_model, count_parameters
+        cfg_cls = ChessTransformerConfig
+        model_builder = build_model
 
     if smoke:
         max_steps = min(max_steps, 15)
@@ -261,29 +279,30 @@ def train_trial(
         if train.get("torch_compile"):
             train["torch_compile"] = False
 
-    model_cfg = ChessTransformerConfig(**{
+    model_cfg = cfg_cls(**{
         k: v for k, v in model_kw.items()
-        if k in ChessTransformerConfig.__dataclass_fields__
+        if k in cfg_cls.__dataclass_fields__
     })
     with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump({"model": asdict(model_cfg), "train": train, "trial": trial}, f, indent=2)
+        json.dump({"arch": arch, "model": asdict(model_cfg), "train": train, "trial": trial}, f, indent=2)
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    _log(log_path, f"trial={trial['id']} device={device} vocab={VOCAB_SIZE}")
+    _log(log_path, f"trial={trial['id']} arch={arch} device={device} vocab={VOCAB_SIZE}")
     _log(
         log_path,
         f"train bs={train.get('batch_size')} accum={train.get('accum_steps')} "
         f"grad_ckpt={model_kw.get('gradient_checkpointing')} "
-        f"compile={train.get('torch_compile')} elo_every={train.get('elo_every_steps', 0)}",
+        f"compile={train.get('torch_compile')} elo_every={train.get('elo_every_steps', 0)} "
+        f"save_every={train.get('save_every_steps', 0)}",
     )
     _log(log_path, f"model={model_cfg}")
 
     try:
-        model = build_model(model_cfg).to(device)
+        model = model_builder(model_cfg).to(device)
     except Exception as e:
         if _is_oom(e):
             return {"status": "oom", "error": str(e), "pos_s": 0.0, "ckpt_path": None}
@@ -291,6 +310,18 @@ def train_trial(
 
     n_params = count_parameters(model)
     _log(log_path, f"params={n_params/1e6:.2f}M")
+
+    start_step = 0
+    if resume_ckpt is not None:
+        resume_ckpt = Path(resume_ckpt)
+        if not resume_ckpt.exists():
+            raise FileNotFoundError(f"resume ckpt missing: {resume_ckpt}")
+        ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+        start_step = int(ckpt.get("steps", 0))
+        _log(log_path, f"resume {resume_ckpt} steps={start_step}")
 
     opt_name = train.get("optimizer", "normuon")
     try:
@@ -302,13 +333,19 @@ def train_trial(
             )
             _log(log_path, "optimizer=AdamW")
         elif opt_name == "polar_normuon":
+            compile_polar = bool(train.get("compile_polar", device.type == "cuda"))
             optimizer, muon_n, adam_n = build_polar_normuon_optimizer(
                 model,
                 float(train.get("muon_lr", 0.02)),
                 float(train.get("adam_lr", 3e-4)),
                 float(train.get("weight_decay", 0.01)),
+                compile_polar=compile_polar,
             )
-            _log(log_path, f"optimizer=PolarNorMuon ({muon_n/1e6:.1f}M) + AdamW aux ({adam_n/1e6:.1f}M)")
+            _log(
+                log_path,
+                f"optimizer=PolarNorMuon ({muon_n/1e6:.1f}M) + AdamW aux ({adam_n/1e6:.1f}M) "
+                f"compile_polar={compile_polar}",
+            )
         else:
             optimizer, muon_n, adam_n = build_normuon_optimizer(
                 model,
@@ -372,10 +409,15 @@ def train_trial(
     min_lr_frac = float(train.get("min_lr_frac", 0.05))
     bs = int(train["batch_size"])
     accum = int(train.get("accum_steps", 1))
-    # Fit largest batch that works without grad-checkpoint on 8GB.
+    # Fit batch to VRAM. Shrinks on OOM / over-cap; grows when fill_vram is set.
     # Also detects torch.compile/inductor failures (common on Windows without MSVC).
     if device.type == "cuda" and not smoke:
-        while bs >= 32:
+        min_bs = int(train.get("min_batch_size", 32))
+        max_bs = int(train.get("max_batch_size", 2048))
+        vram_cap = float(train.get("max_vram_gb", 6.8))
+        fill_vram = bool(train.get("fill_vram", False))
+        grew = False
+        while bs >= min_bs:
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
@@ -392,9 +434,8 @@ def train_trial(
                 loss.backward()
                 optimizer.zero_grad(set_to_none=True)
                 peak = torch.cuda.max_memory_allocated() / 1e9
-                vram_cap = float(train.get("max_vram_gb", 6.8))
                 if peak > vram_cap:
-                    new_bs = max(32, (bs * 3) // 4)
+                    new_bs = max(min_bs, (bs * 3) // 4)
                     _log(
                         log_path,
                         f"batch probe high vram bs={bs} peak={peak:.2f}GB > {vram_cap}; retry bs={new_bs}",
@@ -403,18 +444,37 @@ def train_trial(
                     if new_bs >= bs:
                         break
                     bs = new_bs
+                    if grew:
+                        _log(log_path, f"batch probe settle bs={bs} after fill overshoot")
+                        break
                     continue
+                if fill_vram and peak < vram_cap * 0.78 and bs < max_bs:
+                    scale = (vram_cap * 0.90) / max(peak, 0.1)
+                    new_bs = min(max_bs, max(bs + 16, int(bs * scale)))
+                    new_bs = max(min_bs, (new_bs // 8) * 8)
+                    if new_bs > bs:
+                        _log(
+                            log_path,
+                            f"batch probe fill_vram bs={bs} peak={peak:.2f}GB < {vram_cap}; grow bs={new_bs}",
+                        )
+                        torch.cuda.empty_cache()
+                        bs = new_bs
+                        grew = True
+                        continue
                 _log(log_path, f"batch probe ok bs={bs} peak_vram={peak:.2f}GB compile={compiled}")
                 break
             except torch.cuda.OutOfMemoryError:
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
-                new_bs = max(32, (bs * 3) // 4)
+                new_bs = max(min_bs, (bs * 3) // 4)
                 _log(log_path, f"batch probe OOM at bs={bs}; retry bs={new_bs}")
                 if new_bs >= bs:
-                    bs = 32
+                    bs = min_bs
                     break
                 bs = new_bs
+                if grew:
+                    _log(log_path, f"batch probe settle bs={bs} after fill OOM")
+                    break
             except Exception as e:
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
@@ -439,6 +499,9 @@ def train_trial(
     swa_start_frac = float(train.get("swa_start_frac", 0.75))
     label_smoothing = float(train.get("label_smoothing", 0.0))
     elo_every = int(train.get("elo_every_steps", 0) or 0)
+    save_every = int(train.get("save_every_steps", 0) or 0)
+    keep_step_every = int(train.get("keep_step_every", 0) or 0)
+    keep_last = int(train.get("keep_last_ckpts", 4))
     elo_history_path = out_dir / "elo_gauntlet.jsonl"
 
     def set_lrs(step: int) -> None:
@@ -460,9 +523,11 @@ def train_trial(
     active_budget_s = max_minutes * 60.0
     active_elapsed = 0.0
     last_tick = t0
-    step = 0
+    step = start_step
     positions = 0
     peak_vram = 0.0
+    window_loss = 0.0
+    window_n = 0
     swa_state: dict[str, torch.Tensor] | None = None
     swa_n = 0
     swa_start_step = int(max_steps * swa_start_frac) if use_swa else max_steps + 1
@@ -474,11 +539,10 @@ def train_trial(
     stop_path = out_dir / "STOP"
     interrupted = False
 
-    def _save_ckpt(status: str) -> dict[str, Any]:
+    def _save_ckpt(status: str, *, also_step: bool = False) -> dict[str, Any]:
         wall = max(time.time() - t0, 1e-6)
         elapsed = max(active_elapsed, 1e-6)
         pos_s = positions / elapsed
-        _log(log_path, f"timing wall={wall:.0f}s active={elapsed:.0f}s steps={step} status={status}")
         ckpt_path = out_dir / "latest.pt"
         to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
         state = to_save.state_dict()
@@ -488,6 +552,7 @@ def train_trial(
         torch.save({
             "model_state_dict": state,
             "config": asdict(model_cfg),
+            "arch": arch,
             "vocab": "compact",
             "vocab_version": "compact",
             "trial_id": trial["id"],
@@ -499,7 +564,21 @@ def train_trial(
         }, ckpt_path)
         with open(out_dir / "model_config.json", "w", encoding="utf-8") as f:
             json.dump(asdict(model_cfg), f, indent=2)
-        _log(log_path, f"done steps={step} pos_s={pos_s:.1f} params={n_params/1e6:.2f}M status={status}")
+        if also_step and step > 0:
+            step_path = out_dir / f"step_{step:06d}.pt"
+            shutil.copy2(ckpt_path, step_path)
+            kept = sorted(out_dir.glob("step_*.pt"))
+            for old in kept[:-max(keep_last, 1)]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            _log(log_path, f"ckpt {step_path.name} + latest.pt steps={step} status={status}")
+        elif status in ("trained", "interrupted"):
+            _log(log_path, f"timing wall={wall:.0f}s active={elapsed:.0f}s steps={step} status={status}")
+            _log(log_path, f"done steps={step} pos_s={pos_s:.1f} params={n_params/1e6:.2f}M status={status}")
+        else:
+            _log(log_path, f"ckpt latest.pt steps={step} status={status}")
         return {
             "status": status,
             "ckpt_path": str(ckpt_path),
@@ -595,7 +674,12 @@ def train_trial(
                         ) / accum
                     loss.backward()
                 positions += bs
+                window_loss += float(loss.detach().float()) * accum
+                window_n += 1
 
+            if average_recurrent_grads is not None:
+                raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+                average_recurrent_grads(raw)
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             set_lrs(step + 1)
             optimizer.step()
@@ -614,7 +698,25 @@ def train_trial(
                 peak_vram = max(peak_vram, torch.cuda.max_memory_allocated() / 1e9)
             if step % 25 == 0 or step == 1:
                 elapsed = max(time.time() - t0, 1e-6)
-                _log(log_path, f"step {step}/{max_steps} | {positions/elapsed:.0f} pos/s | vram={peak_vram:.2f}GB")
+                avg_loss = window_loss / max(window_n, 1)
+                finite = math.isfinite(avg_loss)
+                _log(
+                    log_path,
+                    f"step {step}/{max_steps} | loss={avg_loss:.4f} | "
+                    f"{positions/elapsed:.0f} pos/s | vram={peak_vram:.2f}GB"
+                    + ("" if finite else " NON-FINITE"),
+                )
+                window_loss = 0.0
+                window_n = 0
+                if not finite:
+                    interrupted = True
+                    _log(log_path, f"stopping: non-finite loss at step {step}")
+                    break
+            if save_every > 0 and step % save_every == 0:
+                _save_ckpt(
+                    "mid",
+                    also_step=keep_step_every > 0 and step % keep_step_every == 0,
+                )
             if elo_every > 0 and step % elo_every == 0:
                 mid = _save_ckpt("mid_elo")
                 _log(log_path, f"elo gauntlet at step {step} -> {mid['ckpt_path']}")

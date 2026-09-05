@@ -44,24 +44,45 @@ def _pick_device(explicit: torch.device | str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def _is_squares64(ckpt: dict, config_data) -> bool:
+    if ckpt.get("arch") == "squares64":
+        return True
+    if isinstance(config_data, dict) and "recurrent_layers" in config_data:
+        return True
+    return False
+
+
 def load_checkpoint(
     path: str | Path | None = None,
     device: torch.device | str | None = None,
-) -> ChessTransformer:
-    """Load a trained ChessTransformer for inference."""
+):
+    """Load a trained ChessTransformer or squares64 recurrent checkpoint."""
     ckpt_path = resolve_checkpoint(path)
     dev = _pick_device(device)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     config_data = ckpt.get("config")
-    if config_data is None:
-        config = DEFAULT_8GB_CONFIG
-    elif isinstance(config_data, ChessTransformerConfig):
-        config = config_data
-    else:
-        config = ChessTransformerConfig(**config_data)
+    if _is_squares64(ckpt, config_data):
+        from chess_squares64 import Squares64RecurrentConfig, build_squares64
 
-    model = build_model(config)
+        if config_data is None:
+            config = Squares64RecurrentConfig()
+        elif isinstance(config_data, Squares64RecurrentConfig):
+            config = config_data
+        else:
+            known = {f.name for f in Squares64RecurrentConfig.__dataclass_fields__.values()}
+            config = Squares64RecurrentConfig(
+                **{k: v for k, v in config_data.items() if k in known}
+            )
+        model = build_squares64(config)
+    else:
+        if config_data is None:
+            config = DEFAULT_8GB_CONFIG
+        elif isinstance(config_data, ChessTransformerConfig):
+            config = config_data
+        else:
+            config = ChessTransformerConfig(**config_data)
+        model = build_model(config)
     state = ckpt.get("model_state_dict", ckpt)
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
     model.load_state_dict(state, strict=True)
