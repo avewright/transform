@@ -307,15 +307,39 @@ def make_val_membership(
     seed: int = 201,
     source: str = "unknown",
 ) -> dict[str, Any]:
-    """Deterministic hash holdout that survives shard merge / reshuffle.
+    """Holdout membership.
 
-    Game-level IDs are not in the current caches. Membership is by canonical
-    position hash (board+turn+castling+ep). Horizontal-flip equivalents of
-    held-out positions are also excluded from training.
-
-    Leakage limit: other positions from the same game may still appear in
-    train if they were sampled independently.
+    If ``split`` is present with both train (0) and eval (!=0) rows, that
+    saved assignment is used. Do not invent a new position-level split.
+    Otherwise fall back to a deterministic position-hash holdout.
     """
+    if "split" in data:
+        split = data["split"]
+        split_np = split.detach().cpu().view(-1).numpy() if torch.is_tensor(split) else np.asarray(split).reshape(-1)
+        n_val = int((split_np != 0).sum())
+        n_train = int((split_np == 0).sum())
+        if n_val > 0 and n_train > 0:
+            hs = position_hashes(data)
+            val_h = np.unique(hs[split_np != 0].astype(np.uint64))
+            blocked = np.array(val_h, copy=True)
+            cast = data["castling"].cpu().numpy()
+            flip_src = np.flatnonzero((split_np != 0) & (cast == 0))
+            if flip_src.size:
+                extra = position_hashes(
+                    hflip_cache_slice(data, torch.from_numpy(flip_src.astype(np.int64)))
+                ).astype(np.uint64)
+                blocked = np.unique(np.concatenate([blocked, extra]))
+            return {
+                "method": "saved_split_v1",
+                "source": source,
+                "seed": seed,
+                "n_rows": int(hs.shape[0]),
+                "n_hold": int(val_h.size),
+                "n_blocked": int(blocked.size),
+                "hashes": [int(x) for x in val_h.tolist()],
+                "blocked_hashes": [int(x) for x in blocked.tolist()],
+                "leakage": "Saved split field. Eval rows (split!=0) and their flip-equivalents are blocked from training.",
+            }
     hs = position_hashes(data)
     n = int(hs.shape[0])
     n_hold = int(max(0, min(n_hold, n)))
@@ -351,6 +375,20 @@ def make_val_membership(
 
 def apply_membership(data: dict, manifest: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (train_index, val_index) into data."""
+    if manifest.get("method") == "saved_split_v1" and "split" in data:
+        split = data["split"]
+        split_np = split.detach().cpu().view(-1).numpy() if torch.is_tensor(split) else np.asarray(split).reshape(-1)
+        is_val = split_np != 0
+        hs = position_hashes(data)
+        blocked = np.asarray(manifest.get("blocked_hashes") or [], dtype=np.uint64)
+        is_blocked = is_val.copy()
+        if blocked.size:
+            is_blocked |= np.isin(hs, blocked)
+        train_idx = torch.from_numpy(np.flatnonzero(~is_blocked).astype(np.int64))
+        val_idx = torch.from_numpy(np.flatnonzero(is_val).astype(np.int64))
+        if train_idx.numel() == 0:
+            train_idx = torch.from_numpy(np.flatnonzero(split_np == 0).astype(np.int64))
+        return train_idx, val_idx
     hs = position_hashes(data)
     val_h = np.asarray(manifest["hashes"], dtype=np.uint64)
     blocked = np.asarray(manifest.get("blocked_hashes") or manifest["hashes"], dtype=np.uint64)
@@ -544,26 +582,40 @@ def cheap_eval_losses(
     device: torch.device,
     *,
     soft_temp: float = 4.0,
+    microbatch: int = 64,
 ) -> dict[str, float]:
     if indices.numel() == 0:
         return {}
-    bi, hard, wdl, si, sp = prepare_soft_batch(data, indices, device, hflip_p=0.0)
     model.eval()
-    out = model(bi)
-    hard_ce = F.cross_entropy(out["policy_logits"].float(), hard)
-    soft_ce = soft_policy_loss(out["policy_logits"], si, sp)
-    temp_ce = soft_temp_policy_loss(out["policy_logits"], si, sp, temperature=soft_temp)
-    v_loss = F.cross_entropy(out["value_logits"].float(), wdl)
-    ent = teacher_entropy(si, sp)
-    kl = teacher_kl(out["policy_logits"], si, sp)
-    return {
-        "hard_ce": float(hard_ce.item()),
-        "soft_ce": float(soft_ce.item()),
-        "soft_temp_ce": float(temp_ce.item()),
-        "wdl_ce": float(v_loss.item()),
-        "teacher_entropy": float(ent.item()),
-        "teacher_kl": float(kl.item()),
+    idx = indices.detach().cpu().view(-1)
+    mb = max(int(microbatch), 1)
+    acc = {
+        "hard_ce": 0.0,
+        "soft_ce": 0.0,
+        "soft_temp_ce": 0.0,
+        "wdl_ce": 0.0,
+        "teacher_entropy": 0.0,
+        "teacher_kl": 0.0,
     }
+    n = 0
+    for start in range(0, int(idx.numel()), mb):
+        take = idx[start:start + mb]
+        bi, hard, wdl, si, sp = prepare_soft_batch(data, take, device, hflip_p=0.0)
+        out = model(bi)
+        w = float(take.numel())
+        acc["hard_ce"] += w * float(F.cross_entropy(out["policy_logits"].float(), hard).item())
+        acc["soft_ce"] += w * float(soft_policy_loss(out["policy_logits"], si, sp).item())
+        acc["soft_temp_ce"] += w * float(
+            soft_temp_policy_loss(out["policy_logits"], si, sp, temperature=soft_temp).item()
+        )
+        acc["wdl_ce"] += w * float(F.cross_entropy(out["value_logits"].float(), wdl).item())
+        acc["teacher_entropy"] += w * float(teacher_entropy(si, sp).item())
+        acc["teacher_kl"] += w * float(teacher_kl(out["policy_logits"], si, sp).item())
+        n += w
+        del bi, hard, wdl, si, sp, out
+    if n <= 0:
+        return {}
+    return {k: v / n for k, v in acc.items()}
 
 
 @torch.no_grad()

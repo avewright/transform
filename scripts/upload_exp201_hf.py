@@ -76,7 +76,8 @@ def write_card(repo: str, steps: int, extra: dict) -> Path:
         "Greedy policy, no book, no Syzygy. Treat as Stockfish `UCI_Elo` "
         "(not FIDE / Lichess). Older ~30k-step probe was ~1500–1650."
     )
-    card = OUT / "HF_README.md"
+    checkpoint_md = extra.get("checkpoint_md") or ""
+    card = Path(extra.get("card_path") or (OUT / "HF_README.md"))
     card.write_text(
         f"""---
 license: mit
@@ -95,7 +96,9 @@ library_name: pytorch
 64 board squares. Turn, castling, and en passant are FiLM on the square stream,
 not extra tokens.
 
-This file is **`latest.pt` at step {steps}** ({stamp}). Recent train loss ~{loss}.
+This file is **`latest.pt` at FT step {steps}** ({stamp}). Recent train loss ~{loss}.
+
+{checkpoint_md}
 
 ## Architecture
 
@@ -121,32 +124,16 @@ Soft labels from public Hugging Face packs (depth ≥ 12, phase-balanced open/mi
 - [`avewright/chess-soft-multipv-lichess`](https://huggingface.co/datasets/avewright/chess-soft-multipv-lichess) — 8-wide MultiPV (~91M rows in the full pack)
 - [`avewright/chess-soft-syzygy`](https://huggingface.co/datasets/avewright/chess-soft-syzygy) — tablebase WDL/policy (~498k rows)
 
-**Mix at this checkpoint**
+**This checkpoint (disagreement FT)**
 
-- Soft cache: **10.5M** rows (**10.30M unique** boards). First 16.5k steps used a 1.5M slice; at step 16488 six disjoint 1.5M shards were merged in.
-- Deep cache: **400k** Syzygy rows, mixed into **40%** of batches.
-- Soft objective: α=0.55 toward the MultiPV distribution, T=4, temp aux weight 0.4.
-- Horizontal flip aug 50%. Min label depth 12.
-- Value: 3-way WDL, loss weight 0.15.
+- Warm start from the prior public `latest.pt` (pretrain step 60995).
+- Then **1131** Polar-NorMuon steps (30 min, Apple MPS) on
+  [`avewright/chess-soft-100m-disagreements`](https://huggingface.co/datasets/avewright/chess-soft-100m-disagreements)
+  (~1.75M rows: teacher MultiPV where the 100M greedy argmax disagreed).
+- Optimizer: Polar-NorMuon 97.7M + AdamW aux 1.3M. `muon_lr=0.002`, `adam_lr=3e-5`, warmup 100, cosine over 1200, batch 48.
+- Soft objective unchanged (α=0.55, T=4). No Syzygy mix in this FT. No book / no search at eval.
 
-The 91M MultiPV pack is not fully consumed. More disjoint shards are queued for later segments.
-
-## Training config
-
-Hardware: 1× RTX 2000 Ada 16GB. Batch **192** (fill-VRAM probe; 256 OOM), accum 1.
-
-| | steps 1–16488 | steps 16488+ (this ckpt) |
-|---|---|---|
-| Soft unique | 1.5M | 10.5M |
-| Optimizer | Polar NorMuon (97.7M) + AdamW aux (1.3M) | same, **floor LR** |
-| muon_lr / adam_lr | 0.02 / 3e-4 | 0.001 / 1.5e-5 |
-| warmup | 500 | 0 |
-| min_lr_frac | 0.05 cosine | 1.0 (held) |
-| Syzygy mix | 0.4 | 0.4 |
-| compile | `torch.compile` + `compile_polar` | same |
-| SWA | from 75% of the *segment* | next SWA at step 34866 |
-
-Other: weight decay 0.01, grad clip 1.0, no grad checkpoint. Checkpoints every 250 steps.
+Pretrain used the MultiPV + Syzygy packs above (see older commits for that recipe).
 
 ## Inference
 
@@ -200,6 +187,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--ckpt", default=str(OUT / "latest.pt"))
+    ap.add_argument("--model-config", default=None)
     ap.add_argument("--elo-json", default=None, help="Optional elo_eval_*.json to embed in the model card")
     ap.add_argument("--elo-md", default=None, help="Optional markdown snippet that replaces the Elo section")
     ap.add_argument("--private", action="store_true")
@@ -215,8 +203,13 @@ def main() -> None:
     if not ckpt.exists():
         raise SystemExit(f"missing ckpt {ckpt}")
     steps = ckpt_steps(ckpt)
-    cfg = OUT / "model_config.json"
-    log = OUT / "train.log"
+    ckpt_dir = ckpt.parent
+    cfg = Path(args.model_config) if args.model_config else (ckpt_dir / "model_config.json")
+    if not cfg.exists():
+        cfg = OUT / "model_config.json"
+    log = ckpt_dir / "train.log"
+    if not log.exists():
+        log = OUT / "train.log"
     if not cfg.exists():
         sys.path.insert(0, str(ROOT))
         from chess_squares64 import DEFAULT_100M_SQUARES64_CONFIG
@@ -226,6 +219,11 @@ def main() -> None:
             encoding="utf-8",
         )
     extra = {"steps": steps, "ckpt": ckpt.name, "arch": "squares64", "params_m": 98.97}
+    extra["card_path"] = str(ckpt_dir / "HF_README.md")
+    extra["checkpoint_md"] = (
+        "Continued FT of the public 100M squares64 weights on policy-disagreement "
+        "positions (teacher MultiPV, student greedy ≠ teacher best)."
+    )
     extra["config"] = json.loads(cfg.read_text(encoding="utf-8"))
     if log.exists():
         import re
@@ -246,7 +244,7 @@ def main() -> None:
         path_in_repo="latest.pt",
         repo_id=args.repo,
         repo_type="model",
-        commit_message=f"exp201 squares64 step {steps}",
+        commit_message=f"disagreement FT latest.pt (local step {steps})",
     )
     if cfg.exists():
         api.upload_file(
@@ -265,6 +263,13 @@ def main() -> None:
         api.upload_file(
             path_or_fileobj=str(log),
             path_in_repo="train.log",
+            repo_id=args.repo,
+            repo_type="model",
+        )
+    if args.elo_json and Path(args.elo_json).exists():
+        api.upload_file(
+            path_or_fileobj=str(Path(args.elo_json)),
+            path_in_repo="elo_eval.json",
             repo_id=args.repo,
             repo_type="model",
         )

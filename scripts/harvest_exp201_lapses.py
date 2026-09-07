@@ -6,6 +6,8 @@ CPU-only. Does not touch the training GPU.
 Each model ply: MultiPV teacher labels on the current board, then measure
 value lost if the greedy policy move is not the teacher best. Keep hard
 slips, conversion failures, and positions from lost games.
+Optional epsilon/top-k temperature sampling changes the played trajectory only;
+teacher comparisons still evaluate the greedy move. Holdout games stay greedy.
 
 Usage:
   CUDA_VISIBLE_DEVICES= MOVE_VOCAB_VERSION=compact python -u \\
@@ -74,6 +76,18 @@ OPENINGS = [
     ["d2d4", "d7d5", "c2c4", "c7c6"],
     ["e2e4", "e7e5", "b1c3"],
     ["e2e4", "g7g6"],
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"],
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4"],
+    ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"],
+    ["e2e4", "c7c5", "b1c3"],
+    ["d2d4", "g8f6", "c2c4", "c7c5"],
+    ["d2d4", "d7d5", "g1f3", "g8f6"],
+    ["e2e4", "d7d5"],
+    ["e2e4", "b7b6"],
+    ["c2c4", "g8f6"],
+    ["g1f3", "d7d5", "c2c4"],
+    ["d2d4", "e7e6"],
+    ["e2e4", "e7e5", "g1f3", "g8f6"],
 ]
 
 
@@ -87,12 +101,101 @@ def log(msg: str, path: Path | None = None) -> None:
 def resolve_sf() -> str:
     for p in (
         os.environ.get("STOCKFISH_PATH", ""),
+        str(Path.home() / ".local/bin/stockfish-19"),
         shutil.which("stockfish") or "",
+        str(Path.home() / ".local/bin/stockfish"),
+        "/opt/homebrew/bin/stockfish",
         "/usr/games/stockfish",
     ):
         if p and Path(p).exists():
             return str(p)
     raise FileNotFoundError("Stockfish not found")
+
+
+def sf_uci_name(sf_path: str) -> str:
+    eng = chess.engine.SimpleEngine.popen_uci(sf_path)
+    try:
+        return str(eng.id.get("name") or "")
+    finally:
+        eng.quit()
+
+
+def _iter_cache_pts(paths: list[str]) -> list[Path]:
+    out: list[Path] = []
+    for raw in paths:
+        p = Path(raw)
+        if p.is_file() and p.suffix == ".pt":
+            out.append(p)
+            continue
+        if p.is_dir():
+            out.extend(sorted(p.glob("soft_cache.pt")))
+            out.extend(sorted(p.glob("**/soft_cache.pt")))
+    # preserve order, drop dups
+    seen: set[Path] = set()
+    uniq = []
+    for p in out:
+        rp = p.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        uniq.append(p)
+    return uniq
+
+
+_ID_TO_SYMBOL = {
+    1: "P", 2: "N", 3: "B", 4: "R", 5: "Q", 6: "K",
+    7: "p", 8: "n", 9: "b", 10: "r", 11: "q", 12: "k",
+}
+_CASTLE_BITS = ((8, "K"), (4, "Q"), (2, "k"), (1, "q"))
+
+
+def board_array_to_fen(ba, turn, castling, ep_square) -> str:
+    """Inverse of data_loader._fast_parse_fen (a1 = index 0)."""
+    ranks = []
+    for rank in range(7, -1, -1):
+        empty = 0
+        cells = []
+        for file_idx in range(8):
+            pid = int(ba[rank * 8 + file_idx])
+            if pid <= 0:
+                empty += 1
+                continue
+            if empty:
+                cells.append(str(empty))
+                empty = 0
+            cells.append(_ID_TO_SYMBOL.get(pid, "1"))
+        if empty:
+            cells.append(str(empty))
+        ranks.append("".join(cells))
+    castle = "".join(ch for bit, ch in _CASTLE_BITS if int(castling) & bit) or "-"
+    ep = "-"
+    ep_i = int(ep_square)
+    if 0 <= ep_i <= 63:
+        ep = chess.square_name(ep_i)
+    stm = "b" if int(turn) else "w"
+    return f"{'/'.join(ranks)} {stm} {castle} {ep} 0 1"
+
+
+def sample_seed_fens(cache: Path, n: int, rng: random.Random) -> list[str]:
+    d = torch.load(cache, map_location="cpu", weights_only=False)
+    ba = d["board_array"].numpy()
+    turn = d["turn"].numpy()
+    castle = d["castling"].numpy()
+    ep = d["ep_square"].numpy()
+    phase = d["phase"].numpy() if "phase" in d else np.zeros(len(ba), dtype=np.int8)
+    buckets = {0: [], 1: [], 2: []}
+    for i, ph in enumerate(phase.tolist()):
+        buckets[int(ph) if int(ph) in buckets else 1].append(i)
+    want = {0: max(1, n // 5), 2: max(1, n // 3), 1: 0}
+    want[1] = max(0, n - want[0] - want[2])
+    picked: list[int] = []
+    for ph, k in want.items():
+        pool = buckets[ph] or list(range(len(ba)))
+        picked.extend(rng.choice(pool) for _ in range(k))
+    rng.shuffle(picked)
+    fens = [board_array_to_fen(ba[i], turn[i], castle[i], ep[i]) for i in picked[:n]]
+    del d
+    return fens
 
 
 def phase_id(board: chess.Board) -> int:
@@ -115,19 +218,42 @@ def score_cp_mate(score: chess.engine.PovScore, turn: chess.Color) -> tuple[int,
     return int(cp if cp is not None else 0), 0
 
 
+def select_policy_moves(logits, mask, *, epsilon=0.0, temperature=0.8, top_k=4, rng=None):
+    """Return greedy label move and exploratory trajectory move from one forward."""
+    if not 0 <= epsilon <= 1 or not math.isfinite(temperature) or temperature <= 0 or top_k < 1:
+        raise ValueError("epsilon must be in [0,1], temperature > 0, top_k >= 1")
+    logits = logits.masked_fill(~mask, float("-inf"))
+    greedy = int(logits.argmax().item())
+    if epsilon == 0:
+        return greedy, greedy
+    if rng is None:
+        raise ValueError("exploration requires an explicit seeded RNG")
+    if rng.random() >= epsilon:
+        return greedy, greedy
+    values, indices = logits.topk(min(top_k, int(mask.sum().item())))
+    probs = torch.softmax((values - values.max()) / temperature, dim=0)
+    played = rng.choices(indices.tolist(), weights=probs.tolist(), k=1)[0]
+    return greedy, int(played)
+
+
 @torch.no_grad()
-def model_move(model, board, device) -> chess.Move:
+def model_move(model, board, device, *, epsilon=0.0, temperature=0.8, top_k=4,
+               rng=None, return_pair=False):
     x = batch_boards_to_fused_token_ids([board], device)
     logits = model(x)["policy_logits"][0].float()
     mask = legal_move_mask(board).to(device)
-    logits = logits.masked_fill(~mask, float("-inf"))
-    mv = index_to_move(int(logits.argmax().item()))
+    greedy, played = select_policy_moves(
+        logits, mask, epsilon=epsilon, temperature=temperature, top_k=top_k, rng=rng,
+    )
+    mv = index_to_move(greedy)
     if mv not in board.legal_moves:
         mv = next(iter(board.legal_moves))
-    return mv
+    return (mv, index_to_move(played)) if return_pair else mv
 
 
-def analyze_multipv(engine, board, *, nodes: int, movetime: float, tau: float) -> dict | None:
+def analyze_multipv(
+    engine, board, *, nodes: int, movetime: float, tau: float, multipv: int = SOFT_K,
+) -> dict | None:
     n_legal = board.legal_moves.count()
     if n_legal == 0:
         return None
@@ -138,7 +264,7 @@ def analyze_multipv(engine, board, *, nodes: int, movetime: float, tau: float) -
     else:
         limit = chess.engine.Limit(depth=16)
     try:
-        infos = engine.analyse(board, limit, multipv=min(SOFT_K, n_legal))
+        infos = engine.analyse(board, limit, multipv=min(int(multipv), n_legal, SOFT_K))
     except (chess.engine.EngineError, chess.engine.EngineTerminatedError):
         return None
     if not isinstance(infos, list):
@@ -336,16 +462,29 @@ def summarize_lapse_audit(items: list[dict]) -> dict:
 
 
 def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
-             nodes, movetime, tau, ply_cap, sf_movetime, unlimited_opp):
-    board = chess.Board()
-    for uci in opening:
-        m = chess.Move.from_uci(uci)
-        if m in board.legal_moves:
-            board.push(m)
+             nodes, movetime, tau, ply_cap, sf_movetime, unlimited_opp,
+             explore_epsilon=0.0, explore_temperature=0.8, explore_top_k=4,
+             explore_plies=40, explore_seed=0, screen_nodes=0, start_fen="",
+             book_noise_plies=0, play_nodes=0):
+    explore_rng = random.Random(explore_seed)
+    board = chess.Board(start_fen) if start_fen else chess.Board()
+    if not start_fen:
+        for uci in opening:
+            m = chess.Move.from_uci(uci)
+            if m in board.legal_moves:
+                board.push(m)
+        for _ in range(max(0, int(book_noise_plies))):
+            if board.is_game_over(claim_draw=True):
+                break
+            legal = list(board.legal_moves)
+            if not legal:
+                break
+            board.push(explore_rng.choice(legal))
     kept = []
     meta = {
         "model_color": "white" if model_color == chess.WHITE else "black",
-        "opening": " ".join(opening) if opening else "startpos",
+        "opening": start_fen.split()[0] if start_fen else (" ".join(opening) if opening else "startpos"),
+        "start_fen": start_fen,
         "opp": opp_label,
         "n_model_plies": 0,
         "n_major": 0,
@@ -357,11 +496,36 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
         "n_analyze_fail": 0,
         "n_missed_mate": 0,
         "n_borderline_confirm": 0,
+        "n_exploratory_moves": 0,
+        "explore_epsilon": explore_epsilon,
+        "explore_temperature": explore_temperature,
+        "explore_top_k": explore_top_k,
+        "explore_plies": explore_plies,
+        "explore_seed": explore_seed,
     }
     while not board.is_game_over(claim_draw=True) and len(board.move_stack) < ply_cap:
         if board.turn == model_color:
             meta["n_model_plies"] += 1
-            mv = model_move(model, board, device)
+            mv, played_mv = model_move(
+                model, board, device, return_pair=True,
+                epsilon=explore_epsilon if len(board.move_stack) < explore_plies else 0.0,
+                temperature=explore_temperature, top_k=explore_top_k, rng=explore_rng,
+            )
+            meta["n_exploratory_moves"] += int(played_mv != mv)
+            if screen_nodes and int(screen_nodes) > 0:
+                meta["n_screen"] = meta.get("n_screen", 0) + 1
+                screen = analyze_multipv(
+                    teacher, board, nodes=int(screen_nodes), movetime=0.0, tau=tau, multipv=1,
+                )
+                if screen is None:
+                    meta["n_analyze_fail"] += 1
+                    board.push(played_mv)
+                    continue
+                if mv.uci() == screen["best_uci"]:
+                    meta["n_screen_agree"] = meta.get("n_screen_agree", 0) + 1
+                    board.push(played_mv)
+                    continue
+                meta["n_screen_disagree"] = meta.get("n_screen_disagree", 0) + 1
             soft = analyze_multipv(teacher, board, nodes=nodes, movetime=movetime, tau=tau)
             if soft is None:
                 meta["n_analyze_fail"] += 1
@@ -374,8 +538,9 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
                     model_cp = int(soft["cps"][i])
                     model_mate = int(soft["mates"][i])
                 else:
+                    probe_nodes = min(int(nodes), max(int(screen_nodes) * 2, 16_000)) if screen_nodes else nodes
                     probed = eval_move_score(
-                        teacher, board, mv, nodes=nodes, movetime=movetime, retries=2,
+                        teacher, board, mv, nodes=int(probe_nodes), movetime=0.0, retries=1,
                     )
                     if probed is None:
                         meta["n_label_fail"] += 1
@@ -383,21 +548,6 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
                         model_cp = 0
                     else:
                         model_cp, model_mate = probed
-                        info0 = classify_lapse(
-                            best_cp=int(soft["best_cp"]),
-                            best_mate=int(soft.get("best_mate") or 0),
-                            model_cp=model_cp,
-                            model_mate=model_mate,
-                            model_in_pv=False,
-                        )
-                        drop0 = info0.get("drop_cp")
-                        if info0["kind"] == "cp" and drop0 is not None and 50 <= drop0 < 150:
-                            meta["n_borderline_confirm"] += 1
-                            probed2 = eval_move_score(
-                                teacher, board, mv, nodes=nodes, movetime=movetime, retries=1,
-                            )
-                            if probed2 is not None:
-                                model_cp, model_mate = probed2
                 if not label_fail:
                     info = classify_lapse(
                         best_cp=int(soft["best_cp"]),
@@ -429,6 +579,7 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
                         row["_drop_cp"] = drop_cp
                         row["_mate_delta"] = info["mate_delta"]
                         row["_model_uci"] = mv.uci()
+                        row["_played_uci"] = played_mv.uci()
                         row["_best_uci"] = soft["best_uci"]
                         row["_model_cp"] = int(model_cp)
                         row["_best_cp"] = int(soft["best_cp"])
@@ -437,9 +588,12 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
                         kept.append(row)
             if mv not in board.legal_moves:
                 mv = next(iter(board.legal_moves))
-            board.push(mv)
+            board.push(played_mv)
         else:
-            limit = chess.engine.Limit(time=sf_movetime)
+            if int(play_nodes) > 0:
+                limit = chess.engine.Limit(nodes=int(play_nodes))
+            else:
+                limit = chess.engine.Limit(time=sf_movetime)
             mv = opp.play(board, limit).move
             if mv not in board.legal_moves:
                 mv = next(iter(board.legal_moves))
@@ -593,7 +747,7 @@ def _init_worker(checkpoint: str, sf_path: str):
     _W_MODEL = load_checkpoint(checkpoint, _W_DEVICE)
     _W_MODEL.eval()
     _W_TEACHER = chess.engine.SimpleEngine.popen_uci(sf_path)
-    _W_TEACHER.configure({"Threads": 1, "Hash": 64})
+    _W_TEACHER.configure({"Threads": 1, "Hash": 128})
 
 
 def _configure_opp(sf_path: str, spec: dict):
@@ -608,7 +762,8 @@ def _configure_opp(sf_path: str, spec: dict):
 
 def _worker_game(spec_and_cfg: tuple) -> dict:
     spec, cfg = spec_and_cfg
-    opp = _configure_opp(_W_SF, spec)
+    reuse = bool(spec.get("unlimited"))
+    opp = _W_TEACHER if reuse else _configure_opp(_W_SF, spec)
     try:
         kept, meta = play_one(
             _W_MODEL, _W_DEVICE, opp, _W_TEACHER,
@@ -621,9 +776,19 @@ def _worker_game(spec_and_cfg: tuple) -> dict:
             ply_cap=int(cfg["ply_cap"]),
             sf_movetime=float(cfg["sf_movetime"]),
             unlimited_opp=bool(spec.get("unlimited")),
+            explore_epsilon=0.0 if spec.get("holdout") else float(cfg.get("explore_epsilon", 0.0)),
+            explore_temperature=float(cfg.get("explore_temperature", 0.8)),
+            explore_top_k=int(cfg.get("explore_top_k", 4)),
+            explore_plies=int(cfg.get("explore_plies", 40)),
+            explore_seed=int(spec.get("explore_seed", 0)),
+            screen_nodes=int(cfg.get("screen_nodes", 0) or 0),
+            start_fen=str(spec.get("start_fen") or ""),
+            book_noise_plies=int(spec.get("book_noise_plies", 0) or 0),
+            play_nodes=int(cfg.get("play_nodes", 0) or 0),
         )
     finally:
-        opp.quit()
+        if not reuse:
+            opp.quit()
     lost = meta["score"] == 0.0
     holdout = bool(spec.get("holdout"))
     keep_tags = {"major", "blunder", "conversion", "inaccuracy"}
@@ -637,6 +802,7 @@ def _worker_game(spec_and_cfg: tuple) -> dict:
         drop_cp = r.pop("_drop_cp")
         mate_delta = r.pop("_mate_delta", 0)
         model_uci = r.pop("_model_uci")
+        played_uci = r.pop("_played_uci", model_uci)
         best_uci = r.pop("_best_uci")
         model_cp = int(r.pop("_model_cp"))
         best_cp = int(r.pop("_best_cp"))
@@ -658,6 +824,8 @@ def _worker_game(spec_and_cfg: tuple) -> dict:
             "drop_cp": drop_cp,
             "mate_delta": mate_delta,
             "model_uci": model_uci,
+            "played_uci": played_uci,
+            "exploratory_move": played_uci != model_uci,
             "best_uci": best_uci,
             "model_cp": model_cp,
             "best_cp": best_cp,
@@ -716,14 +884,43 @@ def main() -> None:
     ap.add_argument("--sf-elos", type=int, nargs="+", default=[1600, 1750, 1900, 2200])
     ap.add_argument("--unlimited-frac", type=float, default=0.2)
     ap.add_argument("--teacher-nodes", type=int, default=600_000)
+    ap.add_argument(
+        "--screen-nodes",
+        type=int,
+        default=0,
+        help="Cheap MultiPV=1 gate before deep labels. 0 = label every model ply (old path).",
+    )
+    ap.add_argument(
+        "--seed-cache",
+        default=None,
+        help="soft_cache.pt to start a fraction of games from (mid/end diversity).",
+    )
+    ap.add_argument(
+        "--seed-frac",
+        type=float,
+        default=0.45,
+        help="Fraction of games that start from --seed-cache instead of an opening.",
+    )
     ap.add_argument("--teacher-movetime", type=float, default=0.0)
     ap.add_argument("--tau", type=float, default=120.0)
     ap.add_argument("--sf-movetime", type=float, default=0.06)
+    ap.add_argument(
+        "--play-nodes",
+        type=int,
+        default=0,
+        help="If >0, opponent moves use this node cap instead of --sf-movetime.",
+    )
     ap.add_argument("--ply-cap", type=int, default=160)
     ap.add_argument("--keep-all-from-losses", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--test-min", type=int, default=256)
     ap.add_argument("--seed", type=int, default=201)
+    ap.add_argument("--explore-epsilon", type=float, default=0.0,
+                    help="Probability of top-k temperature sampling; greedy move is still labeled.")
+    ap.add_argument("--explore-temperature", type=float, default=0.8)
+    ap.add_argument("--explore-top-k", type=int, default=4)
+    ap.add_argument("--explore-plies", type=int, default=40,
+                    help="Explore only before this absolute game ply; holdout games stay greedy.")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
         "--inbox",
@@ -736,6 +933,23 @@ def main() -> None:
         nargs="*",
         default=None,
         help="Caches whose positions must not enter inbox shards (holdout + current bonus).",
+    )
+    ap.add_argument(
+        "--exclude-dir",
+        nargs="*",
+        default=None,
+        help="Directories to scan for soft_cache.pt files to exclude (no dups).",
+    )
+    ap.add_argument(
+        "--book-noise-plies",
+        type=int,
+        default=0,
+        help="After the opening, play this many random legal moves (new trees, not old FENs).",
+    )
+    ap.add_argument(
+        "--require-sf-name",
+        default="",
+        help="If set, abort unless Stockfish UCI name contains this substring.",
     )
     ap.add_argument("--loop", action="store_true", help="Keep hunting waves until STOP")
     ap.add_argument("--max-rounds", type=int, default=10**9)
@@ -753,6 +967,9 @@ def main() -> None:
     ap.add_argument("--refresh-min-age-s", type=float, default=45.0)
     ap.add_argument("--frozen-dir", default="outputs/exp201_lapses_frozen")
     args = ap.parse_args()
+    if (not 0 <= args.explore_epsilon <= 1 or not math.isfinite(args.explore_temperature)
+            or args.explore_temperature <= 0 or args.explore_top_k < 1 or args.explore_plies < 0):
+        ap.error("invalid exploration settings")
     if not args.go and not args.smoke:
         raise SystemExit("pass --go or --smoke")
     if args.smoke:
@@ -774,6 +991,9 @@ def main() -> None:
     if not ckpt.exists():
         raise SystemExit(f"missing ckpt {ckpt}")
     sf_path = resolve_sf()
+    sf_name = sf_uci_name(sf_path)
+    if args.require_sf_name and args.require_sf_name not in sf_name:
+        raise SystemExit(f"need Stockfish named *{args.require_sf_name}*, got {sf_name!r} at {sf_path}")
     n_workers = max(1, min(args.workers, args.games))
 
     cfg = {
@@ -784,23 +1004,37 @@ def main() -> None:
         "sf_movetime": args.sf_movetime,
         "keep_all_from_losses": args.keep_all_from_losses,
         "ckpt": str(ckpt),
+        "explore_epsilon": args.explore_epsilon,
+        "explore_temperature": args.explore_temperature,
+        "explore_top_k": args.explore_top_k,
+        "explore_plies": args.explore_plies,
+        "screen_nodes": args.screen_nodes,
+        "play_nodes": args.play_nodes,
     }
 
     from autoresearch_8gb.pipeline import load_position_hashes
 
     seen_h = None
-    for raw in args.exclude_cache or []:
-        p = Path(raw)
-        if not p.exists():
-            continue
+    exclude_pts = _iter_cache_pts(list(args.exclude_cache or []) + list(args.exclude_dir or []))
+    if exclude_pts:
+        log(f"loading exclude caches={len(exclude_pts)}", log_path)
+    for i, p in enumerate(exclude_pts, 1):
         extra = load_position_hashes(p)
         seen_h = extra if seen_h is None else np.unique(
             np.concatenate([seen_h.astype(np.uint64, copy=False), extra.astype(np.uint64, copy=False)])
         )
+        if i == 1 or i == len(exclude_pts) or i % 50 == 0:
+            log(f"exclude {i}/{len(exclude_pts)} hashes={0 if seen_h is None else int(seen_h.size):,}", log_path)
+    if exclude_pts:
+        log(
+            f"exclude caches={len(exclude_pts)} hashes={0 if seen_h is None else int(seen_h.size):,}",
+            log_path,
+        )
+    exclude_resolved = {p.resolve() for p in exclude_pts}
     if inbox is not None:
         for sh in sorted(inbox.glob("shard_*")):
             cache = sh / "soft_cache.pt"
-            if not cache.exists():
+            if not cache.exists() or cache.resolve() in exclude_resolved:
                 continue
             extra = load_position_hashes(cache)
             seen_h = extra if seen_h is None else np.unique(
@@ -822,17 +1056,33 @@ def main() -> None:
             c[a["tag"]] = c.get(a["tag"], 0) + 1
         return c
 
+    seed_fens: list[str] = []
+    seed_path = Path(args.seed_cache) if args.seed_cache else None
+    if seed_path is not None and seed_path.exists() and args.seed_frac > 0:
+        need = max(32, int(args.games * max(args.max_rounds, 1) * args.seed_frac))
+        need = min(need, 4000)
+        seed_fens = sample_seed_fens(seed_path, need, random.Random(args.seed + 17))
+        log(f"seed fens={len(seed_fens)} from {seed_path} frac={args.seed_frac}", log_path)
+
     def _make_jobs(rng: random.Random, n: int, start_idx: int):
         jobs = []
         for gi in range(n):
             unlimited = rng.random() < args.unlimited_frac
+            start_fen = ""
+            opening = list(OPENINGS[rng.randrange(len(OPENINGS))])
+            if seed_fens and rng.random() < float(args.seed_frac):
+                start_fen = seed_fens[(start_idx + gi) % len(seed_fens)]
+                opening = []
             jobs.append((
                 {
                     "game_idx": start_idx + gi,
+                    "explore_seed": args.seed + (start_idx + gi) * 1000003,
                     "sf_elo": args.sf_elos[(start_idx + gi) % len(args.sf_elos)],
                     "unlimited": unlimited,
                     "as_black": rng.random() < args.black_frac,
-                    "opening": list(OPENINGS[rng.randrange(len(OPENINGS))]),
+                    "opening": opening,
+                    "start_fen": start_fen,
+                    "book_noise_plies": 0 if start_fen else int(args.book_noise_plies),
                     "holdout": rng.random() < float(args.holdout_game_frac),
                 },
                 dict(cfg),
@@ -842,8 +1092,9 @@ def main() -> None:
     log(f"ckpt={ckpt}", log_path)
     log(
         f"CPU harvest workers={n_workers} games/wave={args.games} "
-        f"nodes={args.teacher_nodes} sf={sf_path} device=cpu "
-        f"inbox={inbox} loop={args.loop}",
+        f"screen={args.screen_nodes} deep={args.teacher_nodes} sf={sf_path} ({sf_name}) "
+        f"unlimited_frac={args.unlimited_frac} book_noise={args.book_noise_plies} "
+        f"play_nodes={args.play_nodes} device=cpu inbox={inbox} loop={args.loop}",
         log_path,
     )
     log(f"castling canonical K={CASTLING_MAP['K']} Q={CASTLING_MAP['Q']}", log_path)
@@ -862,6 +1113,15 @@ def main() -> None:
     n_label_fail = 0
     current_ckpt = ckpt
     current_step = parse_ckpt_step(ckpt) or 0
+    if not current_step:
+        # HF files are named latest.pt; mmap avoids eagerly reading optimizer tensors.
+        metadata = torch.load(ckpt, map_location="cpu", weights_only=False, mmap=True)
+        current_step = int(metadata.get("steps") or metadata.get("step") or 0)
+        del metadata
+    log(f"checkpoint step={current_step}; exploration epsilon={args.explore_epsilon} "
+        f"temperature={args.explore_temperature} top_k={args.explore_top_k} "
+        f"before_ply={args.explore_plies}; labels=greedy, holdout=greedy; "
+        "exploratory scores are not policy Elo", log_path)
     refresh_dir = Path(args.refresh_from_dir) if args.refresh_from_dir else None
     frozen_dir = Path(args.frozen_dir)
 
@@ -1047,6 +1307,9 @@ def main() -> None:
         "ckpt_step": current_step,
         "inbox": str(inbox) if inbox else None,
         "rating_note": "Teacher is full-strength Stockfish (no UCI_LimitStrength). Opponent may be limited.",
+        "exploration": {k: cfg[k] for k in cfg if k.startswith("explore_")},
+        "n_exploratory_moves": sum(m.get("n_exploratory_moves", 0) for m in game_metas),
+        "score_note": "Exploratory game scores are harvesting diagnostics, not greedy-policy Elo.",
         "elapsed_s": round(time.time() - t0, 1),
         "uniq_per_min": round(n_inbox / max((time.time() - t0) / 60.0, 1e-6), 2),
     }

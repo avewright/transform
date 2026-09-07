@@ -66,6 +66,23 @@ def _fixed_list(arr: np.ndarray, value_type: pa.DataType, width: int) -> pa.Arra
     return pa.FixedSizeListArray.from_arrays(flat, width)
 
 
+SF19_SCHEMA = pa.schema(list(SCHEMA) + [
+    pa.field("wdl", pa.list_(pa.float32(), 3)),
+    pa.field("soft_cps", pa.list_(pa.int32(), 8)),
+    pa.field("soft_mates", pa.list_(pa.int32(), 8)),
+    pa.field("nodes", pa.int32()),
+    pa.field("policy_mask", pa.int8()),
+    pa.field("tau", pa.float32()),
+    pa.field("nodes_budget", pa.int32()),
+    pa.field("game_id", pa.int64()),
+    pa.field("ply", pa.int16()),
+    pa.field("split", pa.int8()),
+    pa.field("origin", pa.int8()),
+    pa.field("flags", pa.int16()),
+    pa.field("bound_skipped", pa.int16()),
+])
+
+
 def cache_chunk_table(d: dict, name: str, start: int, end: int) -> pa.Table:
     n = end - start
     ba = d["board_array"][start:end].numpy().astype(np.int8, copy=False)
@@ -101,6 +118,74 @@ def cache_chunk_table(d: dict, name: str, start: int, end: int) -> pa.Table:
         pa.array([name] * n, type=pa.string()),
     ]
     return pa.Table.from_arrays(cols, schema=SCHEMA)
+
+
+def sf19_chunk_table(d: dict, name: str, start: int, end: int) -> pa.Table:
+    base = cache_chunk_table(d, name, start, end)
+    n = end - start
+
+    def _col(key, dtype, default):
+        if key in d:
+            return d[key][start:end].numpy()
+        if isinstance(default, np.ndarray):
+            return np.repeat(default[None, ...], n, axis=0)
+        return np.full(n, default)
+
+    extras = [
+        _fixed_list(np.asarray(_col("wdl", None, np.zeros(3, dtype=np.float32)), dtype=np.float32), pa.float32(), 3),
+        _fixed_list(np.asarray(_col("soft_cps", None, np.zeros(8, dtype=np.int32)), dtype=np.int32), pa.int32(), 8),
+        _fixed_list(np.asarray(_col("soft_mates", None, np.zeros(8, dtype=np.int32)), dtype=np.int32), pa.int32(), 8),
+        pa.array(np.asarray(_col("nodes", None, 0), dtype=np.int32)),
+        pa.array(np.asarray(_col("policy_mask", None, 1), dtype=np.int8)),
+        pa.array(np.asarray(_col("tau", None, 120.0), dtype=np.float32)),
+        pa.array(np.asarray(_col("nodes_budget", None, 0), dtype=np.int32)),
+        pa.array(np.asarray(_col("game_id", None, -1), dtype=np.int64)),
+        pa.array(np.asarray(_col("ply", None, -1), dtype=np.int16)),
+        pa.array(np.asarray(_col("split", None, 0), dtype=np.int8)),
+        pa.array(np.asarray(_col("origin", None, 0), dtype=np.int8)),
+        pa.array(np.asarray(_col("flags", None, 0), dtype=np.int16)),
+        pa.array(np.asarray(_col("bound_skipped", None, 0), dtype=np.int16)),
+    ]
+    table = base
+    extra_fields = [SF19_SCHEMA.field(i) for i in range(len(SCHEMA), len(SF19_SCHEMA))]
+    for field, col in zip(extra_fields, extras):
+        table = table.append_column(field.name, col)
+    return table.cast(SF19_SCHEMA)
+
+
+def sf19_table_to_cache(table: pa.Table) -> dict:
+    """Round-trip parquet → torch cache fields used by the training loader."""
+    def _list_np(name, dtype):
+        return np.asarray(table.column(name).to_pylist(), dtype=dtype)
+
+    out = {
+        "board_array": torch.from_numpy(_list_np("board_array", np.int8)),
+        "turn": torch.from_numpy(table.column("turn").to_numpy().astype(np.int8)),
+        "castling": torch.from_numpy(table.column("castling").to_numpy().astype(np.int8)),
+        "ep_square": torch.from_numpy(table.column("ep_square").to_numpy().astype(np.int8)),
+        "move_idx": torch.from_numpy(table.column("move_idx").to_numpy().astype(np.int64)),
+        "cp": torch.from_numpy(table.column("cp").to_numpy().astype(np.int32)),
+        "mate": torch.from_numpy(table.column("mate").to_numpy().astype(np.int32)),
+        "soft_indices": torch.from_numpy(_list_np("soft_indices", np.int64)),
+        "soft_probs": torch.from_numpy(_list_np("soft_probs", np.float32)),
+        "label_depth": torch.from_numpy(table.column("label_depth").to_numpy().astype(np.int16)),
+        "phase": torch.from_numpy(table.column("phase").to_numpy().astype(np.int8)),
+        "source": torch.from_numpy(table.column("source").to_numpy().astype(np.int8)),
+        "wdl": torch.from_numpy(_list_np("wdl", np.float32)),
+        "soft_cps": torch.from_numpy(_list_np("soft_cps", np.int32)),
+        "soft_mates": torch.from_numpy(_list_np("soft_mates", np.int32)),
+        "nodes": torch.from_numpy(table.column("nodes").to_numpy().astype(np.int32)),
+        "policy_mask": torch.from_numpy(table.column("policy_mask").to_numpy().astype(np.int8)),
+        "tau": torch.from_numpy(table.column("tau").to_numpy().astype(np.float32)),
+        "nodes_budget": torch.from_numpy(table.column("nodes_budget").to_numpy().astype(np.int32)),
+        "game_id": torch.from_numpy(table.column("game_id").to_numpy().astype(np.int64)),
+        "ply": torch.from_numpy(table.column("ply").to_numpy().astype(np.int16)),
+        "split": torch.from_numpy(table.column("split").to_numpy().astype(np.int8)),
+        "origin": torch.from_numpy(table.column("origin").to_numpy().astype(np.int8)),
+        "flags": torch.from_numpy(table.column("flags").to_numpy().astype(np.int16)),
+        "bound_skipped": torch.from_numpy(table.column("bound_skipped").to_numpy().astype(np.int16)),
+    }
+    return out
 
 
 def main() -> None:

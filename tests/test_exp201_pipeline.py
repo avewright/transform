@@ -202,6 +202,23 @@ def test_val_membership_blocks_flip_equivalents():
     assert 2 not in train_idx.tolist()  # flip equivalent blocked
 
 
+def test_saved_split_is_honored_not_resampled():
+    b_e4 = chess.Board()
+    b_e4.push_uci("e2e4")
+    b_d4 = chess.Board()
+    b_d4.push_uci("d2d4")
+    e4 = board_to_cache_row(b_e4, chess.Move.from_uci("e7e5"))
+    d4 = board_to_cache_row(b_d4, chess.Move.from_uci("d7d5"))
+    data = stack_rows([e4, d4, e4])
+    data["split"] = torch.tensor([0, 1, 0], dtype=torch.int8)
+    man = make_val_membership(data, n_hold=2, seed=0, source="test")
+    assert man["method"] == "saved_split_v1"
+    train_idx, val_idx = apply_membership(data, man)
+    assert set(val_idx.tolist()) == {1}
+    assert 1 not in train_idx.tolist()
+    assert 0 in train_idx.tolist()
+
+
 def test_filter_disjoint_drops_internal_and_prior():
     b_e4 = chess.Board()
     b_e4.push_uci("e2e4")

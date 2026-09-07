@@ -247,6 +247,14 @@ def train(args: argparse.Namespace) -> dict:
         trial["train"]["muon_lr"] = float(args.muon_lr)
     if args.adam_lr is not None:
         trial["train"]["adam_lr"] = float(args.adam_lr)
+    if args.batch_size is not None:
+        trial["train"]["batch_size"] = int(args.batch_size)
+        trial["train"]["fill_vram"] = False
+        trial["train"]["max_batch_size"] = int(args.batch_size)
+    if args.optimizer is not None:
+        trial["train"]["optimizer"] = str(args.optimizer)
+        trial["train"]["compile_polar"] = False
+        trial["train"]["torch_compile"] = False
     if args.force_lr:
         trial["train"]["force_lr"] = True
     if args.bonus_mix_frac is not None:
@@ -257,6 +265,12 @@ def train(args: argparse.Namespace) -> dict:
         trial["train"]["bonus_exclude"] = [str(Path(p)) for p in args.bonus_exclude]
     if args.bonus_soft_temp_weight is not None:
         trial["train"]["bonus_soft_temp_weight"] = float(args.bonus_soft_temp_weight)
+    if args.val_eval_n is not None:
+        trial["train"]["val_eval_n"] = int(args.val_eval_n)
+    if args.val_every is not None:
+        trial["train"]["val_every_steps"] = int(args.val_every)
+    if args.warmup is not None:
+        trial["train"]["warmup"] = int(args.warmup)
     bonus = Path(args.bonus_cache) if args.bonus_cache else None
     if bonus is not None and not bonus.exists():
         raise SystemExit(f"bonus cache missing: {bonus}")
@@ -321,6 +335,8 @@ def main() -> None:
         default=None,
         help="Attach the shards listed in a dataset_manifest.json (same mix as that run).",
     )
+    ap.add_argument("--batch-size", type=int, default=None, help="Override microbatch (disables fill_vram)")
+    ap.add_argument("--optimizer", default=None, help="adamw | normuon | polar_normuon")
     ap.add_argument("--muon-lr", type=float, default=None, help="Override Polar/NorMuon LR")
     ap.add_argument("--adam-lr", type=float, default=None, help="Override AdamW aux LR")
     ap.add_argument(
@@ -357,6 +373,19 @@ def main() -> None:
         help="Override Chessformer soft-temp aux weight on bonus batches only. "
         "None keeps the general weight (0.4). 0 disables flattening on mistakes.",
     )
+    ap.add_argument(
+        "--val-eval-n",
+        type=int,
+        default=None,
+        help="Holdout rows per val source (default 256).",
+    )
+    ap.add_argument(
+        "--val-every",
+        type=int,
+        default=None,
+        help="Validation period in steps (default 500).",
+    )
+    ap.add_argument("--warmup", type=int, default=None, help="Override warmup steps")
     args = ap.parse_args()
     _assert_compact()
 

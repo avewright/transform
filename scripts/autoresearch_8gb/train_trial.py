@@ -256,6 +256,7 @@ def train_trial(
             train["accum_steps"] = int(train.get("accum_steps", 1)) * scale
         if train.get("torch_compile"):
             train["torch_compile"] = False
+        train["compile_polar"] = False
 
     model_cfg = cfg_cls(**{
         k: v for k, v in model_kw.items()
@@ -945,15 +946,28 @@ def train_trial(
                     interrupted = True
                     _log(log_path, f"stopping: non-finite loss at step {step}")
                     break
+            if save_every > 0 and step % save_every == 0:
+                _save_ckpt(
+                    "mid",
+                    also_step=keep_step_every > 0 and step % keep_step_every == 0,
+                )
             if val_every > 0 and step % val_every == 0 and not smoke:
                 raw_m = model._orig_mod if hasattr(model, "_orig_mod") else model
+                val_n = int(train.get("val_eval_n", 256) or 256)
+                val_mb = int(train.get("val_microbatch", bs) or bs)
                 if val_soft_idx is not None and val_soft_idx.numel():
-                    take = val_soft_idx[torch.arange(min(256, int(val_soft_idx.numel())))]
-                    metrics = cheap_eval_losses(raw_m, soft_data, take, device, soft_temp=soft_temp or 4.0)
+                    take = val_soft_idx[torch.arange(min(val_n, int(val_soft_idx.numel())))]
+                    metrics = cheap_eval_losses(
+                        raw_m, soft_data, take, device,
+                        soft_temp=soft_temp or 4.0, microbatch=val_mb,
+                    )
                     _log(log_path, "val/soft " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
                 if val_deep_idx is not None and val_deep_idx.numel() and deep_data is not None:
-                    take = val_deep_idx[torch.arange(min(256, int(val_deep_idx.numel())))]
-                    metrics = cheap_eval_losses(raw_m, deep_data, take, device, soft_temp=soft_temp or 4.0)
+                    take = val_deep_idx[torch.arange(min(val_n, int(val_deep_idx.numel())))]
+                    metrics = cheap_eval_losses(
+                        raw_m, deep_data, take, device,
+                        soft_temp=soft_temp or 4.0, microbatch=val_mb,
+                    )
                     _log(log_path, "val/deep " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
                 if legal_every > 0 and step % legal_every == 0 and val_soft_idx is not None:
                     take = val_soft_idx[torch.arange(min(48, int(val_soft_idx.numel())))]
@@ -961,11 +975,6 @@ def train_trial(
                     _log(log_path, "val/legal " + " ".join(f"{k}={v:.4f}" for k, v in diag.items()))
                 model.train()
                 last_tick = time.time()
-            if save_every > 0 and step % save_every == 0:
-                _save_ckpt(
-                    "mid",
-                    also_step=keep_step_every > 0 and step % keep_step_every == 0,
-                )
             if elo_every > 0 and step % elo_every == 0:
                 mid = _save_ckpt("mid_elo")
                 _log(log_path, f"elo gauntlet at step {step} -> {mid['ckpt_path']}")
