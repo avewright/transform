@@ -171,6 +171,7 @@ def play_one_policy(
     use_book: bool,
     get_book_move,
     get_syzygy_move,
+    nodes: int = 0,
 ) -> dict:
     board = chess.Board()
     for uci in opening:
@@ -194,7 +195,12 @@ def play_one_policy(
                 move, _ = move_fn(model, board, device, temperature=0.0)
                 source = "policy"
         else:
-            move = engine.play(board, chess.engine.Limit(time=movetime)).move
+            limit = (
+                chess.engine.Limit(nodes=int(nodes))
+                if int(nodes) > 0
+                else chess.engine.Limit(time=movetime)
+            )
+            move = engine.play(board, limit).move
             source = "sf"
         if move not in board.legal_moves:
             move = next(iter(board.legal_moves))
@@ -279,45 +285,113 @@ def summarize_results(sf_elo: int, results: list[dict]) -> dict:
     }
 
 
+def _logistic_p(elo: float, opp: float) -> float:
+    return 1.0 / (1.0 + 10.0 ** ((opp - elo) / 400.0))
+
+
+def _logistic_elo(summaries: list[dict]) -> int:
+    """Integer Elo maximizing a binomial log-likelihood on observed scores."""
+
+    def nll(elo: float) -> float:
+        loss = 0.0
+        for s in summaries:
+            n = max(int(s.get("games") or 1), 1)
+            p = min(1.0 - 1e-6, max(1e-6, _logistic_p(elo, float(s["sf_elo"]))))
+            y = min(1.0 - 1e-6, max(1e-6, float(s["score"])))
+            loss -= n * (y * math.log(p) + (1.0 - y) * math.log(1.0 - p))
+        return loss
+
+    lo = min(int(s["sf_elo"]) for s in summaries) - 400
+    hi = max(int(s["sf_elo"]) for s in summaries) + 400
+    best_elo = int(summaries[0]["sf_elo"])
+    best = nll(float(best_elo))
+    for elo in range(lo, hi + 1):
+        v = nll(float(elo))
+        if v < best:
+            best = v
+            best_elo = elo
+    return best_elo
+
+
 def estimate_elo(summaries: list[dict]) -> dict:
+    """Bracket 50% only on a prefix/suffix that does not invert.
+
+    lower_bound = highest opponent such that this and every weaker score >= 0.5
+    upper_bound = lowest opponent such that this and every stronger score < 0.5
+
+    Non-monotonic screens (e.g. beat 1900, lose to 1750) used to report
+    lower=1900 and upper=1750. Those bounds are discarded.
+    """
     if not summaries:
         return {"estimated_elo": None, "lower_bound": None, "upper_bound": None, "note": "no games"}
     ordered = sorted(summaries, key=lambda s: s["sf_elo"])
-    above = [s for s in ordered if s["score"] >= 0.5]
-    below = [s for s in ordered if s["score"] < 0.5]
-    lower_bound = max((s["sf_elo"] for s in above), default=None)
-    upper_bound = min((s["sf_elo"] for s in below), default=None)
+    monotonic = all(
+        ordered[i]["score"] + 1e-12 >= ordered[i + 1]["score"] for i in range(len(ordered) - 1)
+    )
+    lower_bound = None
+    for s in ordered:
+        if s["score"] >= 0.5:
+            lower_bound = s["sf_elo"]
+        else:
+            break
+    upper_bound = None
+    for s in reversed(ordered):
+        if s["score"] < 0.5:
+            upper_bound = s["sf_elo"]
+        else:
+            break
+    if lower_bound is not None and upper_bound is not None and lower_bound > upper_bound:
+        lower_bound = None
+        upper_bound = None
+
+    fit = _logistic_elo(ordered)
+    notes: list[str] = []
+    if not monotonic:
+        notes.append("non-monotonic scores; logistic fit")
+
+    if lower_bound is None and upper_bound is None:
+        notes.append(f"no valid 50% bracket; logistic={fit}")
+        return {
+            "estimated_elo": fit,
+            "lower_bound": None,
+            "upper_bound": None,
+            "note": "; ".join(notes),
+        }
     if lower_bound is None:
         first = ordered[0]
+        notes.append(f"below 50% at all levels; at {first['sf_elo']} score={first['score']:.3f}")
         return {
-            "estimated_elo": first["sf_elo"],
+            "estimated_elo": fit,
             "lower_bound": None,
-            "upper_bound": first["sf_elo"],
-            "note": f"below 50% at all levels; at {first['sf_elo']} score={first['score']:.3f}",
+            "upper_bound": upper_bound if upper_bound is not None else first["sf_elo"],
+            "note": "; ".join(notes),
         }
     if upper_bound is None:
         last = ordered[-1]
+        notes.append(f"≥50% through {last['sf_elo']} score={last['score']:.3f}")
         return {
-            "estimated_elo": last["sf_elo"],
+            "estimated_elo": last["sf_elo"] if last["score"] >= 0.5 else fit,
             "lower_bound": last["sf_elo"],
             "upper_bound": None,
-            "note": f"≥50% through {last['sf_elo']} score={last['score']:.3f}",
+            "note": "; ".join(notes),
         }
+
     lo_s = next(s for s in ordered if s["sf_elo"] == lower_bound)
     hi_s = next(s for s in ordered if s["sf_elo"] == upper_bound)
-    if lower_bound == upper_bound or hi_s["score"] == lo_s["score"]:
+    if hi_s["score"] == lo_s["score"]:
         est = lower_bound
     else:
         frac = (0.5 - lo_s["score"]) / (hi_s["score"] - lo_s["score"])
         est = round(lower_bound + frac * (upper_bound - lower_bound))
+    notes.append(
+        f"bracketed by {lower_bound} (score={lo_s['score']:.3f}) "
+        f"and {upper_bound} (score={hi_s['score']:.3f})"
+    )
     return {
         "estimated_elo": est,
         "lower_bound": lower_bound,
         "upper_bound": upper_bound,
-        "note": (
-            f"bracketed by {lower_bound} (score={lo_s['score']:.3f}) "
-            f"and {upper_bound} (score={hi_s['score']:.3f})"
-        ),
+        "note": "; ".join(notes),
     }
 
 
@@ -342,6 +416,7 @@ def run_policy_elo(args: argparse.Namespace) -> dict[str, Any]:
     use_book = args.book
     use_syzygy = args.syzygy
     movetime = args.movetime if args.movetime is not None else protocol["movetime"]
+    nodes = int(getattr(args, "nodes", 0) or 0)
     ply_cap = args.ply_cap if args.ply_cap is not None else protocol["ply_cap"]
     games = (
         args.games_per_opening_per_color
@@ -373,6 +448,7 @@ def run_policy_elo(args: argparse.Namespace) -> dict[str, Any]:
         "book": use_book,
         "syzygy": use_syzygy,
         "movetime": movetime,
+        "nodes": nodes,
         "ply_cap": ply_cap,
         "games_per_opening_per_color": games,
         "elos": elos,
@@ -406,9 +482,10 @@ def run_policy_elo(args: argparse.Namespace) -> dict[str, Any]:
                 "games_per_opening_per_color": games,
                 "elos": elos,
                 "openings": proto_record["openings"],
-                "stop_after_bracket": stop,
-                "book": use_book,
-                "syzygy": use_syzygy,
+                            "stop_after_bracket": stop,
+                            "book": use_book,
+                            "syzygy": use_syzygy,
+                            "nodes": nodes,
             },
             "summaries": summaries,
             "games": all_games,
@@ -445,6 +522,7 @@ def run_policy_elo(args: argparse.Namespace) -> dict[str, Any]:
                             use_book=use_book,
                             get_book_move=get_book_move,
                             get_syzygy_move=syzygy_fn,
+                            nodes=nodes,
                         )
                         r["repeat_idx"] = repeat_idx
                         results.append(r)
@@ -671,6 +749,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--syzygy", action="store_true", help="Enable Syzygy (off by default)")
     ap.add_argument("--no-syzygy", action="store_true", help="Explicitly disable Syzygy (default)")
     ap.add_argument("--movetime", type=float, default=None)
+    ap.add_argument(
+        "--nodes",
+        type=int,
+        default=0,
+        help="If >0, Stockfish uses Limit(nodes=N) instead of movetime (CPU-load invariant).",
+    )
     ap.add_argument("--ply-cap", type=int, default=None)
     ap.add_argument("--games-per-opening-per-color", type=int, default=None)
     ap.add_argument("--elos", type=int, nargs="+", default=None)

@@ -78,6 +78,16 @@ OPENINGS = [
     ["e2e4", "g7g6"],
     ["c2c4", "c7c5"],
     ["g1f3", "d7d5"],
+    ["d2d4", "d7d5", "c2c4", "c7c6"],
+    ["e2e4", "c7c5", "g1f3", "b8c6"],
+    ["d2d4", "g8f6", "c2c4", "e7e6"],
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"],
+    ["b2b3"],
+    ["g2g3"],
+    ["e2e3"],
+    ["f2f4"],
+    ["b1c3"],
+    ["a2a4"],
 ]
 
 
@@ -829,17 +839,21 @@ class SeenDB:
         except sqlite3.OperationalError:
             return set()
 
-    def ingest_shard_keys(self, shard_dir: Path) -> int:
-        cache = shard_dir / "soft_cache.pt"
+    def ingest_cache_keys(self, cache: Path, name: str | None = None) -> int:
+        cache = Path(cache)
         data = torch.load(cache, map_location="cpu", weights_only=False)
+        n_rows = int(data["move_idx"].shape[0])
         keys = [
             compact_key_bytes(data["board_array"][i], data["turn"][i], data["castling"][i], data["ep_square"][i])
-            for i in range(int(data["move_idx"].shape[0]))
+            for i in range(n_rows)
         ]
         n = self.add_many(keys)
-        self.mark_shard(shard_dir.name, int(data["move_idx"].shape[0]))
+        self.mark_shard(name or cache.name, n_rows)
         del data
         return n
+
+    def ingest_shard_keys(self, shard_dir: Path) -> int:
+        return self.ingest_cache_keys(shard_dir / "soft_cache.pt", shard_dir.name)
 
 
 def next_shard_dir(inbox: Path) -> Path:
@@ -912,28 +926,38 @@ def row_key(row: dict) -> bytes:
 
 
 def sample_seed_fens(paths: list[Path], n: int, rng: random.Random) -> list[str]:
-    fens: list[str] = []
+    """Phase-stratified start FENs so self-play is not opening-heavy."""
+    from scripts.harvest_exp201_lapses import board_array_to_fen
+
+    buckets: dict[int, list[str]] = {0: [], 1: [], 2: []}
+    per_path = max(n, 512)
     for p in paths:
-        if len(fens) >= n:
-            break
         if not p.exists():
             continue
         data = torch.load(p, map_location="cpu", weights_only=False)
-        take = min(256, int(data["move_idx"].shape[0]))
-        idx = rng.sample(range(int(data["move_idx"].shape[0])), k=min(take, int(data["move_idx"].shape[0])))
-        from scripts.harvest_exp201_lapses import board_array_to_fen
+        n_rows = int(data["move_idx"].shape[0])
+        take = min(n_rows, per_path)
+        idx = rng.sample(range(n_rows), k=take)
+        phase = data["phase"].view(-1).numpy() if "phase" in data else None
         for i in idx:
-            fens.append(board_array_to_fen(
+            fen = board_array_to_fen(
                 data["board_array"][i].numpy(),
                 int(data["turn"][i]),
                 int(data["castling"][i]),
                 int(data["ep_square"][i]),
-            ))
+            )
+            ph = int(phase[i]) if phase is not None else 1
+            buckets.setdefault(ph if ph in buckets else 1, []).append(fen)
         del data
-        if len(fens) >= n:
-            break
-    rng.shuffle(fens)
-    return fens[:n]
+    out: list[str] = []
+    while len(out) < n and any(buckets.values()):
+        for ph in (0, 1, 2):
+            if buckets[ph]:
+                out.append(buckets[ph].pop())
+            if len(out) >= n:
+                break
+    rng.shuffle(out)
+    return out[:n]
 
 
 def bench(args) -> dict:
@@ -1148,13 +1172,20 @@ def generate(args) -> None:
     log(f"resume seen={len(seen):,} committed={committed:,} next_game={next_game}", log_path)
     target = args.target
     workers = max(1, args.workers)
+    for raw in getattr(args, "exclude_caches", None) or []:
+        p = Path(raw)
+        if not p.exists():
+            continue
+        added = seen.ingest_cache_keys(p, f"exclude:{p}")
+        log(f"exclude {p} +{added:,} keys seen={len(seen):,}", log_path)
     seed_paths = [Path(p) for p in (getattr(args, "seed_caches", None) or [])]
     if not getattr(args, "no_seed_caches", False) and not seed_paths:
         seed_paths = [
             ROOT / "outputs/autoresearch_8gb/soft_cache_200k.pt",
         ]
-    seed_paths = [p for p in seed_paths if p.exists() and p.stat().st_size < 400 * 1024 * 1024]
-    seed_fens = [] if args.no_seed_caches else sample_seed_fens(seed_paths, 128, random.Random(args.seed + 3))
+    seed_n = int(getattr(args, "seed_fens_n", 2048) or 2048)
+    seed_paths = [p for p in seed_paths if p.exists()]
+    seed_fens = [] if args.no_seed_caches else sample_seed_fens(seed_paths, seed_n, random.Random(args.seed + 3))
     if seed_fens:
         ok = []
         for fen in seed_fens:
@@ -1217,10 +1248,10 @@ def generate(args) -> None:
                     "game_id": game_i,
                     "seed": args.seed + game_i * 10007,
                     "opening": list(OPENINGS[game_i % len(OPENINGS)]),
-                    "book_noise": cfg.book_noise,
+                    "book_noise": int(cfg.book_noise) + (game_i % 7),
                     "split": split,
                 }
-                if seed_fens and game_i % 3 == 1:
+                if seed_fens and game_i % 2 == 1:
                     spec["start_fen"] = seed_fens[game_i % len(seed_fens)]
                 jobs.append(spec)
                 game_i += 1
@@ -1485,32 +1516,39 @@ def push_hf(args) -> None:
     state_path = out / "hf_upload.json"
     state = _load_json(state_path)
     uploaded = set(state.get("uploaded") or [])
-    n_total = 0
+    shard_offset = int(getattr(args, "shard_offset", 0) or 0)
+    base_rows = int(getattr(args, "base_rows", 0) or 0)
+    n_new = 0
     shards = sorted(inbox.glob("shard_*"))
     for sh in shards:
         cache = sh / "soft_cache.pt"
         if not cache.exists():
             continue
-        dest = data_dir / f"{sh.name}.parquet"
-        remote_name = f"data/{sh.name}.parquet"
+        try:
+            local_i = int(sh.name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            local_i = 0
+        remote_name = f"data/shard_{local_i + shard_offset:06d}.parquet"
+        dest = data_dir / Path(remote_name).name
         if dest.exists() and dest.stat().st_size > 0:
             n = int(pq.read_metadata(dest).num_rows)
         else:
             d = torch.load(cache, map_location="cpu", weights_only=False)
             n = int(d["move_idx"].shape[0])
             pq.write_table(sf19_chunk_table(d, sh.name, 0, n), dest, compression="zstd")
-        n_total += n
+        n_new += n
         if remote_name in uploaded:
-            log(f"skip {sh.name} n={n} total={n_total:,}")
+            log(f"skip {remote_name} n={n} new={n_new:,}")
             continue
         _upload_with_retry(
             api, path=str(dest), path_in_repo=remote_name, repo=repo, token=token,
-            message=f"add {sh.name} n={n:,}",
+            message=f"add {remote_name} n={n:,}",
         )
         uploaded.add(remote_name)
-        state = {"repo": repo, "uploaded": sorted(uploaded), "rows": n_total}
+        state = {"repo": repo, "uploaded": sorted(uploaded), "rows": n_new, "shard_offset": shard_offset}
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        log(f"uploaded {sh.name} n={n} total={n_total:,}")
+        log(f"uploaded {remote_name} n={n} new={n_new:,}")
+    n_total = base_rows + n_new
     extras = (
         "teacher.json", "bench.json", "manifest.json", "summary.json",
         "sampling.json", "audit.json", "eval_manifest.json",
@@ -1569,6 +1607,9 @@ def main() -> None:
     g.add_argument("--holdout-frac", type=float, default=0.1)
     g.add_argument("--game-start", type=int, default=0)
     g.add_argument("--seed-caches", nargs="*", default=None)
+    g.add_argument("--seed-fens-n", type=int, default=2048)
+    g.add_argument("--exclude-caches", nargs="*", default=None,
+                   help="Caches whose position keys are blocked (already in the public set).")
     g.add_argument("--no-seed-caches", action="store_true")
     g.add_argument("--mode", choices=("selfplay", "mix"), default="mix")
     g.add_argument("--relabel-frac", type=float, default=0.8)
@@ -1603,6 +1644,10 @@ def main() -> None:
     p = sub.add_parser("push")
     add_shared(p)
     p.add_argument("--repo", default="avewright/chess-soft-sf19")
+    p.add_argument("--shard-offset", type=int, default=0,
+                   help="Remote parquet index = local shard index + offset (append without clobber).")
+    p.add_argument("--base-rows", type=int, default=0,
+                   help="Existing remote rows to include in the card total when appending.")
     args = ap.parse_args()
     if args.cmd == "bench":
         bench(args)

@@ -58,9 +58,11 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     attach_static_targets,
     audit_soft_targets,
     concat_soft_tables,
+    drop_blocked_rows,
     filter_disjoint,
     ingest_ready_bonus_shards,
     list_attached_shards,
+    load_blocked_hashes,
     load_extra_soft_shards,
     load_position_hashes,
     cheap_eval_losses,
@@ -70,6 +72,7 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     load_model_state,
     lr_scale,
     make_val_membership,
+    masked_mean_ce,
     muon_update_scale_note,
     pick_mix_source,
     policy_soft_temp_weight,
@@ -78,6 +81,7 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     session_throughput,
     restore_rng_state,
     save_training_checkpoint,
+    value_valid_rows,
     soft_policy_loss,
     soft_temp_policy_loss,
     unwrap_model,
@@ -299,23 +303,29 @@ def train_trial(
             raise FileNotFoundError(f"resume ckpt missing: {resume_ckpt}")
         ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
         if ckpt.get("eval_only"):
-            raise SystemExit(
-                f"{resume_ckpt} is an evaluation/SWA snapshot, not a training resume file. "
-                "Use latest.pt or known_good.pt (live weights)."
-            )
-        model.load_state_dict(load_model_state(ckpt), strict=True)
-        start_step = int(ckpt.get("steps", ckpt.get("global_step", 0)) or 0)
-        resume_kind = classify_checkpoint(ckpt)
-        resume_payload = ckpt if isinstance(ckpt, dict) else None
-        if resume_kind == "full":
-            _log(log_path, f"FULL RESUME {resume_ckpt} steps={start_step}")
-        else:
+            model.load_state_dict(load_model_state(ckpt), strict=True)
+            start_step = 0
+            resume_kind = "weights_only"
+            resume_payload = None
             _log(
                 log_path,
-                f"WEIGHTS-ONLY WARM START {resume_ckpt} steps={start_step} "
-                f"(no optimizer/RNG in checkpoint; optimizer is re-initialized; "
-                f"LR follows this process's train config)",
+                f"WEIGHTS-ONLY WARM START {resume_ckpt} from eval/SWA snapshot "
+                f"(optimizer/RNG re-initialized; step reset to 0)",
             )
+        else:
+            model.load_state_dict(load_model_state(ckpt), strict=True)
+            start_step = int(ckpt.get("steps", ckpt.get("global_step", 0)) or 0)
+            resume_kind = classify_checkpoint(ckpt)
+            resume_payload = ckpt if isinstance(ckpt, dict) else None
+            if resume_kind == "full":
+                _log(log_path, f"FULL RESUME {resume_ckpt} steps={start_step}")
+            else:
+                _log(
+                    log_path,
+                    f"WEIGHTS-ONLY WARM START {resume_ckpt} steps={start_step} "
+                    f"(no optimizer/RNG in checkpoint; optimizer is re-initialized; "
+                    f"LR follows this process's train config)",
+                )
 
     opt_name = train.get("optimizer", "normuon")
     try:
@@ -387,13 +397,41 @@ def train_trial(
     train_soft_n = train_deep_n = 0
     attached_names: list[str] = []
     val_manifests: dict[str, Any] = {}
+    import numpy as np
+    ext_eval_spec = dict(train.get("external_eval") or {})
+    block_paths = [Path(p) for p in (train.get("block_manifests") or [])]
+    blocked_hold = load_blocked_hashes(block_paths) if block_paths else np.zeros(0, dtype=np.uint64)
+    ext_eval_data: dict[str, dict] = {}
+    for ev_name, ev_path in ext_eval_spec.items():
+        ev_p = Path(ev_path)
+        if not ev_p.exists():
+            raise SystemExit(f"external eval missing: {ev_name} {ev_p}")
+        ev = torch.load(ev_p, map_location="cpu", weights_only=False)
+        attach_static_targets(ev)
+        ext_eval_data[ev_name] = ev
+        _log(log_path, f"external eval {ev_name} n={int(ev['board_array'].shape[0]):,} {ev_p}")
     if soft_cache and soft_cache.exists():
         soft_data = torch.load(soft_cache, map_location="cpu", weights_only=False)
         attach_static_targets(soft_data)
         n = int(soft_data["board_array"].shape[0])
         hold = min(2000, max(64 if smoke else 512, n // 40), max(0, n // 5))
         man_path = out_dir / "val_manifest_soft.json"
-        if man_path.exists() and not smoke:
+        if ext_eval_data:
+            soft_data, n_blk = drop_blocked_rows(soft_data, blocked_hold)
+            if n_blk:
+                _log(log_path, f"holdout-blocked {n_blk:,} soft rows")
+            val_manifests["soft"] = {
+                "method": "external_eval_v1",
+                "source": "soft",
+                "n_hold": 0,
+                "n_blocked": int(blocked_hold.size),
+                "hashes": [],
+                "blocked_hashes": [int(x) for x in blocked_hold.tolist()],
+                "eval_caches": {k: str(Path(v)) for k, v in ext_eval_spec.items()},
+                "leakage": "Frozen external holdouts. Training excludes blocked hashes; val is not carved from this mix.",
+            }
+            man_path.write_text(json.dumps(val_manifests["soft"], indent=2), encoding="utf-8")
+        elif man_path.exists() and not smoke:
             val_manifests["soft"] = json.loads(man_path.read_text(encoding="utf-8"))
         else:
             val_manifests["soft"] = make_val_membership(soft_data, n_hold=hold, seed=201, source="soft")
@@ -453,14 +491,20 @@ def train_trial(
                     f"attached {len(kept_extras)} disjoint SF shards → n={int(soft_data['board_array'].shape[0]):,} "
                     f"unique_hashes={int(seen_h.size):,}",
                 )
-        train_soft_idx, val_soft_idx = apply_membership(soft_data, val_manifests["soft"])
+        if ext_eval_data:
+            n_soft = int(soft_data["board_array"].shape[0])
+            train_soft_idx = torch.arange(n_soft, dtype=torch.int64)
+            val_soft_idx = torch.zeros(0, dtype=torch.int64)
+        else:
+            train_soft_idx, val_soft_idx = apply_membership(soft_data, val_manifests["soft"])
         train_soft_n = int(train_soft_idx.numel())
         audit = audit_soft_targets(soft_data)
         _log(
             log_path,
             f"soft train={train_soft_n:,} val={int(val_soft_idx.numel()):,} "
             f"blocked={val_manifests['soft']['n_blocked']} "
-            f"targets empty={audit['empty_rows']} unnorm={audit['unnormalized_rows']}",
+            f"targets empty={audit['empty_rows']} unnorm={audit['unnormalized_rows']}"
+            + (" external_eval" if ext_eval_data else ""),
         )
     elif not smoke:
         return {
@@ -486,7 +530,12 @@ def train_trial(
         else:
             _log(log_path, f"bonus cache missing: {bonus_path}")
 
-    import numpy as np
+    if bonus_data is not None and blocked_hold.size:
+        bonus_data, n_blk = drop_blocked_rows(bonus_data, blocked_hold)
+        if n_blk:
+            _log(log_path, f"holdout-blocked {n_blk:,} bonus rows")
+            train_bonus_n = int(bonus_data["board_array"].shape[0])
+            train_bonus_idx = torch.arange(train_bonus_n)
 
     if bonus_data is not None:
         bonus_seen_h = np.unique(position_hashes(bonus_data).astype(np.uint64, copy=False))
@@ -540,12 +589,29 @@ def train_trial(
         n = int(deep_data["board_array"].shape[0])
         hold = min(1000, max(64 if smoke else 256, n // 40))
         man_path = out_dir / "val_manifest_deep.json"
-        if man_path.exists() and not smoke:
+        if ext_eval_data:
+            deep_data, n_blk = drop_blocked_rows(deep_data, blocked_hold)
+            if n_blk:
+                _log(log_path, f"holdout-blocked {n_blk:,} deep rows")
+            n_deep = int(deep_data["board_array"].shape[0])
+            train_deep_idx = torch.arange(n_deep, dtype=torch.int64)
+            val_deep_idx = torch.zeros(0, dtype=torch.int64)
+            val_manifests["deep"] = {
+                "method": "external_eval_v1",
+                "source": "deep",
+                "n_hold": 0,
+                "n_blocked": int(blocked_hold.size),
+                "hashes": [],
+                "blocked_hashes": [int(x) for x in blocked_hold.tolist()],
+            }
+            man_path.write_text(json.dumps(val_manifests["deep"], indent=2), encoding="utf-8")
+        elif man_path.exists() and not smoke:
             val_manifests["deep"] = json.loads(man_path.read_text(encoding="utf-8"))
+            train_deep_idx, val_deep_idx = apply_membership(deep_data, val_manifests["deep"])
         else:
             val_manifests["deep"] = make_val_membership(deep_data, n_hold=hold, seed=202, source="deep")
             man_path.write_text(json.dumps(val_manifests["deep"], indent=2), encoding="utf-8")
-        train_deep_idx, val_deep_idx = apply_membership(deep_data, val_manifests["deep"])
+            train_deep_idx, val_deep_idx = apply_membership(deep_data, val_manifests["deep"])
         train_deep_n = int(train_deep_idx.numel())
         _log(log_path, f"deep train={train_deep_n:,} val={int(val_deep_idx.numel()):,}")
 
@@ -849,14 +915,23 @@ def train_trial(
                             p_loss = p_loss + st_w * soft_temp_policy_loss(
                                 out["policy_logits"], si, sp, temperature=soft_temp,
                             )
-                        v_loss = F.cross_entropy(out["value_logits"], wdl)
+                        v_ok = value_valid_rows(src, idx)
+                        if v_ok is not None:
+                            v_ok = v_ok.to(device=device, dtype=torch.float32)
+                        v_loss = masked_mean_ce(out["value_logits"], wdl, v_ok)
                         loss = (p_loss + value_weight * v_loss) / accum
                     # Search-value-head aux: learn the backed-up best-child scalar
                     # against the game-result scalar (Stockfish-style retrogression).
                     if "searched_value" in out:
                         # wdl is a (B, 3) probability distribution.
                         scalar_t = wdl[:, 0] - wdl[:, 2]
-                        sv_loss = F.mse_loss(out["searched_value"], scalar_t)
+                        if v_ok is None:
+                            sv_loss = F.mse_loss(out["searched_value"], scalar_t)
+                        elif float(v_ok.sum()) > 0:
+                            m = v_ok.bool()
+                            sv_loss = F.mse_loss(out["searched_value"][m], scalar_t[m])
+                        else:
+                            sv_loss = out["value_logits"].new_zeros(())
                         loss = loss + 0.1 * sv_loss
                     loss.backward()
                 elif smoke:
@@ -955,20 +1030,30 @@ def train_trial(
                 raw_m = model._orig_mod if hasattr(model, "_orig_mod") else model
                 val_n = int(train.get("val_eval_n", 256) or 256)
                 val_mb = int(train.get("val_microbatch", bs) or bs)
-                if val_soft_idx is not None and val_soft_idx.numel():
-                    take = val_soft_idx[torch.arange(min(val_n, int(val_soft_idx.numel())))]
-                    metrics = cheap_eval_losses(
-                        raw_m, soft_data, take, device,
-                        soft_temp=soft_temp or 4.0, microbatch=val_mb,
-                    )
-                    _log(log_path, "val/soft " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-                if val_deep_idx is not None and val_deep_idx.numel() and deep_data is not None:
-                    take = val_deep_idx[torch.arange(min(val_n, int(val_deep_idx.numel())))]
-                    metrics = cheap_eval_losses(
-                        raw_m, deep_data, take, device,
-                        soft_temp=soft_temp or 4.0, microbatch=val_mb,
-                    )
-                    _log(log_path, "val/deep " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                if ext_eval_data:
+                    for ev_name, ev_data in ext_eval_data.items():
+                        n_ev = int(ev_data["board_array"].shape[0])
+                        take = torch.arange(min(val_n, n_ev), dtype=torch.int64)
+                        metrics = cheap_eval_losses(
+                            raw_m, ev_data, take, device,
+                            soft_temp=soft_temp or 4.0, microbatch=val_mb,
+                        )
+                        _log(log_path, f"val/{ev_name} " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                else:
+                    if val_soft_idx is not None and val_soft_idx.numel():
+                        take = val_soft_idx[torch.arange(min(val_n, int(val_soft_idx.numel())))]
+                        metrics = cheap_eval_losses(
+                            raw_m, soft_data, take, device,
+                            soft_temp=soft_temp or 4.0, microbatch=val_mb,
+                        )
+                        _log(log_path, "val/soft " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+                    if val_deep_idx is not None and val_deep_idx.numel() and deep_data is not None:
+                        take = val_deep_idx[torch.arange(min(val_n, int(val_deep_idx.numel())))]
+                        metrics = cheap_eval_losses(
+                            raw_m, deep_data, take, device,
+                            soft_temp=soft_temp or 4.0, microbatch=val_mb,
+                        )
+                        _log(log_path, "val/deep " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
                 if legal_every > 0 and step % legal_every == 0 and val_soft_idx is not None:
                     take = val_soft_idx[torch.arange(min(48, int(val_soft_idx.numel())))]
                     diag = legal_policy_diagnostics(raw_m, soft_data, take, device)

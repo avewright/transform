@@ -20,11 +20,14 @@ STEP_RE = re.compile(
     r"\[(\d{2}:\d{2}:\d{2})\] step (\d+)/(\d+) \| loss=([-\d.]+|nan|inf)"
     r".*? ([\d.]+) pos/s(?: \| vram=([\d.]+)GB)?"
 )
-MIX_RE = re.compile(r"mix s/d=(\d+)/(\d+)")
+MIX_RE = re.compile(r"mix s/d(?:/b)?=(\d+)/(\d+)(?:/(\d+))?")
 VAL_RE = re.compile(
     r"\[(\d{2}:\d{2}:\d{2})\] val/(soft|deep) hard_ce=([-\d.]+) "
     r"soft_ce=([-\d.]+) soft_temp_ce=([-\d.]+) wdl_ce=([-\d.]+)"
+    r"(?: teacher_entropy=([-\d.]+) teacher_kl=([-\d.]+))?"
 )
+ELO_RE = re.compile(r"elo@(\d+) estimate=([-\d.]+|None) rc=(\d+)")
+WARM_RE = re.compile(r"WEIGHTS-ONLY WARM START \S+ steps=(\d+)")
 DISJOINT_RE = re.compile(
     r"disjoint (shard_\d+): in=([\d,]+) out=([\d,]+) "
     r"internal_dups=(\d+) vs_prior=(\d+)"
@@ -57,6 +60,7 @@ def parse_log(path: Path) -> dict:
         return {"steps": [], "vals": [], "data": {}, "log": str(path)}
     steps: list[dict] = []
     vals: list[dict] = []
+    elos: list[dict] = []
     shards: list[dict] = []
     data: dict = {"phase": "idle"}
     for line in path.read_text(errors="replace").splitlines():
@@ -81,6 +85,7 @@ def parse_log(path: Path) -> dict:
             if mx:
                 rec["mix_s"] = int(mx.group(1))
                 rec["mix_d"] = int(mx.group(2))
+                rec["mix_b"] = int(mx.group(3)) if mx.group(3) else 0
             steps.append(rec)
             data["phase"] = "training"
             data["total"] = rec["total"]
@@ -95,13 +100,20 @@ def parse_log(path: Path) -> dict:
                     "soft_ce": float(vm.group(4)),
                     "soft_temp_ce": float(vm.group(5)),
                     "wdl_ce": float(vm.group(6)),
+                    "teacher_entropy": float(vm.group(7)) if vm.group(7) else None,
+                    "teacher_kl": float(vm.group(8)) if vm.group(8) else None,
                     "step": steps[-1]["step"] if steps else None,
                 }
             )
             continue
+        em = ELO_RE.search(line)
+        if em:
+            est = None if em.group(2) == "None" else float(em.group(2))
+            elos.append({"step": int(em.group(1)), "elo": est, "rc": int(em.group(3))})
+            continue
         if "FULL RESUME" in line or "WEIGHTS-ONLY WARM START" in line:
             shards = []
-            rm = RESUME_RE.search(line)
+            rm = RESUME_RE.search(line) or WARM_RE.search(line)
             data["resume_step"] = int(rm.group(1)) if rm else data.get("resume_step")
             data["phase"] = "starting"
             continue
@@ -176,9 +188,30 @@ def parse_log(path: Path) -> dict:
     data["disjoint"] = bool(shards) and vs_prior == 0
     data["vs_prior_total"] = vs_prior
     last = steps[-1] if steps else None
+    hist = path.parent / "elo_gauntlet.jsonl"
+    if hist.exists():
+        for line in hist.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            step = row.get("step")
+            if step is None:
+                continue
+            if any(e["step"] == step for e in elos):
+                continue
+            est = row.get("elo")
+            if est is None:
+                est = (row.get("estimate") or {}).get("estimated_elo")
+            elos.append({"step": int(step), "elo": est, "rc": row.get("rc")})
+    elos.sort(key=lambda e: e["step"])
     return {
         "steps": steps,
         "vals": vals,
+        "elos": elos,
         "data": data,
         "total": (last or {}).get("total") or data.get("total") or 0,
         "log": str(path),
@@ -230,6 +263,9 @@ HTML = """<!DOCTYPE html>
 <div class="grid two">
   <div class="card"><h2>Loss vs step</h2><canvas id="loss"></canvas></div>
   <div class="card"><h2>Throughput (pos/s)</h2><canvas id="speed"></canvas></div>
+</div>
+<div class="grid">
+  <div class="card"><h2>Elo gauntlet (UCI_Elo)</h2><canvas id="elo"></canvas></div>
 </div>
 <script>
 const charts = {};
@@ -292,13 +328,16 @@ async function refresh(){
     ['pos/s', last ? last.pos_s.toFixed(0) : '—'],
     ['VRAM', last && last.vram ? last.vram.toFixed(2)+' GB' : '—'],
     ['Val soft / deep', (lastSoft?lastSoft.hard_ce.toFixed(3):'—')+' / '+(lastDeep?lastDeep.hard_ce.toFixed(3):'—')],
+    ['Teacher KL', lastSoft && lastSoft.teacher_kl!=null ? lastSoft.teacher_kl.toFixed(3) : '—'],
+    ['Elo', (d.elos||[]).at(-1)?.elo!=null ? Number((d.elos||[]).at(-1).elo).toFixed(0) : '—'],
     ['Mix', mix],
     ['SWA n', fmt(info.swa_n)],
   ].map(([k,v])=>stat(k,v)).join('');
   const shards = info.shards || [];
   const badge = info.disjoint
     ? '<span class="badge ok">disjoint · vs_prior=0</span>'
-    : (shards.length ? '<span class="badge bad">overlap vs_prior='+info.vs_prior_total+'</span>' : '<span class="badge bad">no attach parsed</span>');
+    : (shards.length ? '<span class="badge bad">overlap vs_prior='+info.vs_prior_total+'</span>'
+      : (info.soft_train ? '<span class="badge ok">saved split</span>' : '<span class="badge bad">no attach parsed</span>'));
   const ids = shards.map(s=>s.name.replace('shard_',''));
   const names = ids.length ? (ids[0]+'–'+ids[ids.length-1]) : '';
   const rows = shards.map(s=>`<tr><td>${s.name}</td><td>${fmt(s.n_in)}</td><td>${fmt(s.n_out)}</td><td>${fmt(s.internal_dups)}</td><td>${s.vs_prior}</td></tr>`).join('');
@@ -329,10 +368,20 @@ async function refresh(){
   upsert('speed', L, [line('pos/s', S.map(s=>s.pos_s), '#c58af9')], 'pos/s');
   const softV = vals.filter(v=>v.split==='soft' && v.step!=null);
   const deepV = vals.filter(v=>v.split==='deep' && v.step!=null);
-  upsert('val', softV.map(v=>v.step), [
+  const valSets = [
     line('soft hard CE', softV.map(v=>v.hard_ce), '#8ab4f8', {pointRadius:2}),
     line('deep hard CE', deepV.map(v=>v.hard_ce), '#f9ab00', {pointRadius:2}),
-  ], 'hard CE');
+  ];
+  if(softV.some(v=>v.teacher_kl!=null)){
+    valSets.push(line('teacher KL', softV.map(v=>v.teacher_kl), '#81c995', {pointRadius:2}));
+  }
+  upsert('val', softV.map(v=>v.step), valSets, 'hard CE / KL');
+  const elos = d.elos || [];
+  if(elos.length){
+    upsert('elo', elos.map(e=>e.step), [
+      line('UCI_Elo', elos.map(e=>e.elo), '#fdd663', {pointRadius:4}),
+    ], 'Elo');
+  }
 }
 refresh();
 setInterval(refresh, 10000);

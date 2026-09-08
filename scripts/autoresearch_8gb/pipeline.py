@@ -196,6 +196,9 @@ def list_attached_shards(queue_dir: Path) -> list[Path]:
     return found
 
 
+PUZZLE_SOURCE = 5
+
+
 def attach_static_targets(data: dict) -> dict:
     """Precompute WDL and ep_file so the train loop does not redo them."""
     from data_loader import compute_wdl, ep_square_to_file
@@ -204,7 +207,59 @@ def attach_static_targets(data: dict) -> dict:
         data["wdl"] = compute_wdl(data["cp"], data["mate"])
     if "ep_file" not in data:
         data["ep_file"] = ep_square_to_file(data["ep_square"]).to(torch.int8)
+    if "value_valid" not in data:
+        n = int(data["board_array"].shape[0])
+        if "source" in data:
+            data["value_valid"] = (data["source"] != PUZZLE_SOURCE).to(torch.int8)
+        else:
+            data["value_valid"] = torch.ones(n, dtype=torch.int8)
     return data
+
+
+def value_valid_rows(data: dict, indices: torch.Tensor) -> torch.Tensor | None:
+    """1 = use the value target; 0 = policy-only (puzzles). None = all valid."""
+    if "value_valid" in data:
+        return data["value_valid"][indices]
+    if "source" in data:
+        return (data["source"][indices] != PUZZLE_SOURCE).to(torch.int8)
+    return None
+
+
+def masked_mean_ce(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor | None):
+    """Mean CE over valid rows. All-invalid batches contribute 0, not invented value."""
+    ce = F.cross_entropy(logits, target, reduction="none")
+    if valid is None:
+        return ce.mean()
+    w = valid.to(dtype=ce.dtype).reshape(-1)
+    if float(w.sum()) <= 0:
+        return ce.new_zeros(())
+    return (ce * w).sum() / w.sum()
+
+
+def load_blocked_hashes(paths: list[Path]) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    for raw in paths:
+        p = Path(raw)
+        if not p.exists():
+            continue
+        man = json.loads(p.read_text(encoding="utf-8"))
+        vals = man.get("blocked_hashes") or man.get("hashes") or []
+        if vals:
+            chunks.append(np.asarray(vals, dtype=np.uint64))
+    if not chunks:
+        return np.zeros(0, dtype=np.uint64)
+    return np.unique(np.concatenate(chunks))
+
+
+def drop_blocked_rows(data: dict, blocked: np.ndarray) -> tuple[dict, int]:
+    if blocked is None or blocked.size == 0:
+        return data, 0
+    hs = position_hashes(data)
+    keep = ~np.isin(hs, blocked)
+    n_drop = int((~keep).sum())
+    if n_drop == 0:
+        return data, 0
+    return {k: (v[keep] if torch.is_tensor(v) else v) for k, v in data.items()}, n_drop
 
 
 def _hflip_soft_indices(soft_i: torch.Tensor, flip_mask: torch.Tensor) -> torch.Tensor:

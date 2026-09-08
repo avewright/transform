@@ -253,8 +253,10 @@ def train(args: argparse.Namespace) -> dict:
         trial["train"]["max_batch_size"] = int(args.batch_size)
     if args.optimizer is not None:
         trial["train"]["optimizer"] = str(args.optimizer)
-        trial["train"]["compile_polar"] = False
-        trial["train"]["torch_compile"] = False
+    if args.torch_compile is not None:
+        trial["train"]["torch_compile"] = bool(args.torch_compile)
+    if args.compile_polar is not None:
+        trial["train"]["compile_polar"] = bool(args.compile_polar)
     if args.force_lr:
         trial["train"]["force_lr"] = True
     if args.bonus_mix_frac is not None:
@@ -271,6 +273,20 @@ def train(args: argparse.Namespace) -> dict:
         trial["train"]["val_every_steps"] = int(args.val_every)
     if args.warmup is not None:
         trial["train"]["warmup"] = int(args.warmup)
+    if args.elo_every is not None:
+        trial["train"]["elo_every_steps"] = int(args.elo_every)
+    if args.save_every is not None:
+        trial["train"]["save_every_steps"] = int(args.save_every)
+    if args.external_eval:
+        spec = {}
+        for item in args.external_eval:
+            if "=" not in item:
+                raise SystemExit(f"--external-eval needs NAME=PATH, got {item}")
+            name, path = item.split("=", 1)
+            spec[name] = str(Path(path).resolve())
+        trial["train"]["external_eval"] = spec
+    if args.block_manifest:
+        trial["train"]["block_manifests"] = [str(Path(p).resolve()) for p in args.block_manifest]
     bonus = Path(args.bonus_cache) if args.bonus_cache else None
     if bonus is not None and not bonus.exists():
         raise SystemExit(f"bonus cache missing: {bonus}")
@@ -337,6 +353,18 @@ def main() -> None:
     )
     ap.add_argument("--batch-size", type=int, default=None, help="Override microbatch (disables fill_vram)")
     ap.add_argument("--optimizer", default=None, help="adamw | normuon | polar_normuon")
+    ap.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile the model (default: on in trial_config). --optimizer no longer forces this off.",
+    )
+    ap.add_argument(
+        "--compile-polar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile Polar Express (default: on). --optimizer no longer forces this off.",
+    )
     ap.add_argument("--muon-lr", type=float, default=None, help="Override Polar/NorMuon LR")
     ap.add_argument("--adam-lr", type=float, default=None, help="Override AdamW aux LR")
     ap.add_argument(
@@ -386,6 +414,30 @@ def main() -> None:
         help="Validation period in steps (default 500).",
     )
     ap.add_argument("--warmup", type=int, default=None, help="Override warmup steps")
+    ap.add_argument(
+        "--elo-every",
+        type=int,
+        default=None,
+        help="Stockfish UCI_Elo gauntlet period in steps (0 disables).",
+    )
+    ap.add_argument(
+        "--save-every",
+        type=int,
+        default=None,
+        help="Checkpoint period in steps (default 250).",
+    )
+    ap.add_argument(
+        "--external-eval",
+        action="append",
+        default=[],
+        help="Shared holdout NAME=PATH. Repeatable. Val is not carved from the training mix.",
+    )
+    ap.add_argument(
+        "--block-manifest",
+        action="append",
+        default=[],
+        help="val_manifest_*.json whose blocked_hashes are excluded from training.",
+    )
     args = ap.parse_args()
     _assert_compact()
 
