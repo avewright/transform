@@ -133,7 +133,7 @@ def classify_lapse(*, best_cp: int, best_mate: int, model_cp: int, model_mate: i
     return {"tag": tag, "kind": "cp", "drop_cp": drop}
 
 
-def load_blocked_hashes() -> np.ndarray:
+def load_blocked_hashes(extra_manifests: list[str] | None = None) -> np.ndarray:
     """Overnight union of holdout hashes including flip-equivalents (20,961)."""
     paths = [
         OVERNIGHT / "val_manifest_soft.json",
@@ -141,7 +141,10 @@ def load_blocked_hashes() -> np.ndarray:
         OVERNIGHT / "val_manifest_replay.json",
         ROOT / "outputs/sf19_ft/run2/val_manifest_soft.json",
         ROOT / "outputs/sf19_ft/run2/val_manifest_deep.json",
+        ROOT / "outputs/overnight_corr15/blocked_manifest.json",
     ]
+    for extra in extra_manifests or []:
+        paths.append(Path(extra))
     chunks = []
     for p in paths:
         if not p.exists():
@@ -172,8 +175,17 @@ def load_blocked_hashes() -> np.ndarray:
     return np.unique(np.concatenate(parts))
 
 
-def list_scan_caches() -> list[tuple[Path, bool, str]]:
+def list_scan_caches(extra: list[str] | None = None) -> list[tuple[Path, bool, str]]:
     out: list[tuple[Path, bool, str]] = []
+    if extra:
+        for item in extra:
+            name, path = item.split("=", 1)
+            p = Path(path)
+            if not p.exists():
+                raise SystemExit(f"scan cache missing: {p}")
+            white_abs = name.startswith("sf19") or "sf19" in name
+            out.append((p, white_abs, name))
+        return out
     soft = OVERNIGHT / "soft_cache.pt"
     replay = OVERNIGHT / "replay_cache.pt"
     deep = OVERNIGHT / "deep_cache.pt"
@@ -471,7 +483,7 @@ def run_scan(args) -> None:
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "harvest.log"
-    blocked = load_blocked_hashes()
+    blocked = load_blocked_hashes(args.block_manifest)
     log(f"blocked_hashes={blocked.size:,} ckpt={args.ckpt}", log_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -482,7 +494,7 @@ def run_scan(args) -> None:
         log("torch.compile ...", log_path)
         model = torch.compile(model)
 
-    caches = list_scan_caches()
+    caches = list_scan_caches(args.cache)
     cursor_path = out / "cursor.json"
     done = set()
     if cursor_path.exists():
@@ -842,6 +854,8 @@ def main() -> None:
     ap.add_argument("--analyze-limit", type=int, default=100_000)
     ap.add_argument("--watch", action="store_true")
     ap.add_argument("--poll-s", type=float, default=60.0)
+    ap.add_argument("--cache", action="append", default=[], help="NAME=PATH (replaces default overnight caches)")
+    ap.add_argument("--block-manifest", action="append", default=[], help="JSON with blocked_hashes")
     args = ap.parse_args()
     if args.self_test:
         self_test()

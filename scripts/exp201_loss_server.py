@@ -22,9 +22,11 @@ STEP_RE = re.compile(
 )
 MIX_RE = re.compile(r"mix s/d(?:/b)?=(\d+)/(\d+)(?:/(\d+))?")
 VAL_RE = re.compile(
-    r"\[(\d{2}:\d{2}:\d{2})\] val/(soft|deep) hard_ce=([-\d.]+) "
-    r"soft_ce=([-\d.]+) soft_temp_ce=([-\d.]+) wdl_ce=([-\d.]+)"
+    r"\[(\d{2}:\d{2}:\d{2})\] val/(\S+) hard_ce=([-\d.]+) "
+    r"soft_ce=([-\d.]+) soft_temp_ce=([-\d.]+)"
+    r"(?: wdl_ce=([-\d.]+))?"
     r"(?: teacher_entropy=([-\d.]+) teacher_kl=([-\d.]+))?"
+    r"(?: value_rows=([-\d.]+))?"
 )
 ELO_RE = re.compile(r"elo@(\d+) estimate=([-\d.]+|None) rc=(\d+)")
 WARM_RE = re.compile(r"WEIGHTS-ONLY WARM START \S+ steps=(\d+)")
@@ -86,7 +88,10 @@ def parse_log(path: Path) -> dict:
                 rec["mix_s"] = int(mx.group(1))
                 rec["mix_d"] = int(mx.group(2))
                 rec["mix_b"] = int(mx.group(3)) if mx.group(3) else 0
-            steps.append(rec)
+            if steps and steps[-1]["step"] == rec["step"]:
+                steps[-1] = rec
+            else:
+                steps.append(rec)
             data["phase"] = "training"
             data["total"] = rec["total"]
             continue
@@ -99,7 +104,7 @@ def parse_log(path: Path) -> dict:
                     "hard_ce": float(vm.group(3)),
                     "soft_ce": float(vm.group(4)),
                     "soft_temp_ce": float(vm.group(5)),
-                    "wdl_ce": float(vm.group(6)),
+                    "wdl_ce": float(vm.group(6)) if vm.group(6) else None,
                     "teacher_entropy": float(vm.group(7)) if vm.group(7) else None,
                     "teacher_kl": float(vm.group(8)) if vm.group(8) else None,
                     "step": steps[-1]["step"] if steps else None,
@@ -316,8 +321,8 @@ async function refresh(){
   const info = d.data || {};
   const total = d.total || (last && last.total) || 0;
   const vals = d.vals || [];
-  const lastSoft = [...vals].reverse().find(v=>v.split==='soft');
-  const lastDeep = [...vals].reverse().find(v=>v.split==='deep');
+  const lastSoft = [...vals].reverse().find(v=>v.split==='sf19' || v.split==='soft');
+  const lastDeep = [...vals].reverse().find(v=>v.split==='syzygy' || v.split==='deep');
   const mix = last && last.mix_s!=null ? (100*last.mix_d/(last.mix_s+last.mix_d)).toFixed(0)+'% deep' : (info.deep_mix!=null ? (100*info.deep_mix).toFixed(0)+'% deep' : '—');
   document.getElementById('stats').innerHTML = [
     ['Step', last ? last.step.toLocaleString()+' / '+Number(total).toLocaleString() : '— / '+fmt(total)],
@@ -327,7 +332,7 @@ async function refresh(){
     ['Recent min', lo!==null ? lo.toFixed(4) : '—'],
     ['pos/s', last ? last.pos_s.toFixed(0) : '—'],
     ['VRAM', last && last.vram ? last.vram.toFixed(2)+' GB' : '—'],
-    ['Val soft / deep', (lastSoft?lastSoft.hard_ce.toFixed(3):'—')+' / '+(lastDeep?lastDeep.hard_ce.toFixed(3):'—')],
+    ['Val sf19 / syzygy', (lastSoft?lastSoft.hard_ce.toFixed(3):'—')+' / '+(lastDeep?lastDeep.hard_ce.toFixed(3):'—')],
     ['Teacher KL', lastSoft && lastSoft.teacher_kl!=null ? lastSoft.teacher_kl.toFixed(3) : '—'],
     ['Elo', (d.elos||[]).at(-1)?.elo!=null ? Number((d.elos||[]).at(-1).elo).toFixed(0) : '—'],
     ['Mix', mix],
@@ -366,16 +371,17 @@ async function refresh(){
     line('EMA', ema(raw, 0.08), '#81c995'),
   ], 'loss');
   upsert('speed', L, [line('pos/s', S.map(s=>s.pos_s), '#c58af9')], 'pos/s');
-  const softV = vals.filter(v=>v.split==='soft' && v.step!=null);
-  const deepV = vals.filter(v=>v.split==='deep' && v.step!=null);
-  const valSets = [
-    line('soft hard CE', softV.map(v=>v.hard_ce), '#8ab4f8', {pointRadius:2}),
-    line('deep hard CE', deepV.map(v=>v.hard_ce), '#f9ab00', {pointRadius:2}),
-  ];
-  if(softV.some(v=>v.teacher_kl!=null)){
-    valSets.push(line('teacher KL', softV.map(v=>v.teacher_kl), '#81c995', {pointRadius:2}));
+  const colors = {sf19:'#8ab4f8', lichess:'#f9ab00', puzzles:'#c58af9', syzygy:'#81c995', soft:'#8ab4f8', deep:'#f9ab00'};
+  const splits = [...new Set(vals.map(v=>v.split))];
+  const valSets = splits.filter(s=>vals.some(v=>v.split===s && v.step!=null)).map(s =>
+    line(s+' hard CE', vals.filter(v=>v.split===s && v.step!=null).map(v=>v.hard_ce), colors[s]||'#e8eaed', {pointRadius:2})
+  );
+  const sf19V = vals.filter(v=>v.split==='sf19' && v.step!=null);
+  if(sf19V.some(v=>v.teacher_kl!=null)){
+    valSets.push(line('sf19 teacher KL', sf19V.map(v=>v.teacher_kl), '#81c995', {pointRadius:2, borderDash:[4,3]}));
   }
-  upsert('val', softV.map(v=>v.step), valSets, 'hard CE / KL');
+  const valLabels = (vals.find(v=>v.step!=null) ? vals.filter(v=>v.split===splits[0] && v.step!=null).map(v=>v.step) : []);
+  upsert('val', valLabels, valSets, 'hard CE / KL');
   const elos = d.elos || [];
   if(elos.length){
     upsert('elo', elos.map(e=>e.step), [

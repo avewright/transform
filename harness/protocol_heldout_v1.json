@@ -1,0 +1,33 @@
+{
+  "name": "maxelo_policy_heldout_v1",
+  "mode": "policy",
+  "book": false,
+  "syzygy": false,
+  "movetime": 0.05,
+  "ply_cap": 160,
+  "games_per_opening_per_color": 2,
+  "stop_after_bracket": false,
+  "threads": 1,
+  "hash": 32,
+  "elos": [2050, 2200],
+  "openings": [
+    ["e2e4", "c7c6"],
+    ["e2e4", "g8f6"],
+    ["e2e4", "d7d5"],
+    ["e2e4", "g7g6"],
+    ["e2e4", "d7d6"],
+    ["d2d4", "f7f5"],
+    ["d2d4", "e7e6"],
+    ["d2d4", "c7c5"],
+    ["c2c4", "c7c5"],
+    ["c2c4", "e7e6"],
+    ["c2c4", "g8f6"],
+    ["g1f3", "g8f6"],
+    ["g1f3", "c7c5"],
+    ["b2b3"],
+    ["g2g3"],
+    ["f2f4"]
+  ],
+  "vocab": "compact",
+  "notes": "Held-out screen. None of these UCI sequences appear in the cached 8-opening 2050/2200 reference. Same engine settings as maxelo_policy_v1. 16 openings x 2 colors x 2 repeats x 2 Elos = 128 games. Cached incumbent results cannot be reused here."
+}

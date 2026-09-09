@@ -49,6 +49,15 @@ from move_vocab import UCI_TO_IDX, index_to_move, legal_move_mask  # noqa: E402
 
 SOFT_K = 8
 SOURCE_HARVEST = 3
+TAG_TO_I = {
+    "ok": 0,
+    "off_pv": 1,
+    "inaccuracy": 2,
+    "blunder": 3,
+    "conversion": 4,
+    "major": 5,
+    "disagree": 6,
+}
 OPENINGS = [
     [],
     ["e2e4", "e7e5"],
@@ -465,7 +474,7 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
              nodes, movetime, tau, ply_cap, sf_movetime, unlimited_opp,
              explore_epsilon=0.0, explore_temperature=0.8, explore_top_k=4,
              explore_plies=40, explore_seed=0, screen_nodes=0, start_fen="",
-             book_noise_plies=0, play_nodes=0):
+             book_noise_plies=0, play_nodes=0, confirm_drop=0):
     explore_rng = random.Random(explore_seed)
     board = chess.Board(start_fen) if start_fen else chess.Board()
     if not start_fen:
@@ -526,6 +535,21 @@ def play_one(model, device, opp, teacher, *, model_color, opening, opp_label,
                     board.push(played_mv)
                     continue
                 meta["n_screen_disagree"] = meta.get("n_screen_disagree", 0) + 1
+                if int(confirm_drop) > 0:
+                    cheap = eval_move_score(
+                        teacher, board, mv, nodes=int(screen_nodes), movetime=0.0, retries=1,
+                    )
+                    if cheap is not None:
+                        cheap_cp, cheap_mate = cheap
+                        best_mate = int(screen.get("best_mate") or 0)
+                        mate_risk = (best_mate > 0 and cheap_mate <= 0) or (
+                            cheap_mate < 0 and best_mate >= 0
+                        )
+                        drop = int(screen["best_cp"]) - int(cheap_cp)
+                        if not mate_risk and drop < int(confirm_drop):
+                            meta["n_screen_small"] = meta.get("n_screen_small", 0) + 1
+                            board.push(played_mv)
+                            continue
             soft = analyze_multipv(teacher, board, nodes=nodes, movetime=movetime, tau=tau)
             if soft is None:
                 meta["n_analyze_fail"] += 1
@@ -618,7 +642,7 @@ MISTAKE_TAGS = frozenset({"major", "blunder", "inaccuracy", "conversion"})
 
 
 def rows_to_data(rows: list[dict]) -> dict:
-    return {
+    out = {
         "board_array": torch.from_numpy(np.stack([r["board_array"] for r in rows])),
         "turn": torch.tensor([r["turn"] for r in rows], dtype=torch.int8),
         "castling": torch.tensor([r["castling"] for r in rows], dtype=torch.int8),
@@ -632,6 +656,10 @@ def rows_to_data(rows: list[dict]) -> dict:
         "phase": torch.tensor([r["phase"] for r in rows], dtype=torch.int8),
         "source": torch.tensor([r["source"] for r in rows], dtype=torch.int8),
     }
+    if rows and "tag" in rows[0]:
+        out["tag"] = torch.tensor([int(r.get("tag", 6)) for r in rows], dtype=torch.int8)
+        out["drop_cp"] = torch.tensor([int(r.get("drop_cp", 0)) for r in rows], dtype=torch.int32)
+    return out
 
 
 def pack_cache(rows: list[dict], out_pt: Path) -> int:
@@ -643,6 +671,54 @@ def pack_cache(rows: list[dict], out_pt: Path) -> int:
     torch.save(data, tmp)
     os.replace(tmp, out_pt)
     return len(rows)
+
+
+def write_dataset(rows: list[dict], audit: list[dict], out_dir: Path, seen_h: np.ndarray | None) -> None:
+    """Unique tagged mistakes: dataset.pt + dataset.parquet + seen_hashes.npy."""
+    if not rows:
+        return
+    pack_cache(rows, out_dir / "dataset.pt")
+    data = rows_to_data(rows)
+    n = int(data["turn"].shape[0])
+    cols = {
+        "turn": np.asarray(data["turn"], dtype=np.int8),
+        "castling": np.asarray(data["castling"], dtype=np.int8),
+        "ep_square": np.asarray(data["ep_square"], dtype=np.int8),
+        "move_idx": np.asarray(data["move_idx"], dtype=np.int64),
+        "cp": np.asarray(data["cp"], dtype=np.int32),
+        "mate": np.asarray(data["mate"], dtype=np.int32),
+        "label_depth": np.asarray(data["label_depth"], dtype=np.int16),
+        "phase": np.asarray(data["phase"], dtype=np.int8),
+        "source": np.asarray(data["source"], dtype=np.int8),
+    }
+    if "tag" in data:
+        cols["tag"] = np.asarray(data["tag"], dtype=np.int8)
+        cols["drop_cp"] = np.asarray(data["drop_cp"], dtype=np.int32)
+    elif audit:
+        cols["tag"] = np.array([TAG_TO_I.get(a.get("tag", "disagree"), 6) for a in audit], dtype=np.int8)
+        cols["drop_cp"] = np.array([int(a.get("drop") or 0) for a in audit], dtype=np.int32)
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from export_soft_caches_to_hf import _fixed_list
+
+        table = pa.table({
+            **{k: pa.array(v) for k, v in cols.items()},
+            "board_array": _fixed_list(np.asarray(data["board_array"], dtype=np.int8), pa.int8(), 64),
+            "soft_indices": _fixed_list(np.asarray(data["soft_indices"], dtype=np.int64), pa.int64(), 8),
+            "soft_probs": _fixed_list(np.asarray(data["soft_probs"], dtype=np.float32), pa.float32(), 8),
+            "tag_name": pa.array(
+                [{v: k for k, v in TAG_TO_I.items()}.get(int(t), "unknown") for t in cols.get("tag", np.zeros(n))],
+            ),
+        })
+        pq.write_table(table, out_dir / "dataset.parquet")
+    except Exception as exc:
+        log(f"dataset.parquet skip: {exc}")
+    if seen_h is not None and getattr(seen_h, "size", 0):
+        np.save(out_dir / "seen_hashes.npy", seen_h.astype(np.uint64, copy=False))
+    (out_dir / "lapses.jsonl").write_text(
+        "".join(json.dumps(a) + "\n" for a in audit), encoding="utf-8",
+    )
 
 
 def next_inbox_shard(inbox: Path) -> Path:
@@ -785,6 +861,7 @@ def _worker_game(spec_and_cfg: tuple) -> dict:
             start_fen=str(spec.get("start_fen") or ""),
             book_noise_plies=int(spec.get("book_noise_plies", 0) or 0),
             play_nodes=int(cfg.get("play_nodes", 0) or 0),
+            confirm_drop=int(cfg.get("confirm_drop", 0) or 0),
         )
     finally:
         if not reuse:
@@ -815,6 +892,8 @@ def _worker_game(spec_and_cfg: tuple) -> dict:
         if key in seen:
             continue
         seen.add(key)
+        r["tag"] = int(TAG_TO_I.get(tag, 6))
+        r["drop_cp"] = int(drop_cp) if drop_cp is not None else 0
         rows.append(r)
         audit.append({
             "fen": fen,
@@ -891,6 +970,12 @@ def main() -> None:
         help="Cheap MultiPV=1 gate before deep labels. 0 = label every model ply (old path).",
     )
     ap.add_argument(
+        "--confirm-drop",
+        type=int,
+        default=0,
+        help="After a screen disagree, 8k-score the model move and skip 80k MultiPV if drop < this. 0 = off.",
+    )
+    ap.add_argument(
         "--seed-cache",
         default=None,
         help="soft_cache.pt to start a fraction of games from (mid/end diversity).",
@@ -939,6 +1024,18 @@ def main() -> None:
         nargs="*",
         default=None,
         help="Directories to scan for soft_cache.pt files to exclude (no dups).",
+    )
+    ap.add_argument(
+        "--exclude-hashes",
+        nargs="*",
+        default=None,
+        help="uint64 .npy hash lists already harvested (unique-position deny list).",
+    )
+    ap.add_argument(
+        "--block-manifest",
+        nargs="*",
+        default=None,
+        help="JSON manifests with blocked_hashes / hashes (holdouts).",
     )
     ap.add_argument(
         "--book-noise-plies",
@@ -1010,11 +1107,32 @@ def main() -> None:
         "explore_plies": args.explore_plies,
         "screen_nodes": args.screen_nodes,
         "play_nodes": args.play_nodes,
+        "confirm_drop": args.confirm_drop,
     }
 
     from autoresearch_8gb.pipeline import load_position_hashes
 
     seen_h = None
+    for hp in args.exclude_hashes or []:
+        p = Path(hp)
+        if not p.exists():
+            raise SystemExit(f"exclude-hashes missing: {p}")
+        extra = np.load(p).astype(np.uint64, copy=False)
+        seen_h = extra if seen_h is None else np.unique(
+            np.concatenate([seen_h.astype(np.uint64, copy=False), extra])
+        )
+        log(f"exclude hashes {p} n={int(extra.size):,} total={int(seen_h.size):,}", log_path)
+    try:
+        from harvest_swa_mistakes import load_blocked_hashes
+        blocked = load_blocked_hashes(list(args.block_manifest or []))
+        if blocked.size:
+            seen_h = blocked if seen_h is None else np.unique(
+                np.concatenate([seen_h.astype(np.uint64, copy=False), blocked.astype(np.uint64, copy=False)])
+            )
+            log(f"exclude blocked holdouts n={int(blocked.size):,} total={int(seen_h.size):,}", log_path)
+    except SystemExit:
+        if args.block_manifest:
+            raise
     exclude_pts = _iter_cache_pts(list(args.exclude_cache or []) + list(args.exclude_dir or []))
     if exclude_pts:
         log(f"loading exclude caches={len(exclude_pts)}", log_path)
@@ -1145,6 +1263,9 @@ def main() -> None:
                 f"dups={stats['internal_dups']} vs_seen={stats['vs_seen']} total={n_inbox}",
                 log_path,
             )
+        mistakes_only = [r for r, a in zip(rows, audit_all) if a.get("tag") in MISTAKE_TAGS]
+        mistakes_audit = [a for a in audit_all if a.get("tag") in MISTAKE_TAGS]
+        write_dataset(mistakes_only, mistakes_audit, out, seen_h)
 
     def _absorb_holdout(new_rows: list[dict]) -> None:
         nonlocal seen_h
@@ -1314,6 +1435,12 @@ def main() -> None:
         "uniq_per_min": round(n_inbox / max((time.time() - t0) / 60.0, 1e-6), 2),
     }
     (out / "report.json").write_text(json.dumps(report, indent=2))
+    write_dataset(
+        [r for r, a in zip(rows, audit_all) if a.get("tag") in MISTAKE_TAGS],
+        [a for a in audit_all if a.get("tag") in MISTAKE_TAGS],
+        out,
+        seen_h,
+    )
     if not args.loop:
         (out / "DONE").write_text(json.dumps(report, indent=2))
     log(f"DONE {json.dumps(report)}", log_path)
