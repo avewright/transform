@@ -653,6 +653,7 @@ def cheap_eval_losses(
         "teacher_kl": 0.0,
     }
     n = 0
+    value_n = 0
     for start in range(0, int(idx.numel()), mb):
         take = idx[start:start + mb]
         bi, hard, wdl, si, sp = prepare_soft_batch(data, take, device, hflip_p=0.0)
@@ -663,14 +664,25 @@ def cheap_eval_losses(
         acc["soft_temp_ce"] += w * float(
             soft_temp_policy_loss(out["policy_logits"], si, sp, temperature=soft_temp).item()
         )
-        acc["wdl_ce"] += w * float(F.cross_entropy(out["value_logits"].float(), wdl).item())
+        value_ok = value_valid_rows(data, take)
+        value_ok = (torch.ones(len(take), device=device, dtype=torch.bool) if value_ok is None
+                    else value_ok.to(device=device, dtype=torch.bool))
+        count = int(value_ok.sum())
+        if count:
+            acc["wdl_ce"] += count * float(F.cross_entropy(
+                out["value_logits"][value_ok].float(), wdl[value_ok]).item())
+            value_n += count
         acc["teacher_entropy"] += w * float(teacher_entropy(si, sp).item())
         acc["teacher_kl"] += w * float(teacher_kl(out["policy_logits"], si, sp).item())
         n += w
         del bi, hard, wdl, si, sp, out
     if n <= 0:
         return {}
-    return {k: v / n for k, v in acc.items()}
+    result = {k: v / n for k, v in acc.items() if k != "wdl_ce"}
+    if value_n:
+        result["wdl_ce"] = acc["wdl_ce"] / value_n
+    result["value_rows"] = float(value_n)
+    return result
 
 
 @torch.no_grad()

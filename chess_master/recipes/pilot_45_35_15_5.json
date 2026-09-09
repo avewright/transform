@@ -1,0 +1,58 @@
+{
+  "name": "pilot_45_35_15_5",
+  "dataset_version": "chess_master_v1",
+  "role": "baseline",
+  "note": "Reproduces the frozen organized_chess_v1 mix. Not an optimal mix.",
+  "seed": 20260908,
+  "output_size": 1000000,
+  "eval_rows_per_source": 1000,
+  "membership_pool": "organized_chess_v1",
+  "sources": ["sf19", "lichess", "puzzles", "syzygy"],
+  "annotation_types": {
+    "sf19": ["engine_policy"],
+    "lichess": ["engine_policy"],
+    "puzzles": ["puzzle_solution"],
+    "syzygy": ["tablebase"]
+  },
+  "weights": {
+    "sf19": 0.45,
+    "lichess": 0.35,
+    "puzzles": 0.15,
+    "syzygy": 0.05
+  },
+  "overlap_policy": "exclusive_source_bucket",
+  "quality": {
+    "sf19": {"min_nodes_budget": 100000, "min_depth": 12, "require_policy_mask": true, "exclude_upstream_holdout": true},
+    "lichess": {"min_depth": 22, "max_depth": 127},
+    "puzzles": {"min_rating": 600, "max_rating": 3500},
+    "syzygy": {"tb_wdl_values": [-2, -1, 0, 1, 2], "max_abs_dtz": 1000}
+  },
+  "quality_relaxation": "never",
+  "quota_mode": {
+    "phase": "prefer",
+    "phase_frac": {"0": 0.22, "1": 0.50, "2": 0.28},
+    "puzzle_rating_buckets": "prefer_equal"
+  },
+  "teacher_selection": "source_primary",
+  "verified_correction_share": 0.0,
+  "repeat_exposure_limit": null,
+  "split_exclusions": ["organized_chess_v1:eval", "prior_holdouts"],
+  "policy_eligible": {
+    "sf19": true,
+    "lichess": true,
+    "puzzles": true,
+    "syzygy": true
+  },
+  "value_eligible": {
+    "sf19": true,
+    "lichess": false,
+    "puzzles": false,
+    "syzygy": false
+  },
+  "trainer": {
+    "deep_mix_frac": 0.05,
+    "bonus_mix_frac": 0,
+    "soft_cache": "soft_cache.pt",
+    "deep_cache": "deep_cache.pt"
+  }
+}
