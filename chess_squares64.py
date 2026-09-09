@@ -86,6 +86,23 @@ class Squares64RecurrentConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def validate(self) -> None:
+        """Head / kernel compatibility. Width scaling is not a free lunch."""
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_dim={self.hidden_dim} must be divisible by "
+                f"num_heads={self.num_heads}"
+            )
+        if self.hidden_dim % 8 != 0:
+            raise ValueError(
+                f"hidden_dim={self.hidden_dim} must be divisible by 8 "
+                "(Polar / attention kernels)"
+            )
+        if self.encoder_dim < 1 or self.policy_head_dim < 1 or self.value_hidden < 1:
+            raise ValueError("embed / head dims must be positive")
+        if self.recurrent_unrolls < 1:
+            raise ValueError("recurrent_unrolls must be >= 1")
+
     @classmethod
     def from_json(cls, path: str | Path) -> "Squares64RecurrentConfig":
         import json
@@ -93,7 +110,9 @@ class Squares64RecurrentConfig:
             data = json.load(f)
         model = data.get("model", data)
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in model.items() if k in known})
+        cfg = cls(**{k: v for k, v in model.items() if k in known})
+        cfg.validate()
+        return cfg
 
 
 # ~100M params @ compact vocab (verify with count_parameters).
@@ -101,6 +120,17 @@ class Squares64RecurrentConfig:
 DEFAULT_100M_SQUARES64_CONFIG = Squares64RecurrentConfig(
     hidden_dim=736,
     num_heads=8,
+)
+
+# Width-only scale of the 99M incumbent. Same prefix/bank/suffix, 3 unrolls,
+# compact 1968 vocab, squares-only attention. 1216d / 16H is the closest
+# 16-head width to 270M (measured 268,552,344). 8H at the same width is
+# 268,554,624 — head count barely moves params under QK-norm MHA.
+# Do not silently copy 99M weights into this config.
+EXPECTED_270M_PARAMS = 268_552_344
+DEFAULT_270M_SQUARES64_CONFIG = Squares64RecurrentConfig(
+    hidden_dim=1216,
+    num_heads=16,
 )
 
 
@@ -155,6 +185,7 @@ class Squares64RecurrentTransformer(nn.Module):
 
     def __init__(self, config: Squares64RecurrentConfig = DEFAULT_100M_SQUARES64_CONFIG):
         super().__init__()
+        config.validate()
         self.config = config
         self.encoder = Squares64Encoder(config.encoder_dim)
         self.input_proj = nn.Linear(config.encoder_dim, config.hidden_dim)
@@ -255,4 +286,5 @@ def build_squares64(
     else:
         known = {f.name for f in Squares64RecurrentConfig.__dataclass_fields__.values()}
         cfg = Squares64RecurrentConfig(**{k: v for k, v in config.items() if k in known})
+    cfg.validate()
     return Squares64RecurrentTransformer(cfg)

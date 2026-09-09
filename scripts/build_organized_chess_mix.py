@@ -632,7 +632,7 @@ def build(args) -> dict:
         save_progress(out, completed, seen)
         json_write(out / "manifest.json", manifest)
 
-    soft_names = ("sf19", "lichess", "puzzles")
+    soft_names = tuple(n for n in ("sf19", "lichess", "puzzles") if n in source_train)
     keys = [k for k in source_train["sf19"] if all(k in source_train[n] for n in soft_names)]
     soft = squeeze_scalars({k: torch.cat([source_train[n][k] for n in soft_names]) for k in keys})
     torch.save(soft, out / "soft_cache.pt")

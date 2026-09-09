@@ -1,0 +1,47 @@
+{
+  "name": "exp270_75_20_5",
+  "dataset_version": "exp270_pretrain_v1",
+  "role": "first_capacity_pretrain",
+  "note": "75% SF19 / 20% deep Lichess MultiPV / 5% Syzygy. No puzzles, no correction bonus, no live ingest.",
+  "seed": 20260909,
+  "sources": ["sf19", "lichess", "syzygy"],
+  "weights": {
+    "sf19": 0.75,
+    "lichess": 0.20,
+    "syzygy": 0.05
+  },
+  "overlap_policy": "exclusive_source_bucket",
+  "quality": {
+    "sf19": {"min_nodes_budget": 100000, "min_depth": 12, "require_policy_mask": true, "exclude_upstream_holdout": true},
+    "lichess": {"min_depth": 22, "max_depth": 127},
+    "syzygy": {"tb_wdl_values": [-2, -1, 0, 1, 2], "max_abs_dtz": 1000}
+  },
+  "quality_relaxation": "never",
+  "quota_mode": {
+    "phase": "prefer",
+    "phase_frac": {"0": 0.22, "1": 0.50, "2": 0.28}
+  },
+  "split_exclusions": ["sf19:shard_000000", "prior_holdouts"],
+  "value_eligible": {
+    "sf19": true,
+    "lichess": false,
+    "syzygy": false
+  },
+  "pinned_sources": {
+    "avewright/chess-soft-sf19": "68cef6c9ba62c62f904f25305f1a7489dab825e0",
+    "avewright/chess-soft-multipv-lichess": "291acea2a2ce6fc2aba4b289110d1920cf969afe",
+    "avewright/chess-soft-syzygy": "3889985c482837aa3082e182d8f123e005e2c0d4"
+  },
+  "trainer": {
+    "deep_mix_frac": 0.05,
+    "bonus_mix_frac": 0,
+    "soft_cache": "soft_cache.pt",
+    "deep_cache": "deep_cache.pt"
+  },
+  "limitations": [
+    "First-night mix is limited by currently audited SF19 (~2.01M). 50M SF19 is a harvest target, not this freeze.",
+    "New holdouts are dataset-disjoint, not proven unseen by the 99M incumbent.",
+    "Lichess and Syzygy values stay masked.",
+    "Harvested expand50m shards attach only after a later remixed freeze — not live during this run."
+  ]
+}
