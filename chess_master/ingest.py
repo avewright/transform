@@ -38,7 +38,6 @@ from chess_master.schema import (
     MEMBERSHIP_SCHEMA,
     POSITIONS_SCHEMA,
     QUARANTINE_SCHEMA,
-    SOURCE_IDS,
     UNKNOWN,
 )
 
@@ -466,7 +465,6 @@ def ingest_organized_mix(out: Path, inventory: dict) -> dict:
     revs = mix_pins.get("source_revisions") or {}
     writer = Writer(out, "mix")
     writer.load_seen()
-    totals = dict(writer.counts)
     report = {"sources": {}, "status": "building"}
     completed = set(progress.get("completed", []))
 
@@ -527,15 +525,14 @@ def ingest_organized_mix(out: Path, inventory: dict) -> dict:
         progress["completed"] = sorted(completed)
         _save_progress(out, progress)
         writer.close()
-        for k, v in writer.counts.items():
-            totals[k] = totals.get(k, 0) + v
         writer = Writer(out, "mix")
         writer.load_seen()
         print(f"  {name} train={kept['train']} eval={kept['eval']}", flush=True)
 
     writer.close()
+    writer.load_seen()
     report["status"] = "complete"
-    report["counts"] = totals
+    report["counts"] = writer.counts
     json_write(out / "mix_ingest_report.json", report)
     completed.add(key)
     progress["completed"] = sorted(completed)

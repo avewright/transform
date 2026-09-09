@@ -97,3 +97,19 @@ MOVE_VOCAB_VERSION=compact python scripts/build_chess_master.py export --recipe 
 ```
 
 Trainer export writes `soft_cache.pt` + `deep_cache.pt` with the existing source ids (Lichess=1, Syzygy=2, SF19=4, Puzzle=5).
+
+## First-pass quality (after sample + mix migrate)
+
+| Table | Rows |
+|---|---|
+| Mix positions / annotations / membership | 1,004,000 each (1M train + 4k eval) |
+| Sample annotations | 384 (64 × 4 sources + 128 SWA teacher/model) |
+| Unique `position_id` overall | 1,004,293 |
+| Train ∩ eval (organized_v1) | 0 |
+| Value-eligible annotations | 451,064 (SF19 only) |
+| Depth sentinels | 72,565 (Syzygy `999` + 21,501 SF19 depths `>64` kept from the frozen mix) |
+| Quarantine (sample gates only) | 459 |
+| Positions with disagreeing best moves | 66 (mostly SWA teacher vs model; a few Lichess vs SF19) |
+| Rule-state (clocks) available | 0 |
+
+Frozen-mix rows that fail the current SF19 depth-sentinel gate are **kept** and tagged `quality_status=accepted_from_frozen_mix`. New recipes must not silently drop that gate to refill quotas.

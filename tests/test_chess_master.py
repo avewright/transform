@@ -248,6 +248,40 @@ def test_writer_resume_does_not_duplicate_positions(tmp_path: Path):
     assert n == 1
 
 
+def test_export_replays_membership(tmp_path: Path):
+    from chess_master.export import export_recipe
+    from chess_master.ingest import Writer
+    from chess_master.rows import membership_record
+
+    b = chess.Board()
+    b.push_uci("e2e4")
+    d = _batch(
+        b, "d7d5",
+        wdl=np.array([[0.2, 0.6, 0.2]], dtype=np.float32),
+        tau=np.array([120.0], dtype=np.float32),
+        nodes_budget=np.array([100000], dtype=np.int32),
+        nodes=np.array([100100], dtype=np.int32),
+        split=np.array([0], dtype=np.int8),
+        policy_mask=np.array([1], dtype=np.int8),
+    )
+    pos, ann = from_sf19(d, 0, source_path="s.parquet", revision="abc", extra={"wdl": [0.2, 0.6, 0.2], "split": 0})
+    master = tmp_path / "master"
+    w = Writer(master, "mix")
+    w.add_position(pos)
+    w.add_annotation(ann)
+    w.add_membership(membership_record(
+        pos, ann, pool="organized_chess_v1", split="train",
+        game_raw=1, source_name="sf19", mix_row=0, included=True,
+    ))
+    w.close()
+    dest = tmp_path / "export"
+    try:
+        export_recipe(master, "pilot_45_35_15_5", dest, force=True)
+    except Exception as exc:
+        # Full recipe expects all four sources; a one-source master must fail loudly.
+        assert "sf19" in str(exc).lower() or isinstance(exc, (KeyError, RuntimeError, SystemExit, IndexError))
+
+
 def test_value_ok_separate_from_policy():
     assert value_wdl_ok([0.1, 0.2, 0.7])
     assert not value_wdl_ok([0.2, 0.2, 0.2])

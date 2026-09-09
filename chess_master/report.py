@@ -51,12 +51,26 @@ def build_quality_report(out: Path) -> dict:
     membership = pa.concat_tables(mem_parts) if mem_parts else None
     quarantine = pa.concat_tables(q_parts) if q_parts else None
 
+    prefixes = {
+        "positions": _prefixes(out / "positions"),
+        "annotations": _prefixes(out / "annotations"),
+        "membership": _prefixes(out / "membership"),
+        "quarantine": _prefixes(out / "quarantine"),
+    }
+    prefix_counts = {}
+    for kind, folder in (("positions", "positions"), ("annotations", "annotations"), ("membership", "membership")):
+        prefix_counts[kind] = {}
+        for prefix in prefixes[kind]:
+            t = _read(out / folder, prefix, columns=["position_id"] if kind != "annotations" else ["annotation_id"])
+            prefix_counts[kind][prefix] = 0 if t is None else t.num_rows
+
     report: dict = {
         "positions": 0 if positions is None else positions.num_rows,
         "unique_positions": 0 if positions is None else len(set(positions.column("position_id").to_pylist())),
         "annotations": 0 if annotations is None else annotations.num_rows,
         "membership": 0 if membership is None else membership.num_rows,
         "quarantine": 0 if quarantine is None else quarantine.num_rows,
+        "by_prefix": prefix_counts,
         "missing_metadata": {},
         "conflicts": {},
         "rejected": {},
