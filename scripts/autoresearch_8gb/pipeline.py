@@ -93,11 +93,19 @@ def pick_mix_source(
     *,
     has_bonus: bool,
     has_deep: bool,
+    quality_mix: float = 0.0,
+    has_quality: bool = False,
+    puzzle_mix: float = 0.0,
+    has_puzzle: bool = False,
 ) -> str:
-    """bonus, then deep, else shallow. ``draw`` is Uniform[0, 1)."""
-    if has_bonus and draw < bonus_mix:
+    """puzzle, quality, bonus, deep, else shallow. ``draw`` is Uniform[0, 1)."""
+    if has_puzzle and draw < puzzle_mix:
+        return "puzzle"
+    if has_quality and draw < (puzzle_mix + quality_mix):
+        return "quality"
+    if has_bonus and draw < (puzzle_mix + quality_mix + bonus_mix):
         return "bonus"
-    if has_deep and draw < (bonus_mix + deep_mix):
+    if has_deep and draw < (puzzle_mix + quality_mix + bonus_mix + deep_mix):
         return "deep"
     return "shallow"
 
@@ -155,7 +163,12 @@ def filter_disjoint(data: dict, seen: np.ndarray | None) -> tuple[dict, np.ndarr
     internal = n - int(first.size)
     vs_seen = 0
     if seen is not None and seen.size:
-        collide = np.isin(hs, seen)
+        # np.isin casts uint64→float64 and false-collides hashes > 2^53.
+        seen_u = np.unique(np.asarray(seen, dtype=np.uint64))
+        hs_u = hs.astype(np.uint64, copy=False)
+        loc = np.searchsorted(seen_u, hs_u)
+        loc = np.minimum(loc, seen_u.size - 1)
+        collide = seen_u[loc] == hs_u
         vs_seen = int((collide & keep).sum())
         keep &= ~collide
     n_keep = int(keep.sum())
@@ -334,6 +347,16 @@ def prepare_soft_batch(data, indices, device, hflip_p=0.0, rng=None):
         soft_i.to(device, non_blocking=nb),
         soft_p.to(device, non_blocking=nb),
     )
+
+
+def cat_soft_batches(parts: list[tuple]) -> tuple:
+    """Concat prepare_soft_batch outputs along the batch dim."""
+    if len(parts) == 1:
+        return parts[0]
+    keys = parts[0][0].keys()
+    board = {k: torch.cat([p[0][k] for p in parts], dim=0) for k in keys}
+    rest = tuple(torch.cat([p[i] for p in parts], dim=0) for i in range(1, 5))
+    return (board,) + rest
 
 
 def position_hashes(data: dict) -> np.ndarray:

@@ -32,6 +32,16 @@ def test_nonmonotonic_does_not_invert_bounds():
     assert "non-monotonic" in est["note"]
 
 
+def test_single_level_uses_logistic():
+    est = estimate_elo([{"sf_elo": 2050, "score": 0.75, "games": 12}])
+    assert est["estimated_elo"] > 2050
+    assert est["lower_bound"] == 2050
+    assert est["upper_bound"] is None
+    est = estimate_elo([{"sf_elo": 2050, "score": 0.25, "games": 12}])
+    assert est["estimated_elo"] < 2050
+    assert est["upper_bound"] == 2050
+
+
 def test_unbeaten_top_has_lower_bound_only():
     est = estimate_elo([
         {"sf_elo": 1750, "score": 0.656, "games": 16},
