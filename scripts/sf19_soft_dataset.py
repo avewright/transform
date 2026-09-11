@@ -16,6 +16,9 @@ Usage:
   MOVE_VOCAB_VERSION=compact STOCKFISH_PATH=$HOME/.local/bin/stockfish-19 \\
     python -u scripts/sf19_soft_dataset.py generate --go --mode eco \\
       --out-dir outputs/sf19_soft/eco_1m --target 1000000 --workers 16
+  MOVE_VOCAB_VERSION=compact STOCKFISH_PATH=$HOME/.local/bin/stockfish-19 \\
+    python -u scripts/sf19_soft_dataset.py generate --go --mode piece_curve \\
+      --out-dir outputs/sf19_soft/piece_curve --target 300000 --workers 8
 """
 from __future__ import annotations
 
@@ -52,6 +55,20 @@ from scripts.lichess_openings import (  # noqa: E402
     load_openings as load_eco_openings,
     openings_summary,
     start_positions as eco_start_positions,
+)
+from scripts.piece_curve import (  # noqa: E402
+    LABEL_WHEN_PIECES_LE,
+    STREAMS,
+    curve_summary,
+    empty_counts,
+    label_stride,
+    local_copy_paths,
+    local_fen_paths,
+    most_deficit_n,
+    n_pieces_from_row,
+    recount_inbox_pieces,
+    should_keep as curve_should_keep,
+    target_pmf,
 )
 
 SOFT_K = 8
@@ -612,6 +629,237 @@ def build_eco_game_spec(
     }
 
 
+def build_piece_curve_game_spec(
+    game_i: int,
+    starts: list[dict],
+    *,
+    seed: int,
+    holdout_frac: float,
+) -> dict:
+    """Full ECO game. Rotate start depth so the N(17,6) piece curve can fill."""
+    spec = build_eco_game_spec(game_i, starts, seed=seed, holdout_frac=holdout_frac)
+    stream = STREAMS[game_i % len(STREAMS)]
+    spec["piece_curve"] = True
+    spec["stream"] = stream
+    spec["label_when_pieces_le"] = LABEL_WHEN_PIECES_LE[stream]
+    if stream == "endgame":
+        spec["wild"] = max(float(spec["wild"]), 0.12)
+        spec["epsilon"] = max(float(spec["epsilon"]), 0.28)
+    return spec
+
+
+ROW_STACK_KEYS = (
+    "board_array", "turn", "castling", "ep_square", "move_idx",
+    "cp", "mate", "soft_indices", "soft_probs", "soft_cps", "soft_mates",
+    "label_depth", "phase", "source", "wdl", "nodes", "policy_mask",
+    "tau", "nodes_budget", "game_id", "ply", "split",
+    "origin", "flags", "bound_skipped",
+)
+
+
+def _as_numpy(val, dtype=None):
+    if torch.is_tensor(val):
+        val = val.detach().cpu().numpy()
+    arr = np.asarray(val)
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
+
+def normalize_harvest_row(row: dict) -> dict | None:
+    """Pad older caches so they stack with eco/prod shards."""
+    if "board_array" not in row or "move_idx" not in row:
+        return None
+    if "soft_indices" not in row or "soft_probs" not in row:
+        return None
+    out = dict(row)
+    out["board_array"] = _as_numpy(out["board_array"], np.int8).reshape(64)
+    out["soft_indices"] = _as_numpy(out["soft_indices"], np.int64).reshape(-1)
+    out["soft_probs"] = _as_numpy(out["soft_probs"], np.float32).reshape(-1)
+    if out["soft_indices"].shape[0] < SOFT_K:
+        return None
+    out["soft_indices"] = out["soft_indices"][:SOFT_K]
+    out["soft_probs"] = out["soft_probs"][:SOFT_K]
+    if "soft_cps" not in out:
+        out["soft_cps"] = np.zeros(SOFT_K, dtype=np.int32)
+    if "soft_mates" not in out:
+        out["soft_mates"] = np.zeros(SOFT_K, dtype=np.int32)
+    defaults = {
+        "turn": (np.int8, 0),
+        "castling": (np.int8, 0),
+        "ep_square": (np.int8, -1),
+        "move_idx": (np.int64, -1),
+        "cp": (np.int32, 0),
+        "mate": (np.int32, 0),
+        "label_depth": (np.int16, 12),
+        "phase": (np.int8, 1),
+        "source": (np.int8, SOURCE_SF19),
+        "nodes": (np.int32, 0),
+        "policy_mask": (np.int8, 1),
+        "tau": (np.float32, DEFAULT_TAU),
+        "nodes_budget": (np.int32, 100_000),
+        "game_id": (np.int64, -1),
+        "ply": (np.int16, 0),
+        "split": (np.int8, 0),
+        "origin": (np.int8, ORIGIN_RELABEL),
+        "flags": (np.int16, 0),
+        "bound_skipped": (np.int16, 0),
+    }
+    for key, (dtype, fill) in defaults.items():
+        out[key] = _as_numpy(out[key], dtype) if key in out else np.asarray(fill, dtype=dtype)
+    if "wdl" not in out:
+        out["wdl"] = np.array([0.33, 0.34, 0.33], dtype=np.float32)
+    else:
+        out["wdl"] = _as_numpy(out["wdl"], np.float32).reshape(-1)[:3]
+    if int(out["policy_mask"]) == 0 or int(out["move_idx"]) < 0:
+        return None
+    return out
+
+
+def iter_cache_rows(path: Path):
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    n = int(data["move_idx"].shape[0])
+    keys = [k for k in data if hasattr(data[k], "__getitem__") and getattr(data[k], "shape", None) is not None and int(data[k].shape[0]) == n]
+    for i in range(n):
+        yield {k: data[k][i] for k in keys}
+    del data
+
+
+def collect_fen_buckets(paths: list[Path], rng: random.Random, *, per_n: int = 2500) -> dict[int, list[str]]:
+    from scripts.harvest_exp201_lapses import board_array_to_fen
+
+    buckets: dict[int, list[str]] = {n: [] for n in range(2, 33)}
+    for path in paths:
+        if not path.exists():
+            continue
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        n = int(data["move_idx"].shape[0])
+        take = min(n, 80_000)
+        idx = rng.sample(range(n), k=take) if take < n else list(range(n))
+        for i in idx:
+            pcs = int((data["board_array"][i] != 0).sum())
+            if pcs < 2 or pcs > 32 or len(buckets[pcs]) >= per_n:
+                continue
+            fen = board_array_to_fen(
+                data["board_array"][i].numpy(),
+                int(data["turn"][i]),
+                int(data["castling"][i]),
+                int(data["ep_square"][i]),
+            )
+            buckets[pcs].append(fen)
+        del data
+    master = ROOT / "outputs/chess_master_v1/positions"
+    if master.is_dir():
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            pq = None
+        if pq is not None:
+            for fp in sorted(master.glob("mix-*.parquet"))[:12]:
+                table = pq.read_table(fp, columns=["fen_4"])
+                fens = table.column("fen_4").to_pylist()
+                for fen4 in rng.sample(fens, k=min(len(fens), 4000)):
+                    if not fen4:
+                        continue
+                    try:
+                        board = chess.Board(str(fen4) + " 0 1")
+                    except ValueError:
+                        continue
+                    pcs = int(board.occupied.bit_count())
+                    if 2 <= pcs <= 32 and len(buckets[pcs]) < per_n:
+                        buckets[pcs].append(board.fen())
+    for n in buckets:
+        rng.shuffle(buckets[n])
+    return buckets
+
+
+def ingest_existing_curve(
+    *,
+    inbox: Path,
+    seen,
+    target: int,
+    shard_size: int,
+    pmf,
+    have,
+    teacher_meta: dict,
+    log_path: Path,
+) -> int:
+    """Copy local SF19 rows into the bell. No new Stockfish search."""
+    pending: list[dict] = []
+    pending_keys: set[bytes] = set()
+    kept = 0
+    scanned = 0
+    skipped = {"dup": 0, "curve": 0, "bad": 0}
+
+    def flush() -> None:
+        nonlocal pending, pending_keys
+        if len(pending) < shard_size:
+            return
+        take = pending[:shard_size]
+        pending = pending[shard_size:]
+        keys = [row_key(r) for r in take]
+        data = stack_rows(take)
+        sh = next_shard_dir(inbox)
+        write_shard(data, sh, {**teacher_meta, "origin": "ingest", "max_game_id": -1})
+        seen.add_many(keys)
+        seen.mark_shard(sh.name, len(take))
+        seen.forget_hot(keys)
+        pending_keys.difference_update(keys)
+        log(f"ingest wrote {sh} n={len(take)} copied={kept:,}", log_path)
+
+    sources = local_copy_paths(ROOT)
+    log(f"ingest sources={len(sources)} target={target:,}", log_path)
+    for path in sources:
+        if kept >= target:
+            break
+        try:
+            rows = iter_cache_rows(path)
+        except Exception as exc:
+            log(f"ingest skip {path}: {type(exc).__name__}: {exc}", log_path)
+            continue
+        for raw in rows:
+            scanned += 1
+            row = normalize_harvest_row(raw)
+            if row is None:
+                skipped["bad"] += 1
+                continue
+            k = row_key(row)
+            if seen.has(k) or k in pending_keys:
+                skipped["dup"] += 1
+                continue
+            n_pcs = n_pieces_from_row(row)
+            if not curve_should_keep(n_pcs, have, int(have.sum()), pmf):
+                skipped["curve"] += 1
+                continue
+            have[n_pcs] += 1
+            pending.append(row)
+            pending_keys.add(k)
+            seen.remember_hot([k])
+            kept += 1
+            if len(pending) >= shard_size:
+                flush()
+            if kept >= target:
+                break
+        if scanned and scanned % 200_000 < 5000:
+            log(
+                f"ingest scanned={scanned:,} kept={kept:,} {curve_summary(have)} "
+                f"skip={skipped}",
+                log_path,
+            )
+    if pending:
+        take = pending
+        data = stack_rows(take)
+        sh = next_shard_dir(inbox)
+        write_shard(data, sh, {**teacher_meta, "origin": "ingest", "max_game_id": -1})
+        keys = [row_key(r) for r in take]
+        seen.add_many(keys)
+        seen.mark_shard(sh.name, len(take))
+        seen.forget_hot(keys)
+        log(f"ingest wrote {sh} n={len(take)} copied={kept:,}", log_path)
+    log(f"ingest done kept={kept:,} scanned={scanned:,} skip={skipped} {curve_summary(have)}", log_path)
+    return kept
+
+
 @dataclass
 class GenConfig:
     nodes: int = 30_000
@@ -705,11 +953,16 @@ def _play_one_game(spec: dict) -> dict:
     ply = 0
     last_kept_ply = -999
     n_search = 0
+    piece_curve = bool(spec.get("piece_curve"))
+    label_le = int(spec.get("label_when_pieces_le") or 32)
     while not board.is_game_over(claim_draw=True) and ply < cfg.ply_cap:
+        n_pcs = int(board.occupied.bit_count())
+        stride = label_stride(n_pcs, default=cfg.ply_stride) if piece_curve else cfg.ply_stride
         keep = (
             ply >= cfg.ply_skip_open
-            and (ply - cfg.ply_skip_open) % cfg.ply_stride == 0
-            and (ply - last_kept_ply) >= cfg.ply_stride
+            and n_pcs <= label_le
+            and (ply - cfg.ply_skip_open) % stride == 0
+            and (ply - last_kept_ply) >= stride
         )
         parsed = None
         if keep and _W_SEEN is not None:
@@ -774,6 +1027,23 @@ def _play_one_game(spec: dict) -> dict:
         board.push(mv)
         ply += 1
     return {"rows": rows, "rejects": rejects, "game_id": spec["game_id"], "plies": ply}
+
+
+def _run_job(spec: dict) -> dict:
+    if spec.get("relabel"):
+        empty = {"seen_skip": 0, "stride": 0, "analyze_fail": 0, "adjacent": 0}
+        row = _label_fen(str(spec["fen"]))
+        if row is None:
+            empty["analyze_fail"] = 1
+            return {"rows": [], "rejects": empty, "game_id": spec["game_id"], "plies": 0}
+        if int(row.get("policy_mask", 0)) == 0:
+            return {"rows": [], "rejects": empty, "game_id": spec["game_id"], "plies": 0}
+        row["game_id"] = np.int64(spec["game_id"])
+        row["ply"] = np.int16(0)
+        row["split"] = np.int8(spec.get("split") or 0)
+        row["origin"] = np.int8(ORIGIN_RELABEL)
+        return {"rows": [row], "rejects": empty, "game_id": spec["game_id"], "plies": 0}
+    return _play_one_game(spec)
 
 
 def stack_rows(rows: list[dict]) -> dict:
@@ -1226,7 +1496,11 @@ def generate(args) -> None:
         added = seen.ingest_cache_keys(p, f"exclude:{p}")
         log(f"exclude {p} +{added:,} keys seen={len(seen):,}", log_path)
     eco_starts: list[dict] = []
-    if getattr(args, "mode", "") == "eco":
+    piece_curve = getattr(args, "mode", "") == "piece_curve"
+    curve_pmf = target_pmf() if piece_curve else None
+    curve_have = empty_counts()
+    fen_buckets: dict[int, list[str]] = {}
+    if getattr(args, "mode", "") in ("eco", "piece_curve"):
         openings = load_eco_openings()
         eco_starts = eco_start_positions(
             openings,
@@ -1235,11 +1509,43 @@ def generate(args) -> None:
         summary = openings_summary(openings, eco_starts)
         (out / "openings.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         log(
-            f"eco openings={summary['n_rows']} unique={summary['n_unique']} "
-            f"starts={len(eco_starts)} prefixes={not getattr(args, 'no_prefixes', False)} "
+            f"{'piece_curve' if piece_curve else 'eco'} openings={summary['n_rows']} "
+            f"unique={summary['n_unique']} starts={len(eco_starts)} "
+            f"prefixes={not getattr(args, 'no_prefixes', False)} "
             f"volumes={summary['volumes']}",
             log_path,
         )
+        if piece_curve:
+            curve_have = recount_inbox_pieces(inbox)
+            log(f"piece_curve resume {curve_summary(curve_have)}", log_path)
+            if committed < target:
+                ingest_existing_curve(
+                    inbox=inbox,
+                    seen=seen,
+                    target=target,
+                    shard_size=args.shard_size,
+                    pmf=curve_pmf,
+                    have=curve_have,
+                    teacher_meta={
+                        "teacher": fp["uci_name"],
+                        "binary_sha256": fp["binary_sha256"],
+                        "fingerprint_id": run_fp["fingerprint_id"],
+                        "nodes": cfg.nodes,
+                        "multipv": cfg.multipv,
+                        "tau": cfg.tau,
+                    },
+                    log_path=log_path,
+                )
+                committed, next_game = inbox_state(inbox)
+                curve_have = recount_inbox_pieces(inbox)
+            log(f"piece_curve after ingest committed={committed:,} {curve_summary(curve_have)}", log_path)
+            fen_buckets = collect_fen_buckets(
+                local_fen_paths(ROOT), random.Random(args.seed + 9),
+            )
+            log(
+                f"fen_seeds={sum(len(v) for v in fen_buckets.values()):,}",
+                log_path,
+            )
         seed_fens = []
         seed_paths = []
     else:
@@ -1270,7 +1576,7 @@ def generate(args) -> None:
     pool = ctx.Pool(workers, initializer=_init_worker, initargs=(sf, cfg, str(out / "seen.sqlite")))
     t0 = time.time()
     new_rows = 0
-    rejected = {"dup": 0, "stride": 0, "analyze_fail": 0}
+    rejected = {"dup": 0, "stride": 0, "analyze_fail": 0, "curve": 0}
     pending: list[dict] = []
     pending_keys: set[str] = set()
     game_i = args.game_start if args.game_start else next_game
@@ -1308,7 +1614,28 @@ def generate(args) -> None:
             for _ in range(max(workers * 2, 8)):
                 if committed + new_rows >= target:
                     break
-                if eco_starts:
+                if piece_curve:
+                    n_need = most_deficit_n(curve_have, curve_pmf)
+                    if n_need is not None and fen_buckets.get(n_need):
+                        spec = {
+                            "relabel": True,
+                            "fen": fen_buckets[n_need].pop(),
+                            "game_id": game_i,
+                            "seed": args.seed + game_i * 10007,
+                            "split": 1 if random.Random(game_i + 17).random() < args.holdout_frac else 0,
+                        }
+                    elif eco_starts:
+                        spec = build_piece_curve_game_spec(
+                            game_i, eco_starts, seed=args.seed, holdout_frac=args.holdout_frac,
+                        )
+                    else:
+                        spec = {
+                            "game_id": game_i,
+                            "seed": args.seed + game_i * 10007,
+                            "opening": list(OPENINGS[game_i % len(OPENINGS)]),
+                            "split": 0,
+                        }
+                elif eco_starts:
                     spec = build_eco_game_spec(
                         game_i, eco_starts, seed=args.seed, holdout_frac=args.holdout_frac,
                     )
@@ -1327,7 +1654,7 @@ def generate(args) -> None:
                 game_i += 1
             if not jobs:
                 break
-            for result in pool.imap_unordered(_play_one_game, jobs, chunksize=1):
+            for result in pool.imap_unordered(_run_job, jobs, chunksize=1):
                 rejected["stride"] += int(result["rejects"].get("stride") or 0)
                 rejected["analyze_fail"] += int(result["rejects"].get("analyze_fail") or 0)
                 keys = []
@@ -1337,6 +1664,12 @@ def generate(args) -> None:
                     if seen.has(k) or k in pending_keys:
                         rejected["dup"] += 1
                         continue
+                    if curve_pmf is not None:
+                        n_pcs = n_pieces_from_row(row)
+                        if not curve_should_keep(n_pcs, curve_have, int(curve_have.sum()), curve_pmf):
+                            rejected["curve"] += 1
+                            continue
+                        curve_have[n_pcs] += 1
                     keys.append(k)
                     kept.append(row)
                     pending_keys.add(k)
@@ -1348,20 +1681,30 @@ def generate(args) -> None:
                 if new_rows and new_rows % 64 < max(len(kept), 1):
                     rate = new_rows / elapsed
                     eta = (target - accepted) / max(rate, 1e-9)
-                    log(
-                        f"accepted={accepted:,} pending={len(pending)} seen={len(seen):,} "
-                        f"dup={rejected['dup']} fail={rejected['analyze_fail']} "
-                        f"{rate:.1f}/s eta={eta/60:.1f}m",
-                        log_path,
-                    )
-                    stats_path.write_text(json.dumps({
+                    extra = ""
+                    stats = {
                         "accepted": accepted,
                         "new_rows": new_rows,
                         "rejected": rejected,
                         "seen": len(seen),
                         "pos_per_s": rate,
                         "elapsed_s": elapsed,
-                    }, indent=2), encoding="utf-8")
+                    }
+                    if piece_curve:
+                        summ = curve_summary(curve_have)
+                        extra = (
+                            f" curve={rejected['curve']} "
+                            f"n̄={summ['mean']} σ={summ['std']} peak={summ['peak']}"
+                        )
+                        stats["piece_curve"] = summ
+                        stats["piece_hist"] = [int(x) for x in curve_have.tolist()]
+                    log(
+                        f"accepted={accepted:,} pending={len(pending)} seen={len(seen):,} "
+                        f"dup={rejected['dup']} fail={rejected['analyze_fail']} "
+                        f"{rate:.1f}/s eta={eta/60:.1f}m{extra}",
+                        log_path,
+                    )
+                    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
                 flush(False)
                 if accepted >= target:
                     break
@@ -1832,7 +2175,7 @@ def main() -> None:
     g.add_argument("--no-seed-caches", action="store_true")
     g.add_argument("--no-prefixes", action="store_true",
                    help="ECO mode: start only from named leaves, not book prefixes.")
-    g.add_argument("--mode", choices=("selfplay", "mix", "eco"), default="mix")
+    g.add_argument("--mode", choices=("selfplay", "mix", "eco", "piece_curve"), default="mix")
     g.add_argument("--relabel-frac", type=float, default=0.8)
     a = sub.add_parser("audit")
     add_shared(a)
@@ -1883,16 +2226,16 @@ def main() -> None:
     elif args.cmd == "generate":
         if not args.go:
             raise SystemExit("pass --go")
-        if args.mode == "eco":
+        if args.mode in ("eco", "piece_curve"):
             args.no_seed_caches = True
             if args.ply_skip_open == 4:
                 args.ply_skip_open = 0
             if args.ply_cap == 140:
-                args.ply_cap = 180
+                args.ply_cap = 220 if args.mode == "piece_curve" else 180
             if args.watchdog_s == 8.0:
                 args.watchdog_s = 20.0
             if args.target == 25_000 and not args.pilot and not args.smoke:
-                args.target = 1_000_000
+                args.target = 300_000 if args.mode == "piece_curve" else 1_000_000
             if args.workers == 14:
                 args.workers = max(1, (os.cpu_count() or 8) - 2)
         if args.smoke:
