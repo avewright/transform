@@ -131,6 +131,9 @@ def load_eval_model(checkpoint_path: str | Path, device: torch.device):
 @torch.no_grad()
 def get_model_move(model, board: chess.Board, device: torch.device, temperature: float = 0.0):
     board_input = batch_boards_to_fused_token_ids([board], device)
+    if getattr(getattr(model, "config", None), "use_history", False):
+        from chess_history import batch_history_features
+        board_input.update(batch_history_features([board], device))
     mask = legal_move_mask(board).to(device)
     board_input["legal_mask"] = mask.unsqueeze(0)
     result = model(board_input)

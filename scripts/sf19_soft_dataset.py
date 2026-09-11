@@ -13,6 +13,9 @@ Usage:
   MOVE_VOCAB_VERSION=compact STOCKFISH_PATH=$HOME/.local/bin/stockfish-19 \\
     python -u scripts/sf19_soft_dataset.py generate --go --pilot \\
       --out-dir outputs/sf19_soft/pilot
+  MOVE_VOCAB_VERSION=compact STOCKFISH_PATH=$HOME/.local/bin/stockfish-19 \\
+    python -u scripts/sf19_soft_dataset.py generate --go --mode eco \\
+      --out-dir outputs/sf19_soft/eco_1m --target 1000000 --workers 16
 """
 from __future__ import annotations
 
@@ -45,6 +48,11 @@ if str(ROOT) not in sys.path:
 
 from data_loader import CASTLING_MAP, _fast_parse_fen, compute_wdl  # noqa: E402
 from move_vocab import UCI_TO_IDX, VOCAB_SIZE  # noqa: E402
+from scripts.lichess_openings import (  # noqa: E402
+    load_openings as load_eco_openings,
+    openings_summary,
+    start_positions as eco_start_positions,
+)
 
 SOFT_K = 8
 SOURCE_SF19 = 4
@@ -547,10 +555,23 @@ def union_kl_and_coverage(ref: dict, cand: dict, *, eps: float = 1e-8) -> tuple[
     return kl, ref_mass_in_cand, cand_mass_in_ref
 
 
-def pick_play_move(parsed: dict | None, board: chess.Board, rng: random.Random, *, epsilon: float) -> chess.Move:
+ECO_EPSILONS = (0.10, 0.18, 0.28, 0.40)
+ECO_WILDS = (0.00, 0.03, 0.06, 0.10)
+
+
+def pick_play_move(
+    parsed: dict | None,
+    board: chess.Board,
+    rng: random.Random,
+    *,
+    epsilon: float,
+    wild: float = 0.0,
+) -> chess.Move:
     legal = list(board.legal_moves)
     if not legal:
         raise RuntimeError("no legal moves")
+    if wild > 0 and rng.random() < wild:
+        return rng.choice(legal)
     if parsed and not parsed.get("terminal") and parsed.get("items"):
         best = chess.Move.from_uci(parsed["items"][0]["uci"])
         if best not in board.legal_moves:
@@ -566,6 +587,29 @@ def pick_play_move(parsed: dict | None, board: chess.Board, rng: random.Random, 
     if rng.random() < epsilon:
         return rng.choice(legal)
     return legal[0]
+
+
+def build_eco_game_spec(
+    game_i: int,
+    starts: list[dict],
+    *,
+    seed: int,
+    holdout_frac: float,
+) -> dict:
+    start = starts[game_i % len(starts)]
+    split = 1 if random.Random(game_i + 17).random() < holdout_frac else 0
+    return {
+        "game_id": game_i,
+        "seed": seed + game_i * 10007,
+        "start_fen": start["fen"],
+        "opening": [],
+        "book_noise": game_i % 5,
+        "epsilon": ECO_EPSILONS[game_i % len(ECO_EPSILONS)],
+        "wild": ECO_WILDS[(game_i // 3) % len(ECO_WILDS)],
+        "split": split,
+        "eco": start.get("eco"),
+        "opening_name": start.get("name"),
+    }
 
 
 @dataclass
@@ -638,6 +682,8 @@ def _play_one_game(spec: dict) -> dict:
     assert _W_ENGINE is not None and _W_CFG is not None
     cfg = _W_CFG
     rng = random.Random(int(spec["seed"]))
+    eps = float(spec.get("epsilon", cfg.epsilon))
+    wild = float(spec.get("wild", 0.0))
     start_fen = spec.get("start_fen")
     if start_fen:
         try:
@@ -711,7 +757,7 @@ def _play_one_game(spec: dict) -> dict:
         if board.is_game_over(claim_draw=True):
             break
         if parsed and parsed.get("items"):
-            mv = pick_play_move(parsed, board, rng, epsilon=cfg.epsilon)
+            mv = pick_play_move(parsed, board, rng, epsilon=eps, wild=wild)
         else:
             play = analyze_board(
                 _W_ENGINE, board,
@@ -724,7 +770,7 @@ def _play_one_game(spec: dict) -> dict:
                     if UCI_TO_IDX.get(cand.uci()) == int(play["move_idx"]):
                         parsed_play = {"items": [{"uci": cand.uci()}], "probs": [1.0]}
                         break
-            mv = pick_play_move(parsed_play, board, rng, epsilon=cfg.epsilon)
+            mv = pick_play_move(parsed_play, board, rng, epsilon=eps, wild=wild)
         board.push(mv)
         ply += 1
     return {"rows": rows, "rejects": rejects, "game_id": spec["game_id"], "plies": ply}
@@ -1153,6 +1199,7 @@ def generate(args) -> None:
         book_noise=args.book_noise,
         hash_mb=args.hash_mb,
         clear_hash_every=args.clear_hash_every,
+        watchdog_s=float(getattr(args, "watchdog_s", 8.0) or 8.0),
     )
     run_fp = run_fingerprint(fp, cfg)
     assert_resume_compatible(out, run_fp)
@@ -1178,25 +1225,43 @@ def generate(args) -> None:
             continue
         added = seen.ingest_cache_keys(p, f"exclude:{p}")
         log(f"exclude {p} +{added:,} keys seen={len(seen):,}", log_path)
-    seed_paths = [Path(p) for p in (getattr(args, "seed_caches", None) or [])]
-    if not getattr(args, "no_seed_caches", False) and not seed_paths:
-        seed_paths = [
-            ROOT / "outputs/autoresearch_8gb/soft_cache_200k.pt",
-        ]
-    seed_n = int(getattr(args, "seed_fens_n", 2048) or 2048)
-    seed_paths = [p for p in seed_paths if p.exists()]
-    seed_fens = [] if args.no_seed_caches else sample_seed_fens(seed_paths, seed_n, random.Random(args.seed + 3))
-    if seed_fens:
-        ok = []
-        for fen in seed_fens:
-            try:
-                b = chess.Board(fen)
-            except ValueError:
-                continue
-            if b.is_valid() and not b.is_game_over(claim_draw=True):
-                ok.append(fen)
-        seed_fens = ok
-    log(f"seed_fens={len(seed_fens)} from {[str(p) for p in seed_paths]}", log_path)
+    eco_starts: list[dict] = []
+    if getattr(args, "mode", "") == "eco":
+        openings = load_eco_openings()
+        eco_starts = eco_start_positions(
+            openings,
+            include_prefixes=not getattr(args, "no_prefixes", False),
+        )
+        summary = openings_summary(openings, eco_starts)
+        (out / "openings.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        log(
+            f"eco openings={summary['n_rows']} unique={summary['n_unique']} "
+            f"starts={len(eco_starts)} prefixes={not getattr(args, 'no_prefixes', False)} "
+            f"volumes={summary['volumes']}",
+            log_path,
+        )
+        seed_fens = []
+        seed_paths = []
+    else:
+        seed_paths = [Path(p) for p in (getattr(args, "seed_caches", None) or [])]
+        if not getattr(args, "no_seed_caches", False) and not seed_paths:
+            seed_paths = [
+                ROOT / "outputs/autoresearch_8gb/soft_cache_200k.pt",
+            ]
+        seed_n = int(getattr(args, "seed_fens_n", 2048) or 2048)
+        seed_paths = [p for p in seed_paths if p.exists()]
+        seed_fens = [] if args.no_seed_caches else sample_seed_fens(seed_paths, seed_n, random.Random(args.seed + 3))
+        if seed_fens:
+            ok = []
+            for fen in seed_fens:
+                try:
+                    b = chess.Board(fen)
+                except ValueError:
+                    continue
+                if b.is_valid() and not b.is_game_over(claim_draw=True):
+                    ok.append(fen)
+            seed_fens = ok
+        log(f"seed_fens={len(seed_fens)} from {[str(p) for p in seed_paths]}", log_path)
     if committed >= target:
         write_manifest(out, {"teacher": fp, "config": asdict(cfg), "already_complete": True})
         log(f"already complete committed={committed:,} target={target:,}", log_path)
@@ -1243,16 +1308,21 @@ def generate(args) -> None:
             for _ in range(max(workers * 2, 8)):
                 if committed + new_rows >= target:
                     break
-                split = 1 if random.Random(game_i + 17).random() < args.holdout_frac else 0
-                spec = {
-                    "game_id": game_i,
-                    "seed": args.seed + game_i * 10007,
-                    "opening": list(OPENINGS[game_i % len(OPENINGS)]),
-                    "book_noise": int(cfg.book_noise) + (game_i % 7),
-                    "split": split,
-                }
-                if seed_fens and game_i % 2 == 1:
-                    spec["start_fen"] = seed_fens[game_i % len(seed_fens)]
+                if eco_starts:
+                    spec = build_eco_game_spec(
+                        game_i, eco_starts, seed=args.seed, holdout_frac=args.holdout_frac,
+                    )
+                else:
+                    split = 1 if random.Random(game_i + 17).random() < args.holdout_frac else 0
+                    spec = {
+                        "game_id": game_i,
+                        "seed": args.seed + game_i * 10007,
+                        "opening": list(OPENINGS[game_i % len(OPENINGS)]),
+                        "book_noise": int(cfg.book_noise) + (game_i % 7),
+                        "split": split,
+                    }
+                    if seed_fens and game_i % 2 == 1:
+                        spec["start_fen"] = seed_fens[game_i % len(seed_fens)]
                 jobs.append(spec)
                 game_i += 1
             if not jobs:
@@ -1384,6 +1454,29 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _hf_token() -> str:
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        val = os.environ.get(key)
+        if val:
+            return val
+    for path in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
+        if path.exists():
+            val = path.read_text(encoding="utf-8").strip()
+            if val:
+                os.environ["HF_TOKEN"] = val
+                return val
+    raise SystemExit("HF_TOKEN missing")
+
+
+def should_push_rows(ready: int, uploaded: int, every: int, finished: bool) -> bool:
+    """Push on 50k landmarks, or flush leftovers when the harvest is done."""
+    if ready <= uploaded or every <= 0:
+        return False
+    if finished:
+        return True
+    return (ready // every) > (uploaded // every)
+
+
 def _upload_with_retry(api, *, path: str, path_in_repo: str, repo: str, token: str, message: str, attempts: int = 5) -> None:
     last = None
     for i in range(attempts):
@@ -1487,14 +1580,79 @@ See `audit.json`. Flags did not predict disagreement; no adaptive extra search.
 """
 
 
+def _sf19_eco_readme(repo: str, n_total: int, tau: float, openings: dict, teacher: dict, stats: dict) -> str:
+    cfg = (teacher.get("config") or {})
+    run = (teacher.get("run") or {})
+    fp = run.get("source_revision") or (teacher.get("teacher") or {}).get("source_revision") or "edb0d9db6731067ec50ce619ff372b463bc4dd5d"
+    vols = openings.get("volumes") or {}
+    return f"""---
+license: mit
+tags:
+- chess
+- stockfish-19
+- soft-labels
+- multipv
+- eco
+- openings
+pretty_name: Stockfish 19 soft targets
+---
+
+# {repo}
+
+Official **Stockfish 19** MultiPV soft targets, mined from the Lichess ECO
+opening set. In-progress snapshot toward 1M unique positions.
+
+**{n_total:,}** rows in this upload. Source id `4`. Vocab `compact` (1968).
+
+## How positions are chosen
+
+Games start from the Lichess Chess Openings dataset
+(`lichess-org/chess-openings`): {int(openings.get('n_unique') or 0):,} named
+leaves (HF card still lists {int(openings.get('hf_card_n') or 3704):,}) plus
+book prefixes, **{int(openings.get('n_starts') or 0):,}** unique starts.
+
+ECO volumes: A {int(vols.get('A') or 0):,} / B {int(vols.get('B') or 0):,} /
+C {int(vols.get('C') or 0):,} / D {int(vols.get('D') or 0):,} /
+E {int(vols.get('E') or 0):,}.
+
+From each start: 0–4 random legal noise, then SF19 vs SF19 with rotating
+ε ∈ {{0.10, 0.18, 0.28, 0.40}} and a small uniform-legal wild chance. Labels
+every 2 plies from the start through ply {int(cfg.get('ply_cap') or 180)}.
+Deduped by 4-field board key against this run and existing local mixes.
+
+`split=1` is a ~5% holdout. Honor `split`. Do not invent a new position-hash holdout.
+
+## Teacher
+
+- Stockfish 19 tag `sf_19` (`{str(fp)[:8]}`), EvalFile `nn-1a298aa575a0.nnue`
+- Full file SHA-256 in `teacher.json`
+- Full strength, `Threads=1`, `Hash=64`, `UCI_ShowWDL=true`
+- Label budget: **{int(cfg.get('nodes') or 100000):,} nodes / MultiPV={int(cfg.get('multipv') or 8)}** / `tau={tau:g}`
+- Play on unlabeled plies: {int(cfg.get('play_nodes') or 4000):,} nodes
+
+## Targets
+
+- Policy: STM softmax(`tau={tau:g}`) over the last **complete** MultiPV-8 iteration
+- Unsearched legal moves are absent, not proven bad
+- Mate rank is `sign * (100000 - min(|mate|, 1000))`, not mate-as-cp
+- Bound scores are dropped
+- `cp` / `mate` / `wdl`: **White-absolute** (training loader contract)
+- `soft_indices` / `soft_probs`: width 8, pad `-1` / `0`
+- `soft_cps` / `soft_mates` are stored so softmax can be rebuilt without SF
+
+## Files
+
+- `data/shard_XXXXXX.parquet` — 5,000 rows each
+- `teacher.json`, `openings.json`, `manifest.json`, `stats.json`
+"""
+
+
 def push_hf(args) -> None:
     from huggingface_hub import HfApi, create_repo
     from scripts.export_soft_caches_to_hf import sf19_chunk_table
     import pyarrow.parquet as pq
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not token:
-        raise SystemExit("HF_TOKEN missing")
+    token = _hf_token()
     repo = args.repo
     out = Path(args.out_dir)
     inbox = out / "inbox"
@@ -1552,6 +1710,7 @@ def push_hf(args) -> None:
     extras = (
         "teacher.json", "bench.json", "manifest.json", "summary.json",
         "sampling.json", "audit.json", "eval_manifest.json",
+        "openings.json", "stats.json",
     )
     for name in extras:
         src = out / name
@@ -1563,17 +1722,75 @@ def push_hf(args) -> None:
     summary = _load_json(out / "summary.json")
     audit = _load_json(out / "audit.json")
     sampling = _load_json(out / "sampling.json")
+    openings = _load_json(out / "openings.json")
+    teacher = _load_json(out / "teacher.json")
+    stats = _load_json(out / "stats.json")
     readme = staging / "README.md"
-    readme.write_text(
-        _sf19_readme(repo, n_total, float(args.tau), summary, audit, sampling),
-        encoding="utf-8",
-    )
+    if openings:
+        readme.write_text(
+            _sf19_eco_readme(repo, n_total, float(args.tau), openings, teacher, stats),
+            encoding="utf-8",
+        )
+    else:
+        readme.write_text(
+            _sf19_readme(repo, n_total, float(args.tau), summary, audit, sampling),
+            encoding="utf-8",
+        )
     _upload_with_retry(
         api, path=str(readme), path_in_repo="README.md", repo=repo, token=token,
         message=f"card: {n_total:,} SF19 rows",
     )
-    state_path.write_text(json.dumps({"repo": repo, "uploaded": sorted(uploaded), "rows": n_total, "done": True}, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps({
+        "repo": repo, "uploaded": sorted(uploaded), "rows": n_total, "done": True,
+    }, indent=2), encoding="utf-8")
     log(f"https://huggingface.co/datasets/{repo} rows={n_total:,}")
+
+
+def watch_push(args) -> None:
+    """Poll READY shards and push each time we cross another --every rows."""
+    out = Path(args.out_dir)
+    inbox = out / "inbox"
+    log_path = out / "push_watch.log"
+    halt = out / "HALT_PUSH"
+    lock = out / "push.lock"
+    every = max(1, int(args.every))
+    poll = max(5.0, float(args.poll))
+    _hf_token()
+    log(
+        f"watch-push out={out} repo={args.repo} every={every} poll={poll}s",
+        log_path,
+    )
+    while True:
+        if halt.exists():
+            log("HALT_PUSH", log_path)
+            return
+        ready, _ = inbox_state(inbox)
+        uploaded = int(_load_json(out / "hf_upload.json").get("rows") or 0)
+        finished = (out / "summary.json").exists()
+        if should_push_rows(ready, uploaded, every, finished):
+            if lock.exists():
+                age = time.time() - lock.stat().st_mtime
+                if age < 30 * 60:
+                    log(f"skip push lock age={age:.0f}s ready={ready:,} uploaded={uploaded:,}", log_path)
+                    time.sleep(poll)
+                    continue
+            lock.write_text(str(os.getpid()), encoding="utf-8")
+            try:
+                log(f"push ready={ready:,} uploaded={uploaded:,} finished={finished}", log_path)
+                push_hf(args)
+            finally:
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+            uploaded = int(_load_json(out / "hf_upload.json").get("rows") or 0)
+            if finished and ready <= uploaded:
+                log(f"watch-push done uploaded={uploaded:,}", log_path)
+                return
+        elif finished and ready <= uploaded:
+            log(f"watch-push done uploaded={uploaded:,}", log_path)
+            return
+        time.sleep(poll)
 
 
 def main() -> None:
@@ -1591,6 +1808,7 @@ def main() -> None:
     add_shared(g)
     g.add_argument("--go", action="store_true")
     g.add_argument("--pilot", action="store_true")
+    g.add_argument("--smoke", action="store_true")
     g.add_argument("--target", type=int, default=25_000)
     g.add_argument("--workers", type=int, default=14)
     g.add_argument("--nodes", type=int, default=100_000)
@@ -1601,6 +1819,7 @@ def main() -> None:
     g.add_argument("--ply-skip-open", type=int, default=4)
     g.add_argument("--ply-cap", type=int, default=140)
     g.add_argument("--book-noise", type=int, default=2)
+    g.add_argument("--watchdog-s", type=float, default=8.0)
     g.add_argument("--hash-mb", type=int, default=64)
     g.add_argument("--clear-hash-every", type=int, default=0)
     g.add_argument("--shard-size", type=int, default=5_000)
@@ -1611,7 +1830,9 @@ def main() -> None:
     g.add_argument("--exclude-caches", nargs="*", default=None,
                    help="Caches whose position keys are blocked (already in the public set).")
     g.add_argument("--no-seed-caches", action="store_true")
-    g.add_argument("--mode", choices=("selfplay", "mix"), default="mix")
+    g.add_argument("--no-prefixes", action="store_true",
+                   help="ECO mode: start only from named leaves, not book prefixes.")
+    g.add_argument("--mode", choices=("selfplay", "mix", "eco"), default="mix")
     g.add_argument("--relabel-frac", type=float, default=0.8)
     a = sub.add_parser("audit")
     add_shared(a)
@@ -1648,12 +1869,40 @@ def main() -> None:
                    help="Remote parquet index = local shard index + offset (append without clobber).")
     p.add_argument("--base-rows", type=int, default=0,
                    help="Existing remote rows to include in the card total when appending.")
+    w = sub.add_parser("watch-push")
+    add_shared(w)
+    w.add_argument("--repo", default="avewright/stockfish-19-soft-targets")
+    w.add_argument("--every", type=int, default=50_000,
+                   help="Upload when READY rows cross another multiple of this.")
+    w.add_argument("--poll", type=float, default=30.0)
+    w.add_argument("--shard-offset", type=int, default=0)
+    w.add_argument("--base-rows", type=int, default=0)
     args = ap.parse_args()
     if args.cmd == "bench":
         bench(args)
     elif args.cmd == "generate":
         if not args.go:
             raise SystemExit("pass --go")
+        if args.mode == "eco":
+            args.no_seed_caches = True
+            if args.ply_skip_open == 4:
+                args.ply_skip_open = 0
+            if args.ply_cap == 140:
+                args.ply_cap = 180
+            if args.watchdog_s == 8.0:
+                args.watchdog_s = 20.0
+            if args.target == 25_000 and not args.pilot and not args.smoke:
+                args.target = 1_000_000
+            if args.workers == 14:
+                args.workers = max(1, (os.cpu_count() or 8) - 2)
+        if args.smoke:
+            args.target = min(args.target, 48)
+            args.workers = min(args.workers, 2)
+            args.nodes = min(args.nodes, 4_000)
+            args.play_nodes = min(args.play_nodes, 800)
+            args.ply_cap = min(args.ply_cap, 24)
+            args.shard_size = min(args.shard_size, 32)
+            args.watchdog_s = min(args.watchdog_s, 6.0)
         if args.pilot:
             args.target = min(args.target, 25_000)
         if getattr(args, "mode", "mix") == "mix":
@@ -1674,6 +1923,8 @@ def main() -> None:
         verify_loader(args)
     elif args.cmd == "push":
         push_hf(args)
+    elif args.cmd == "watch-push":
+        watch_push(args)
 
 
 if __name__ == "__main__":

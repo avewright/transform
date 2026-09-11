@@ -283,6 +283,16 @@ def test_flags_mark_shallow_and_decided():
     assert compute_flags(decided) & FLAG_DECIDED
 
 
+def test_should_push_rows_on_50k_landmarks():
+    from scripts.sf19_soft_dataset import should_push_rows
+    assert should_push_rows(140_000, 135_000, 50_000, False) is False
+    assert should_push_rows(149_999, 135_000, 50_000, False) is False
+    assert should_push_rows(150_000, 135_000, 50_000, False) is True
+    assert should_push_rows(200_000, 150_000, 50_000, False) is True
+    assert should_push_rows(136_000, 135_000, 50_000, True) is True
+    assert should_push_rows(135_000, 135_000, 50_000, True) is False
+
+
 def test_eval_bucket_and_existing_sample_skips_adjacent(tmp_path):
     from scripts.sf19_soft_prod import eval_bucket, sample_existing_specs
     from scripts.sf19_soft_dataset import stack_rows

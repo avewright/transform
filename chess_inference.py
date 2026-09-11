@@ -116,6 +116,9 @@ def get_model_move(
 ) -> tuple[chess.Move, dict]:
     """Pick a legal move from the model policy head."""
     board_input = batch_boards_to_fused_token_ids([board], device)
+    if getattr(getattr(model, "config", None), "use_history", False):
+        from chess_history import batch_history_features
+        board_input.update(batch_history_features([board], device))
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
         result = model(board_input)
 

@@ -305,10 +305,17 @@ def classify(sf_cp: int, sf_mate: int, model_cp: int, model_mate: int) -> tuple[
     return drop >= 150, drop, "cp"
 
 
+def search_limit(*, depth: int, movetime: float, nodes: int) -> chess.engine.Limit:
+    if nodes > 0:
+        return chess.engine.Limit(nodes=int(nodes))
+    return chess.engine.Limit(depth=depth, time=movetime)
+
+
 def analyse_pair(
-    engine, board: chess.Board, model_move: chess.Move, depth: int, movetime: float
+    engine, board: chess.Board, model_move: chess.Move, depth: int, movetime: float,
+    *, nodes: int = 0,
 ) -> dict | None:
-    limit = chess.engine.Limit(depth=depth, time=movetime)
+    limit = search_limit(depth=depth, movetime=movetime, nodes=nodes)
     infos = engine.analyse(
         board,
         limit,
@@ -434,6 +441,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--movetime", type=float, default=0.12, help="SF seconds per search")
+    ap.add_argument("--nodes", type=int, default=0,
+                    help="If >0, full-strength node budget (ignores depth/movetime).")
+    ap.add_argument("--sf-threads", type=int, default=2)
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
@@ -477,14 +487,18 @@ def main() -> None:
     random.Random(args.seed).shuffle(disagreements)
 
     log(
-        f"disagreements {len(disagreements)} — SF depth<={args.depth} "
-        f"movetime={args.movetime}s"
+        f"disagreements {len(disagreements)} — SF "
+        + (f"nodes={args.nodes}" if args.nodes else f"depth<={args.depth} movetime={args.movetime}s")
     )
     sf_path = str(resolve_stockfish())
 
     def start_engine():
         eng = chess.engine.SimpleEngine.popen_uci(sf_path)
-        eng.configure({"Threads": 2, "Hash": 64})
+        eng.configure({
+            "Threads": max(1, args.sf_threads),
+            "Hash": 256,
+            "UCI_LimitStrength": False,
+        })
         return eng
 
     engine = start_engine()
@@ -496,7 +510,9 @@ def main() -> None:
             if model_move not in board.legal_moves:
                 continue
             try:
-                result = analyse_pair(engine, board, model_move, args.depth, args.movetime)
+                result = analyse_pair(
+                    engine, board, model_move, args.depth, args.movetime, nodes=args.nodes,
+                )
             except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError) as exc:
                 log(f"  sf skip/restart: {type(exc).__name__}: {exc}")
                 try:

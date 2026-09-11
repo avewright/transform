@@ -70,6 +70,8 @@ class Squares64RecurrentConfig:
     policy_head_dim: int = 384
     value_hidden: int = 384
     n_value_classes: int = 3  # WDL aux
+    use_history: bool = False
+    use_threat_head: bool = False
 
     @property
     def unique_layers(self) -> int:
@@ -140,9 +142,15 @@ class Squares64Encoder(nn.Module):
     Output: (B, 64, embed_dim) — squares only.
     """
 
-    def __init__(self, embed_dim: int = 256):
+    def __init__(self, embed_dim: int = 256, use_history: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
+        self.use_history = use_history
+        if use_history:
+            self.history_proj = nn.Linear(2 * embed_dim, embed_dim, bias=False)
+            self.rule_proj = nn.Linear(3, embed_dim, bias=False)
+            nn.init.zeros_(self.history_proj.weight)
+            nn.init.zeros_(self.rule_proj.weight)
         self.piece_color_embed = nn.Embedding(NUM_FUSED_TOKENS, embed_dim)
         self.square_embed = nn.Embedding(64, embed_dim)
 
@@ -171,13 +179,24 @@ class Squares64Encoder(nn.Module):
         h = self._apply_film(h, self.turn_film(token_ids["turn"]))
         h = self._apply_film(h, self.castling_film(token_ids["castling"]))
         h = self._apply_film(h, self.ep_film(token_ids["ep_file"]))
+        if self.use_history:
+            if "history_fused_ids" in token_ids:
+                history = self.piece_color_embed(token_ids["history_fused_ids"])
+                history = history * token_ids["history_mask"][:, :, None, None]
+                h = h + self.history_proj(history.transpose(1, 2).flatten(2))
+            if "rule_features" in token_ids:
+                h = h + self.rule_proj(token_ids["rule_features"].to(h.dtype)).unsqueeze(1)
         return self.norm(h)
 
     def prepare_input(self, board: chess.Board, device: torch.device):
-        return batch_boards_to_fused_token_ids([board], device)
+        return self.prepare_batch([board], device)
 
     def prepare_batch(self, boards: list[chess.Board], device: torch.device):
-        return batch_boards_to_fused_token_ids(boards, device)
+        result = batch_boards_to_fused_token_ids(boards, device)
+        if self.use_history:
+            from chess_history import batch_history_features
+            result.update(batch_history_features(boards, device))
+        return result
 
 
 class Squares64RecurrentTransformer(nn.Module):
@@ -187,7 +206,7 @@ class Squares64RecurrentTransformer(nn.Module):
         super().__init__()
         config.validate()
         self.config = config
-        self.encoder = Squares64Encoder(config.encoder_dim)
+        self.encoder = Squares64Encoder(config.encoder_dim, config.use_history)
         self.input_proj = nn.Linear(config.encoder_dim, config.hidden_dim)
 
         ffn_dim = config.hidden_dim * config.ffn_ratio
@@ -220,6 +239,16 @@ class Squares64RecurrentTransformer(nn.Module):
             nn.Linear(config.value_hidden, config.n_value_classes),
         )
 
+        if config.use_history:
+            self.repetition_gate = nn.Linear(config.hidden_dim, 1)
+            nn.init.zeros_(self.repetition_gate.weight)
+            nn.init.zeros_(self.repetition_gate.bias)
+        if config.use_threat_head:
+            # Three binary logits per candidate: mate, material loss, promotion threat.
+            self.threat_head = nn.Linear(config.hidden_dim, VOCAB_SIZE * 3)
+            nn.init.zeros_(self.threat_head.weight)
+            nn.init.zeros_(self.threat_head.bias)
+
     def _run_block(self, layer: nn.Module, h: torch.Tensor) -> torch.Tensor:
         if self.config.gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
@@ -241,12 +270,19 @@ class Squares64RecurrentTransformer(nn.Module):
 
         h = self.norm(h)
         global_h = h.mean(dim=1)  # no CLS token — mean pool over 64 squares
-        return {
-            "policy_logits": self.policy_head(h, global_h),
+        policy = self.policy_head(h, global_h)
+        if self.config.use_history and "move_repetition" in board_input:
+            policy = policy + self.repetition_gate(global_h) * board_input["move_repetition"].to(policy.dtype)
+        result = {
+            "policy_logits": policy,
             "value_logits": self.value_head(global_h),
             "square_hidden": h,
             "global_hidden": global_h,
         }
+
+        if self.config.use_threat_head:
+            result["threat_logits"] = self.threat_head(global_h).reshape(-1, VOCAB_SIZE, 3)
+        return result
 
     def recurrent_parameters(self):
         """Parameters belonging to the weight-tied recurrent bank."""
@@ -288,3 +324,25 @@ def build_squares64(
         cfg = Squares64RecurrentConfig(**{k: v for k, v in config.items() if k in known})
     cfg.validate()
     return Squares64RecurrentTransformer(cfg)
+
+
+def upgrade_with_history(model: Squares64RecurrentTransformer, *, threat_head: bool = False):
+    """Return an upgraded copy, preserving old weights and zero new contributions.
+
+    Rebuild the optimizer for this copy; old optimizer parameter groups do not
+    contain the new parameters. Save the returned config with its state dict.
+    """
+    from dataclasses import replace
+    cfg = replace(model.config, use_history=True,
+                  use_threat_head=model.config.use_threat_head or threat_head)
+    param = next(model.parameters())
+    upgraded = build_squares64(cfg).to(device=param.device, dtype=param.dtype)
+    old = model.state_dict()
+    state = upgraded.state_dict()
+    for key, value in old.items():
+        if key not in state or state[key].shape != value.shape:
+            raise ValueError(f"Incompatible checkpoint parameter: {key}")
+        state[key] = value
+    upgraded.load_state_dict(state, strict=True)
+    upgraded.train(model.training)
+    return upgraded

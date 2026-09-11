@@ -1,0 +1,8 @@
+Lichess Chess Openings (ECO) source TSVs.
+
+Upstream: https://github.com/lichess-org/chess-openings
+Files: a.tsv … e.tsv (eco, name, pgn). Pulled from master on 2026-09-10.
+
+The Hugging Face card still lists 3,704 rows; current master parses to 3,810
+unique 4-field positions (2 are already terminal and are dropped as starts).
+Use scripts/lichess_openings.py — do not edit these TSVs by hand.

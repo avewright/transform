@@ -220,6 +220,9 @@ class MCTSSearch:
         if not boards:
             return []
         inp = batch_boards_to_fused_token_ids(boards, self.device)
+        if getattr(getattr(self.model, "config", None), "use_history", False):
+            from chess_history import batch_history_features
+            inp.update(batch_history_features(boards, self.device))
         if self.use_fp16:
             r = self._fp16_safe_forward(inp)
         else:
