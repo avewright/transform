@@ -55,10 +55,13 @@ INCUMBENT_MARKERS = (
     "DEFAULT_100M",
 )
 
-# Conservative first-night LRs. 99M used muon=0.02 / adam=3e-4.
-# Width ratio 736/1216 ≈ 0.605. Do not assume those transfer.
-MUON_LR_PILOT = 0.012
-ADAM_LR_PILOT = 0.00018
+# Match the 99M continuation phase (Polar-NorMuon + constant LRs).
+# 99M pretrain peak 0.02 / 3e-4, scaled by ~270/99.
+MUON_LR = 0.02 / 2.7
+ADAM_LR = 3e-4 / 2.7
+DEFAULT_BONUS = ROOT / "outputs" / "exp270_mix_v1" / "bonus_cache.pt"
+DEFAULT_QUALITY = ROOT / "outputs" / "exp270_mix_v1" / "sf19_eco_train.pt"
+DEFAULT_PUZZLE = ROOT / "outputs" / "exp270_mix_v1" / "puzzle_cache.pt"
 
 
 def _assert_compact() -> None:
@@ -94,7 +97,7 @@ def trial_config() -> dict:
         "arch": "squares64",
         "desc": (
             "~270M squares64 recurrent, fresh init, "
-            "75/20/5 SF19/Lichess/Syzygy. No puzzles, no correction, no live ingest."
+            "PolarNorMuon, soft_alpha=0.55, 20% Syzygy + 8% correction + 5% SF19 ECO + 5% puzzle play per batch."
         ),
         "incumbent_benchmark": {
             "name": "99M squares64",
@@ -106,39 +109,44 @@ def trial_config() -> dict:
         "recipe": str(RECIPE),
         "model": model,
         "train": {
-            "batch_size": 64,
+            "batch_size": 48,
             "min_batch_size": 8,
-            "max_batch_size": 64,
+            "max_batch_size": 80,
             "accum_steps": 1,
             "soft_frac": 1.0,
             "soft_alpha": 0.55,
             "soft_temp": 4.0,
             "soft_temp_weight": 0.4,
-            "deep_mix_frac": 0.05,
-            "bonus_mix_frac": 0.0,
-            "use_swa": True,
+            "deep_mix_frac": 0.20,
+            "deep_in_each_batch": True,
+            "bonus_mix_frac": 0.08,
+            "quality_mix_frac": 0.05,
+            "puzzle_mix_frac": 0.05,
+            "use_swa": False,
             "swa_start_frac": 0.75,
             "hflip_p": 0.5,
             "value_weight": 0.15,
             "min_depth": 12,
             "optimizer": "polar_normuon",
             "compile_polar": True,
-            "muon_lr": MUON_LR_PILOT,
-            "adam_lr": ADAM_LR_PILOT,
+            "force_lr": True,
+            "muon_lr": MUON_LR,
+            "adam_lr": ADAM_LR,
             "weight_decay": 0.01,
             "grad_clip": 1.0,
-            "warmup": 1000,
-            "min_lr_frac": 0.05,
+            "warmup": 0,
+            "min_lr_frac": 1.0,
             "torch_compile": True,
+            "compile_mode": "default",
             "grad_checkpoint": False,
-            "fill_vram": False,
-            "max_vram_gb": 22.0,
-            "save_every_steps": 250,
-            "keep_step_every": 500,
-            "keep_last_ckpts": 6,
-            "val_every_steps": 500,
+            "fill_vram": True,
+            "max_vram_gb": 14.2,
+            "save_every_steps": 500,
+            "keep_step_every": 1000,
+            "keep_last_ckpts": 4,
+            "val_every_steps": 1000,
             "val_eval_n": 256,
-            "elo_every_steps": 2000,
+            "elo_every_steps": 0,
         },
     }
 
@@ -213,7 +221,7 @@ def train(args: argparse.Namespace) -> dict:
     if not soft.exists():
         raise SystemExit(
             f"missing mix {soft}\n"
-            "On the pod: python scripts/build_exp270_mix.py --go"
+            "On the pod: python scripts/pack_exp270_all.py"
         )
     if not deep.exists():
         raise SystemExit(f"missing deep cache {deep}")
@@ -224,7 +232,7 @@ def train(args: argparse.Namespace) -> dict:
     train_cfg = trial["train"]
     if args.batch_size is not None:
         train_cfg["batch_size"] = int(args.batch_size)
-        train_cfg["max_batch_size"] = int(args.batch_size)
+        train_cfg["max_batch_size"] = max(int(train_cfg.get("max_batch_size", 0)), int(args.batch_size))
     if args.accum_steps is not None:
         train_cfg["accum_steps"] = int(args.accum_steps)
     if args.muon_lr is not None:
@@ -246,6 +254,28 @@ def train(args: argparse.Namespace) -> dict:
         train_cfg["val_every_steps"] = int(args.val_every)
     if args.torch_compile is not None:
         train_cfg["torch_compile"] = bool(args.torch_compile)
+    if args.optimizer is not None:
+        train_cfg["optimizer"] = str(args.optimizer)
+    if args.compile_mode is not None:
+        train_cfg["compile_mode"] = str(args.compile_mode)
+    if args.deep_mix_frac is not None:
+        train_cfg["deep_mix_frac"] = float(args.deep_mix_frac)
+    if args.deep_in_each_batch is not None:
+        train_cfg["deep_in_each_batch"] = bool(args.deep_in_each_batch)
+    if args.soft_alpha is not None:
+        train_cfg["soft_alpha"] = float(args.soft_alpha)
+    if args.bonus_mix_frac is not None:
+        train_cfg["bonus_mix_frac"] = float(args.bonus_mix_frac)
+    if args.quality_mix_frac is not None:
+        train_cfg["quality_mix_frac"] = float(args.quality_mix_frac)
+    if args.puzzle_mix_frac is not None:
+        train_cfg["puzzle_mix_frac"] = float(args.puzzle_mix_frac)
+    if args.force_lr:
+        train_cfg["force_lr"] = True
+    if args.compile_polar is not None:
+        train_cfg["compile_polar"] = bool(args.compile_polar)
+    if args.fill_vram is not None:
+        train_cfg["fill_vram"] = bool(args.fill_vram)
     if args.external_eval:
         spec = {}
         for item in args.external_eval:
@@ -256,10 +286,30 @@ def train(args: argparse.Namespace) -> dict:
         train_cfg["external_eval"] = spec
     if args.block_manifest:
         train_cfg["block_manifests"] = [str(Path(p).resolve()) for p in args.block_manifest]
+    extras = [Path(p) for p in (args.extra_soft_cache or [])]
+    extras = [p if p.is_absolute() else ROOT / p for p in extras]
 
     resume = Path(args.resume) if args.resume else None
     if resume is not None and not resume.exists():
         raise SystemExit(f"resume ckpt missing: {resume}")
+
+    bonus = Path(args.bonus_cache) if args.bonus_cache else None
+    if bonus is not None and not bonus.is_absolute():
+        bonus = ROOT / bonus
+    if bonus is not None and not bonus.exists():
+        bonus = None
+
+    quality = Path(args.quality_cache) if args.quality_cache else None
+    if quality is not None and not quality.is_absolute():
+        quality = ROOT / quality
+    if quality is not None and not quality.exists():
+        quality = None
+
+    puzzle = Path(args.puzzle_cache) if args.puzzle_cache else None
+    if puzzle is not None and not puzzle.is_absolute():
+        puzzle = ROOT / puzzle
+    if puzzle is not None and not puzzle.exists():
+        puzzle = None
 
     result = train_trial(
         trial,
@@ -270,8 +320,10 @@ def train(args: argparse.Namespace) -> dict:
         max_minutes=args.train_minutes,
         smoke=False,
         resume_ckpt=resume,
-        extra_soft_caches=None,
-        bonus_cache=None,
+        extra_soft_caches=extras or None,
+        bonus_cache=bonus,
+        quality_cache=quality,
+        puzzle_cache=puzzle,
     )
     (out / "train_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2), flush=True)
@@ -287,7 +339,7 @@ def main() -> None:
     ap.add_argument("--deep-cache", default=str(DEFAULT_DEEP))
     ap.add_argument("--output-dir", default=str(OUT_DIR))
     ap.add_argument("--max-steps", type=int, default=100_000)
-    ap.add_argument("--train-minutes", type=float, default=630.0, help="Default 10.5h; reserve 90m for eval/backup on a 12h pod")
+    ap.add_argument("--train-minutes", type=float, default=840.0, help="Default 14h")
     ap.add_argument("--resume", default=None, help="Resume THIS run only (exp270 latest.pt). Not the 99M incumbent.")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--accum-steps", type=int, default=None)
@@ -300,8 +352,36 @@ def main() -> None:
     ap.add_argument("--save-every", type=int, default=None)
     ap.add_argument("--val-every", type=int, default=None)
     ap.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--optimizer", default=None, help="normuon | polar_normuon | adamw")
+    ap.add_argument("--compile-mode", default=None, help="default | reduce-overhead | max-autotune")
+    ap.add_argument("--deep-mix-frac", type=float, default=None)
+    ap.add_argument("--deep-in-each-batch", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--soft-alpha", type=float, default=None)
+    ap.add_argument("--bonus-mix-frac", type=float, default=None)
+    ap.add_argument("--bonus-cache", default=str(DEFAULT_BONUS), help="Correction / disagreement soft cache")
+    ap.add_argument("--quality-mix-frac", type=float, default=None)
+    ap.add_argument(
+        "--quality-cache",
+        default=str(DEFAULT_QUALITY),
+        help="Oversampled SF19 MultiPV ECO soft cache (split=0 only)",
+    )
+    ap.add_argument("--puzzle-mix-frac", type=float, default=None)
+    ap.add_argument(
+        "--puzzle-cache",
+        default=str(DEFAULT_PUZZLE),
+        help="Lichess puzzle play-through (solver plies, one-hot)",
+    )
+    ap.add_argument("--force-lr", action="store_true", help="Hold muon/adam LRs constant")
+    ap.add_argument("--compile-polar", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--fill-vram", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--external-eval", action="append", default=[])
     ap.add_argument("--block-manifest", action="append", default=[])
+    ap.add_argument(
+        "--extra-soft-cache",
+        action="append",
+        default=[],
+        help="Extra disjoint soft .pt shards (remaining Lichess). Repeatable.",
+    )
     args = ap.parse_args()
     _assert_compact()
 

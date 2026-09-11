@@ -78,12 +78,16 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     policy_soft_temp_weight,
     position_hashes,
     prepare_soft_batch,
+    cat_soft_batches,
     session_throughput,
     restore_rng_state,
     save_training_checkpoint,
     value_valid_rows,
     soft_policy_loss,
     soft_temp_policy_loss,
+    teacher_logits_kd_loss,
+    teacher_wdl_kl_loss,
+    logits_to_soft_targets,
     unwrap_model,
     write_shard_manifest,
 )
@@ -199,6 +203,9 @@ def train_trial(
     resume_ckpt: Path | None = None,
     extra_soft_caches: list[Path] | None = None,
     bonus_cache: Path | None = None,
+    quality_cache: Path | None = None,
+    puzzle_cache: Path | None = None,
+    teacher_ckpt: Path | None = None,
 ) -> dict[str, Any]:
     """Train one trial. Returns metrics dict including ckpt_path / pos_s / status."""
     os.environ.setdefault("MOVE_VOCAB_VERSION", "compact")
@@ -383,10 +390,11 @@ def train_trial(
 
     compiled = False
     if train.get("torch_compile") and hasattr(torch, "compile"):
+        compile_mode = str(train.get("compile_mode") or "reduce-overhead")
         try:
-            model = torch.compile(model, mode="default", fullgraph=False)
+            model = torch.compile(model, mode=compile_mode, fullgraph=False)
             compiled = True
-            _log(log_path, "torch.compile enabled (mode=default); will fall back if inductor fails")
+            _log(log_path, f"torch.compile enabled (mode={compile_mode}); will fall back if inductor fails")
         except Exception as e:
             _log(log_path, f"torch.compile skipped: {e}")
 
@@ -463,12 +471,15 @@ def train_trial(
                     f"({n_prior_rows:,} hashes) seen={int(seen_h.size):,}",
                 )
         if extra_soft_caches:
-            extras = load_extra_soft_shards(
-                [Path(p) for p in extra_soft_caches],
-                log=lambda m: _log(log_path, m),
-            )
-            kept_extras: list[dict] = []
-            for name, data in extras:
+            n_kept = 0
+            for p in extra_soft_caches:
+                loaded = load_extra_soft_shards(
+                    [Path(p)],
+                    log=lambda m: _log(log_path, m),
+                )
+                if not loaded:
+                    continue
+                name, data = loaded[0]
                 data, new_h, rep = filter_disjoint(data, seen_h)
                 _log(
                     log_path,
@@ -476,19 +487,21 @@ def train_trial(
                     f"internal_dups={rep['internal_dups']} vs_prior={rep['vs_seen']}",
                 )
                 if rep["n_out"] <= 0:
+                    del data
                     continue
-                kept_extras.append(data)
+                soft_data = concat_soft_tables([soft_data, data])
+                del data
+                n_kept += 1
                 attached_names.append(name)
                 seen_h = _np.unique(_np.concatenate([seen_h, new_h]))
                 sp = Path(name)
                 if sp.is_dir():
                     (sp / "READY").unlink(missing_ok=True)
                     (sp / "ATTACHED").write_text(f"step={start_step} kept={rep['n_out']}\n", encoding="utf-8")
-            if kept_extras:
-                soft_data = concat_soft_tables([soft_data] + kept_extras)
+            if n_kept:
                 _log(
                     log_path,
-                    f"attached {len(kept_extras)} disjoint SF shards → n={int(soft_data['board_array'].shape[0]):,} "
+                    f"attached {n_kept} disjoint SF shards → n={int(soft_data['board_array'].shape[0]):,} "
                     f"unique_hashes={int(seen_h.size):,}",
                 )
         if ext_eval_data:
@@ -583,6 +596,48 @@ def train_trial(
 
     _ingest_bonus_inbox()
 
+    quality_data = None
+    train_quality_idx = None
+    train_quality_n = 0
+    quality_path = Path(quality_cache) if quality_cache else None
+    if quality_path is not None:
+        if quality_path.exists():
+            quality_data = torch.load(quality_path, map_location="cpu", weights_only=False)
+            attach_static_targets(quality_data)
+            train_quality_n = int(quality_data["board_array"].shape[0])
+            train_quality_idx = torch.arange(train_quality_n)
+            _log(log_path, f"quality cache {quality_path} n={train_quality_n:,}")
+        else:
+            _log(log_path, f"quality cache missing: {quality_path}")
+
+    if quality_data is not None and blocked_hold.size:
+        quality_data, n_qblk = drop_blocked_rows(quality_data, blocked_hold)
+        if n_qblk:
+            _log(log_path, f"holdout-blocked {n_qblk:,} quality rows")
+            train_quality_n = int(quality_data["board_array"].shape[0])
+            train_quality_idx = torch.arange(train_quality_n)
+
+    puzzle_data = None
+    train_puzzle_idx = None
+    train_puzzle_n = 0
+    puzzle_path = Path(puzzle_cache) if puzzle_cache else None
+    if puzzle_path is not None:
+        if puzzle_path.exists():
+            puzzle_data = torch.load(puzzle_path, map_location="cpu", weights_only=False)
+            attach_static_targets(puzzle_data)
+            train_puzzle_n = int(puzzle_data["board_array"].shape[0])
+            train_puzzle_idx = torch.arange(train_puzzle_n)
+            _log(log_path, f"puzzle cache {puzzle_path} n={train_puzzle_n:,}")
+        else:
+            _log(log_path, f"puzzle cache missing: {puzzle_path}")
+
+    if puzzle_data is not None and blocked_hold.size:
+        puzzle_data, n_pblk = drop_blocked_rows(puzzle_data, blocked_hold)
+        if n_pblk:
+            _log(log_path, f"holdout-blocked {n_pblk:,} puzzle rows")
+            train_puzzle_n = int(puzzle_data["board_array"].shape[0])
+            train_puzzle_idx = torch.arange(train_puzzle_n)
+
     if deep_cache and deep_cache.exists():
         deep_data = torch.load(deep_cache, map_location="cpu", weights_only=False)
         attach_static_targets(deep_data)
@@ -627,6 +682,30 @@ def train_trial(
     min_lr_frac = float(train.get("min_lr_frac", 0.05))
     bs = int(train["batch_size"])
     accum = int(train.get("accum_steps", 1))
+    teacher_model = None
+    teacher_path = Path(teacher_ckpt) if teacher_ckpt else None
+    if teacher_path is None and train.get("teacher_ckpt"):
+        teacher_path = Path(train["teacher_ckpt"])
+    teacher_temp = float(train.get("teacher_temp", 2.0))
+    teacher_topk = int(train.get("teacher_topk", 32) or 0)
+    teacher_kd_frac = float(train.get("teacher_kd_frac", 1.0))
+    teacher_replace_hard = bool(train.get("teacher_replace_hard", False))
+    teacher_value = bool(train.get("teacher_value", False))
+    if teacher_path is not None:
+        if not teacher_path.exists():
+            raise FileNotFoundError(f"teacher ckpt missing: {teacher_path}")
+        from chess_inference import load_checkpoint
+        teacher_model = load_checkpoint(teacher_path, device=device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+        n_teacher = sum(p.numel() for p in teacher_model.parameters())
+        _log(
+            log_path,
+            f"teacher {teacher_path} params={n_teacher/1e6:.2f}M "
+            f"kd_temp={teacher_temp:g} kd_frac={teacher_kd_frac:g} topk={teacher_topk} "
+            f"replace_hard={int(teacher_replace_hard)} value_kl={int(teacher_value)}",
+        )
     # Fit batch to VRAM. Shrinks on OOM / over-cap; grows when fill_vram is set.
     # Also detects torch.compile/inductor failures (common on Windows without MSVC).
     if device.type == "cuda" and not smoke:
@@ -647,6 +726,9 @@ def train_trial(
                 }
                 model.train()
                 with autocast("cuda", dtype=torch.bfloat16):
+                    if teacher_model is not None:
+                        with torch.no_grad():
+                            teacher_model(probe)
                     out = model(probe)
                     loss = out["policy_logits"].float().mean() + out["value_logits"].float().mean()
                 loss.backward()
@@ -708,13 +790,22 @@ def train_trial(
     soft_alpha = float(train.get("soft_alpha", 0.45))
     deep_mix = float(train.get("deep_mix_frac", 0.35))
     bonus_mix = float(train.get("bonus_mix_frac", 0.0))
+    quality_mix = float(train.get("quality_mix_frac", 0.0))
+    puzzle_mix = float(train.get("puzzle_mix_frac", 0.0))
     bonus_soft_temp_weight = train.get("bonus_soft_temp_weight", None)
     if bonus_soft_temp_weight is not None:
         bonus_soft_temp_weight = float(bonus_soft_temp_weight)
     if bonus_mix > 0:
         _log(log_path, f"bonus_mix_frac={bonus_mix:g} n={train_bonus_n:,}")
+    if quality_mix > 0:
+        _log(log_path, f"quality_mix_frac={quality_mix:g} n={train_quality_n:,}")
+    if puzzle_mix > 0:
+        _log(log_path, f"puzzle_mix_frac={puzzle_mix:g} n={train_puzzle_n:,}")
     if bonus_soft_temp_weight is not None:
         _log(log_path, f"bonus_soft_temp_weight={bonus_soft_temp_weight:g} (general={float(train.get('soft_temp_weight', 0.5)):g})")
+    deep_in_each_batch = bool(train.get("deep_in_each_batch", False))
+    if deep_in_each_batch and deep_mix > 0:
+        _log(log_path, f"deep_in_each_batch frac={deep_mix:g} (syzygy rows every step)")
     hflip_p = float(train.get("hflip_p", 0.5))
     value_weight = float(train.get("value_weight", 0.1))
     grad_clip = float(train.get("grad_clip", 1.0))
@@ -735,6 +826,8 @@ def train_trial(
     train["batch_size"] = bs
 
     def set_lrs(step: int) -> None:
+        if train.get("force_lr"):
+            return
         scale = lr_scale(step, warmup=warmup, max_steps=max_steps, min_lr_frac=min_lr_frac)
         for pg, base in zip(optimizer.param_groups, base_lrs):
             pg["lr"] = base * scale
@@ -761,6 +854,8 @@ def train_trial(
     shallow_seen = 0
     deep_seen = 0
     bonus_seen = 0
+    quality_seen = 0
+    puzzle_seen = 0
     swa_state: dict[str, torch.Tensor] | None = None
     swa_n = 0
     swa_start_step = int(max_steps * swa_start_frac) if use_swa else max_steps + 1
@@ -879,34 +974,134 @@ def train_trial(
             )
             for _ in range(accum):
                 if use_soft and soft_data is not None:
-                    draw = torch.rand(1, generator=rng).item()
-                    mix_src = pick_mix_source(
-                        draw, bonus_mix, deep_mix,
-                        has_bonus=bonus_data is not None and train_bonus_n > 0,
-                        has_deep=deep_data is not None and train_deep_n > 0,
-                    )
-                    use_bonus = mix_src == "bonus"
-                    use_deep = mix_src == "deep"
-                    if use_bonus:
-                        src, pool = bonus_data, train_bonus_idx
-                        bonus_seen += bs
-                    elif use_deep:
-                        src, pool = deep_data, train_deep_idx
-                        deep_seen += bs
+                    has_deep = deep_data is not None and train_deep_n > 0
+                    has_bonus = bonus_data is not None and train_bonus_n > 0
+                    has_quality = quality_data is not None and train_quality_n > 0
+                    has_puzzle = puzzle_data is not None and train_puzzle_n > 0
+                    n_deep = 0
+                    n_bonus = 0
+                    n_quality = 0
+                    n_puzzle = 0
+                    if deep_in_each_batch and (deep_mix > 0 or bonus_mix > 0 or quality_mix > 0 or puzzle_mix > 0):
+                        if has_deep and deep_mix > 0:
+                            n_deep = max(1, int(round(bs * deep_mix)))
+                        if has_bonus and bonus_mix > 0:
+                            n_bonus = max(1, int(round(bs * bonus_mix)))
+                        if has_quality and quality_mix > 0:
+                            n_quality = max(1, int(round(bs * quality_mix)))
+                        if has_puzzle and puzzle_mix > 0:
+                            n_puzzle = max(1, int(round(bs * puzzle_mix)))
+                        overflow = n_deep + n_bonus + n_quality + n_puzzle - (bs - 1)
+                        if overflow > 0:
+                            n_puzzle = max(0, n_puzzle - overflow)
+                            overflow = n_deep + n_bonus + n_quality + n_puzzle - (bs - 1)
+                        if overflow > 0:
+                            n_quality = max(0, n_quality - overflow)
+                            overflow = n_deep + n_bonus + n_quality + n_puzzle - (bs - 1)
+                        if overflow > 0:
+                            n_bonus = max(0, n_bonus - overflow)
+                            overflow = n_deep + n_bonus + n_quality + n_puzzle - (bs - 1)
+                        if overflow > 0:
+                            n_deep = max(0, n_deep - overflow)
+                    if n_deep or n_bonus or n_quality or n_puzzle:
+                        n_soft = bs - n_deep - n_bonus - n_quality - n_puzzle
+                        parts = []
+                        v_parts = []
+                        if n_soft:
+                            loc_s = torch.randint(0, int(train_soft_idx.numel()), (n_soft,), generator=rng)
+                            idx_s = train_soft_idx[loc_s]
+                            parts.append(prepare_soft_batch(soft_data, idx_s, device, hflip_p=hflip_p, rng=rng))
+                            v_s = value_valid_rows(soft_data, idx_s)
+                            v_parts.append(torch.ones(n_soft, dtype=torch.int8) if v_s is None else v_s)
+                            shallow_seen += n_soft
+                        if n_deep:
+                            loc_d = torch.randint(0, int(train_deep_idx.numel()), (n_deep,), generator=rng)
+                            idx_d = train_deep_idx[loc_d]
+                            parts.append(prepare_soft_batch(deep_data, idx_d, device, hflip_p=hflip_p, rng=rng))
+                            v_d = value_valid_rows(deep_data, idx_d)
+                            v_parts.append(torch.ones(n_deep, dtype=torch.int8) if v_d is None else v_d)
+                            deep_seen += n_deep
+                        if n_bonus:
+                            loc_b = torch.randint(0, int(train_bonus_idx.numel()), (n_bonus,), generator=rng)
+                            idx_b = train_bonus_idx[loc_b]
+                            parts.append(prepare_soft_batch(bonus_data, idx_b, device, hflip_p=hflip_p, rng=rng))
+                            v_b = value_valid_rows(bonus_data, idx_b)
+                            v_parts.append(torch.ones(n_bonus, dtype=torch.int8) if v_b is None else v_b)
+                            bonus_seen += n_bonus
+                        if n_quality:
+                            loc_q = torch.randint(0, int(train_quality_idx.numel()), (n_quality,), generator=rng)
+                            idx_q = train_quality_idx[loc_q]
+                            parts.append(prepare_soft_batch(quality_data, idx_q, device, hflip_p=hflip_p, rng=rng))
+                            v_q = value_valid_rows(quality_data, idx_q)
+                            v_parts.append(torch.ones(n_quality, dtype=torch.int8) if v_q is None else v_q)
+                            quality_seen += n_quality
+                        if n_puzzle:
+                            loc_p = torch.randint(0, int(train_puzzle_idx.numel()), (n_puzzle,), generator=rng)
+                            idx_p = train_puzzle_idx[loc_p]
+                            parts.append(prepare_soft_batch(puzzle_data, idx_p, device, hflip_p=hflip_p, rng=rng))
+                            v_p = value_valid_rows(puzzle_data, idx_p)
+                            v_parts.append(torch.ones(n_puzzle, dtype=torch.int8) if v_p is None else v_p)
+                            puzzle_seen += n_puzzle
+                        bi, hard, wdl, si, sp = cat_soft_batches(parts)
+                        v_ok = torch.cat(v_parts, dim=0) if v_parts else None
+                        use_bonus = bool(n_bonus)
                     else:
-                        src, pool = soft_data, train_soft_idx
-                        shallow_seen += bs
-                    local = torch.randint(0, int(pool.numel()), (bs,), generator=rng)
-                    idx = pool[local]
-                    bi, hard, wdl, si, sp = prepare_soft_batch(
-                        src, idx, device, hflip_p=hflip_p, rng=rng,
-                    )
+                        draw = torch.rand(1, generator=rng).item()
+                        mix_src = pick_mix_source(
+                            draw, bonus_mix, deep_mix,
+                            has_bonus=has_bonus,
+                            has_deep=has_deep,
+                            quality_mix=quality_mix,
+                            has_quality=has_quality,
+                            puzzle_mix=puzzle_mix,
+                            has_puzzle=has_puzzle,
+                        )
+                        use_bonus = mix_src == "bonus"
+                        use_deep = mix_src == "deep"
+                        if mix_src == "puzzle":
+                            src, pool = puzzle_data, train_puzzle_idx
+                            puzzle_seen += bs
+                        elif mix_src == "quality":
+                            src, pool = quality_data, train_quality_idx
+                            quality_seen += bs
+                        elif use_bonus:
+                            src, pool = bonus_data, train_bonus_idx
+                            bonus_seen += bs
+                        elif use_deep:
+                            src, pool = deep_data, train_deep_idx
+                            deep_seen += bs
+                        else:
+                            src, pool = soft_data, train_soft_idx
+                            shallow_seen += bs
+                        local = torch.randint(0, int(pool.numel()), (bs,), generator=rng)
+                        idx = pool[local]
+                        bi, hard, wdl, si, sp = prepare_soft_batch(
+                            src, idx, device, hflip_p=hflip_p, rng=rng,
+                        )
+                        v_ok = value_valid_rows(src, idx)
                     with amp_context(device):
+                        t_out = None
+                        if teacher_model is not None:
+                            with torch.no_grad():
+                                t_out = teacher_model(bi)
+                            if teacher_replace_hard:
+                                hard = t_out["policy_logits"].argmax(dim=-1)
                         out = model(bi)
                         hard_ce = F.cross_entropy(
                             out["policy_logits"], hard, label_smoothing=label_smoothing,
                         )
-                        soft_ce = soft_policy_loss(out["policy_logits"], si, sp)
+                        dataset_soft = soft_policy_loss(out["policy_logits"], si, sp)
+                        if t_out is not None and teacher_kd_frac > 0:
+                            kd = teacher_logits_kd_loss(
+                                out["policy_logits"], t_out["policy_logits"],
+                                temperature=teacher_temp,
+                            )
+                            if teacher_kd_frac >= 1.0:
+                                soft_ce = kd
+                            else:
+                                soft_ce = (1.0 - teacher_kd_frac) * dataset_soft + teacher_kd_frac * kd
+                        else:
+                            soft_ce = dataset_soft
                         p_loss = (1.0 - soft_alpha) * hard_ce + soft_alpha * soft_ce
                         st_w = policy_soft_temp_weight(
                             use_bonus, soft_temp_weight, bonus_soft_temp_weight,
@@ -915,10 +1110,14 @@ def train_trial(
                             p_loss = p_loss + st_w * soft_temp_policy_loss(
                                 out["policy_logits"], si, sp, temperature=soft_temp,
                             )
-                        v_ok = value_valid_rows(src, idx)
                         if v_ok is not None:
                             v_ok = v_ok.to(device=device, dtype=torch.float32)
-                        v_loss = masked_mean_ce(out["value_logits"], wdl, v_ok)
+                        if t_out is not None and teacher_value:
+                            v_loss = teacher_wdl_kl_loss(
+                                out["value_logits"], t_out["value_logits"],
+                            )
+                        else:
+                            v_loss = masked_mean_ce(out["value_logits"], wdl, v_ok)
                         loss = (p_loss + value_weight * v_loss) / accum
                     # Search-value-head aux: learn the backed-up best-child scalar
                     # against the game-result scalar (Stockfish-style retrogression).
@@ -1009,7 +1208,7 @@ def train_trial(
                     log_path,
                     f"step {step}/{max_steps} | loss={avg_loss:.4f} | "
                     f"lr={','.join(lrs)} | clip={clip_hits}/25 | "
-                    f"mix s/d/b={shallow_seen}/{deep_seen}/{bonus_seen} | "
+                    f"mix s/d/b={shallow_seen}/{deep_seen}/{bonus_seen} q={quality_seen} p={puzzle_seen} | "
                     f"{pos_s:.0f} pos/s | vram={peak_vram:.2f}GB"
                     + ("" if finite else " NON-FINITE"),
                 )

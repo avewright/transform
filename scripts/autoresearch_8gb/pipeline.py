@@ -86,6 +86,37 @@ def teacher_kl(logits, soft_indices, soft_probs):
     return kl.mean()
 
 
+def teacher_logits_kd_loss(student_logits, teacher_logits, temperature: float = 2.0):
+    """Hinton KD: T² · KL(softmax(z_t/T) || softmax(z_s/T)) over the full vocab."""
+    t = max(float(temperature), 1e-6)
+    log_q = F.log_softmax(student_logits.float() / t, dim=-1)
+    log_p = F.log_softmax(teacher_logits.float() / t, dim=-1)
+    return F.kl_div(log_q, log_p, reduction="batchmean", log_target=True) * (t * t)
+
+
+def teacher_wdl_kl_loss(student_logits, teacher_logits):
+    """KL(teacher WDL || student WDL)."""
+    log_q = F.log_softmax(student_logits.float(), dim=-1)
+    p = F.softmax(teacher_logits.float(), dim=-1)
+    return F.kl_div(log_q, p, reduction="batchmean")
+
+
+def logits_to_soft_targets(logits, k: int = 32, temperature: float = 1.0):
+    """Sparse top-k soft targets from teacher logits.
+
+    Returns ``(hard, indices, probs)`` with ``probs`` renormalized over the
+    kept support. ``hard`` is the temperature-1 argmax of the teacher.
+    """
+    raw = logits.float()
+    hard = raw.argmax(dim=-1)
+    t = max(float(temperature), 1e-6)
+    probs = F.softmax(raw / t, dim=-1)
+    k = max(1, min(int(k), int(probs.shape[-1])))
+    top_p, top_i = probs.topk(k, dim=-1)
+    top_p = top_p / top_p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return hard, top_i, top_p
+
+
 def pick_mix_source(
     draw: float,
     bonus_mix: float,
@@ -93,11 +124,19 @@ def pick_mix_source(
     *,
     has_bonus: bool,
     has_deep: bool,
+    quality_mix: float = 0.0,
+    has_quality: bool = False,
+    puzzle_mix: float = 0.0,
+    has_puzzle: bool = False,
 ) -> str:
-    """bonus, then deep, else shallow. ``draw`` is Uniform[0, 1)."""
-    if has_bonus and draw < bonus_mix:
+    """puzzle, quality, bonus, deep, else shallow. ``draw`` is Uniform[0, 1)."""
+    if has_puzzle and draw < puzzle_mix:
+        return "puzzle"
+    if has_quality and draw < (puzzle_mix + quality_mix):
+        return "quality"
+    if has_bonus and draw < (puzzle_mix + quality_mix + bonus_mix):
         return "bonus"
-    if has_deep and draw < (bonus_mix + deep_mix):
+    if has_deep and draw < (puzzle_mix + quality_mix + bonus_mix + deep_mix):
         return "deep"
     return "shallow"
 
@@ -155,7 +194,12 @@ def filter_disjoint(data: dict, seen: np.ndarray | None) -> tuple[dict, np.ndarr
     internal = n - int(first.size)
     vs_seen = 0
     if seen is not None and seen.size:
-        collide = np.isin(hs, seen)
+        # np.isin casts uint64→float64 and false-collides hashes > 2^53.
+        seen_u = np.unique(np.asarray(seen, dtype=np.uint64))
+        hs_u = hs.astype(np.uint64, copy=False)
+        loc = np.searchsorted(seen_u, hs_u)
+        loc = np.minimum(loc, seen_u.size - 1)
+        collide = seen_u[loc] == hs_u
         vs_seen = int((collide & keep).sum())
         keep &= ~collide
     n_keep = int(keep.sum())
@@ -334,6 +378,16 @@ def prepare_soft_batch(data, indices, device, hflip_p=0.0, rng=None):
         soft_i.to(device, non_blocking=nb),
         soft_p.to(device, non_blocking=nb),
     )
+
+
+def cat_soft_batches(parts: list[tuple]) -> tuple:
+    """Concat prepare_soft_batch outputs along the batch dim."""
+    if len(parts) == 1:
+        return parts[0]
+    keys = parts[0][0].keys()
+    board = {k: torch.cat([p[0][k] for p in parts], dim=0) for k in keys}
+    rest = tuple(torch.cat([p[i] for p in parts], dim=0) for i in range(1, 5))
+    return (board,) + rest
 
 
 def position_hashes(data: dict) -> np.ndarray:

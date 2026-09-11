@@ -24,9 +24,8 @@ MIX_RE = re.compile(r"mix s/d(?:/b)?=(\d+)/(\d+)(?:/(\d+))?")
 VAL_RE = re.compile(
     r"\[(\d{2}:\d{2}:\d{2})\] val/(\S+) hard_ce=([-\d.]+) "
     r"soft_ce=([-\d.]+) soft_temp_ce=([-\d.]+)"
-    r"(?: wdl_ce=([-\d.]+))?"
-    r"(?: teacher_entropy=([-\d.]+) teacher_kl=([-\d.]+))?"
-    r"(?: value_rows=([-\d.]+))?"
+    r"(?:.*? teacher_entropy=([-\d.]+) teacher_kl=([-\d.]+))?"
+    r"(?:.*? wdl_ce=([-\d.]+))?"
 )
 ELO_RE = re.compile(r"elo@(\d+) estimate=([-\d.]+|None) rc=(\d+)")
 WARM_RE = re.compile(r"WEIGHTS-ONLY WARM START \S+ steps=(\d+)")
@@ -104,9 +103,9 @@ def parse_log(path: Path) -> dict:
                     "hard_ce": float(vm.group(3)),
                     "soft_ce": float(vm.group(4)),
                     "soft_temp_ce": float(vm.group(5)),
-                    "wdl_ce": float(vm.group(6)) if vm.group(6) else None,
-                    "teacher_entropy": float(vm.group(7)) if vm.group(7) else None,
-                    "teacher_kl": float(vm.group(8)) if vm.group(8) else None,
+                    "teacher_entropy": float(vm.group(6)) if vm.group(6) else None,
+                    "teacher_kl": float(vm.group(7)) if vm.group(7) else None,
+                    "wdl_ce": float(vm.group(8)) if vm.group(8) else None,
                     "step": steps[-1]["step"] if steps else None,
                 }
             )
@@ -228,7 +227,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>exp201 loss</title>
+<title>train loss</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --text:#e8eaed; --muted:#9aa0a6; --line:#2a2f3a; --ok:#81c995; --bad:#f28b82; }
@@ -257,7 +256,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>exp201 · squares64 loss</h1>
+  <h1 id="title">squares64 loss</h1>
   <div class="sub" id="sub">Auto-refreshes every 10s from train.log</div>
 </header>
 <div class="stats" id="stats"></div>
@@ -360,6 +359,9 @@ async function refresh(){
     </div>
     <table><thead><tr><th>shard</th><th>in</th><th>kept</th><th>internal dups</th><th>vs prior</th></tr></thead>
     <tbody>${rows || '<tr><td colspan=5>waiting for attach</td></tr>'}</tbody></table>`;
+  const logName = (d.log || '').split('/').slice(-2).join('/');
+  document.getElementById('title').textContent = logName.includes('exp271')
+    ? 'exp271 · 99M → 270M KD loss' : 'squares64 loss';
   document.getElementById('sub').textContent =
     `Auto-refreshes every 10s · ${steps.length} step points · resume ${fmt(info.resume_step)} · log ${d.log}`;
   const stride = steps.length > 400 ? Math.ceil(steps.length/400) : 1;

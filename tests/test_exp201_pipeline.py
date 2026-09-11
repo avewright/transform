@@ -423,6 +423,12 @@ def test_pick_mix_and_bonus_soft_temp_override():
     assert pick_mix_source(0.15, 0.08, 0.20, has_bonus=True, has_deep=True) == "deep"
     assert pick_mix_source(0.50, 0.08, 0.20, has_bonus=True, has_deep=True) == "shallow"
     assert pick_mix_source(0.07, 0.08, 0.20, has_bonus=False, has_deep=True) == "deep"
+    assert pick_mix_source(
+        0.03, 0.08, 0.20, has_bonus=True, has_deep=True, quality_mix=0.05, has_quality=True,
+    ) == "quality"
+    assert pick_mix_source(
+        0.07, 0.08, 0.20, has_bonus=True, has_deep=True, quality_mix=0.05, has_quality=True,
+    ) == "bonus"
     n = 20_000
     draws = [i / n for i in range(n)]
     counts = {"bonus": 0, "deep": 0, "shallow": 0}

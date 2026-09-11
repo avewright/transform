@@ -328,6 +328,18 @@ def estimate_elo(summaries: list[dict]) -> dict:
     if not summaries:
         return {"estimated_elo": None, "lower_bound": None, "upper_bound": None, "note": "no games"}
     ordered = sorted(summaries, key=lambda s: s["sf_elo"])
+    fit = _logistic_elo(ordered)
+    if len(ordered) == 1:
+        s = ordered[0]
+        return {
+            "estimated_elo": fit,
+            "lower_bound": s["sf_elo"] if s["score"] >= 0.5 else None,
+            "upper_bound": s["sf_elo"] if s["score"] < 0.5 else None,
+            "note": (
+                f"logistic from {s['games']} games vs {s['sf_elo']} "
+                f"score={s['score']:.3f}"
+            ),
+        }
     monotonic = all(
         ordered[i]["score"] + 1e-12 >= ordered[i + 1]["score"] for i in range(len(ordered) - 1)
     )
@@ -347,7 +359,6 @@ def estimate_elo(summaries: list[dict]) -> dict:
         lower_bound = None
         upper_bound = None
 
-    fit = _logistic_elo(ordered)
     notes: list[str] = []
     if not monotonic:
         notes.append("non-monotonic scores; logistic fit")
