@@ -86,6 +86,37 @@ def teacher_kl(logits, soft_indices, soft_probs):
     return kl.mean()
 
 
+def teacher_logits_kd_loss(student_logits, teacher_logits, temperature: float = 2.0):
+    """Hinton KD: T² · KL(softmax(z_t/T) || softmax(z_s/T)) over the full vocab."""
+    t = max(float(temperature), 1e-6)
+    log_q = F.log_softmax(student_logits.float() / t, dim=-1)
+    log_p = F.log_softmax(teacher_logits.float() / t, dim=-1)
+    return F.kl_div(log_q, log_p, reduction="batchmean", log_target=True) * (t * t)
+
+
+def teacher_wdl_kl_loss(student_logits, teacher_logits):
+    """KL(teacher WDL || student WDL)."""
+    log_q = F.log_softmax(student_logits.float(), dim=-1)
+    p = F.softmax(teacher_logits.float(), dim=-1)
+    return F.kl_div(log_q, p, reduction="batchmean")
+
+
+def logits_to_soft_targets(logits, k: int = 32, temperature: float = 1.0):
+    """Sparse top-k soft targets from teacher logits.
+
+    Returns ``(hard, indices, probs)`` with ``probs`` renormalized over the
+    kept support. ``hard`` is the temperature-1 argmax of the teacher.
+    """
+    raw = logits.float()
+    hard = raw.argmax(dim=-1)
+    t = max(float(temperature), 1e-6)
+    probs = F.softmax(raw / t, dim=-1)
+    k = max(1, min(int(k), int(probs.shape[-1])))
+    top_p, top_i = probs.topk(k, dim=-1)
+    top_p = top_p / top_p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return hard, top_i, top_p
+
+
 def pick_mix_source(
     draw: float,
     bonus_mix: float,

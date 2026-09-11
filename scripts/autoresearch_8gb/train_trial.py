@@ -85,6 +85,9 @@ from autoresearch_8gb.pipeline import (  # noqa: E402
     value_valid_rows,
     soft_policy_loss,
     soft_temp_policy_loss,
+    teacher_logits_kd_loss,
+    teacher_wdl_kl_loss,
+    logits_to_soft_targets,
     unwrap_model,
     write_shard_manifest,
 )
@@ -202,6 +205,7 @@ def train_trial(
     bonus_cache: Path | None = None,
     quality_cache: Path | None = None,
     puzzle_cache: Path | None = None,
+    teacher_ckpt: Path | None = None,
 ) -> dict[str, Any]:
     """Train one trial. Returns metrics dict including ckpt_path / pos_s / status."""
     os.environ.setdefault("MOVE_VOCAB_VERSION", "compact")
@@ -678,6 +682,30 @@ def train_trial(
     min_lr_frac = float(train.get("min_lr_frac", 0.05))
     bs = int(train["batch_size"])
     accum = int(train.get("accum_steps", 1))
+    teacher_model = None
+    teacher_path = Path(teacher_ckpt) if teacher_ckpt else None
+    if teacher_path is None and train.get("teacher_ckpt"):
+        teacher_path = Path(train["teacher_ckpt"])
+    teacher_temp = float(train.get("teacher_temp", 2.0))
+    teacher_topk = int(train.get("teacher_topk", 32) or 0)
+    teacher_kd_frac = float(train.get("teacher_kd_frac", 1.0))
+    teacher_replace_hard = bool(train.get("teacher_replace_hard", False))
+    teacher_value = bool(train.get("teacher_value", False))
+    if teacher_path is not None:
+        if not teacher_path.exists():
+            raise FileNotFoundError(f"teacher ckpt missing: {teacher_path}")
+        from chess_inference import load_checkpoint
+        teacher_model = load_checkpoint(teacher_path, device=device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+        n_teacher = sum(p.numel() for p in teacher_model.parameters())
+        _log(
+            log_path,
+            f"teacher {teacher_path} params={n_teacher/1e6:.2f}M "
+            f"kd_temp={teacher_temp:g} kd_frac={teacher_kd_frac:g} topk={teacher_topk} "
+            f"replace_hard={int(teacher_replace_hard)} value_kl={int(teacher_value)}",
+        )
     # Fit batch to VRAM. Shrinks on OOM / over-cap; grows when fill_vram is set.
     # Also detects torch.compile/inductor failures (common on Windows without MSVC).
     if device.type == "cuda" and not smoke:
@@ -698,6 +726,9 @@ def train_trial(
                 }
                 model.train()
                 with autocast("cuda", dtype=torch.bfloat16):
+                    if teacher_model is not None:
+                        with torch.no_grad():
+                            teacher_model(probe)
                     out = model(probe)
                     loss = out["policy_logits"].float().mean() + out["value_logits"].float().mean()
                 loss.backward()
@@ -1049,11 +1080,28 @@ def train_trial(
                         )
                         v_ok = value_valid_rows(src, idx)
                     with amp_context(device):
+                        t_out = None
+                        if teacher_model is not None:
+                            with torch.no_grad():
+                                t_out = teacher_model(bi)
+                            if teacher_replace_hard:
+                                hard = t_out["policy_logits"].argmax(dim=-1)
                         out = model(bi)
                         hard_ce = F.cross_entropy(
                             out["policy_logits"], hard, label_smoothing=label_smoothing,
                         )
-                        soft_ce = soft_policy_loss(out["policy_logits"], si, sp)
+                        dataset_soft = soft_policy_loss(out["policy_logits"], si, sp)
+                        if t_out is not None and teacher_kd_frac > 0:
+                            kd = teacher_logits_kd_loss(
+                                out["policy_logits"], t_out["policy_logits"],
+                                temperature=teacher_temp,
+                            )
+                            if teacher_kd_frac >= 1.0:
+                                soft_ce = kd
+                            else:
+                                soft_ce = (1.0 - teacher_kd_frac) * dataset_soft + teacher_kd_frac * kd
+                        else:
+                            soft_ce = dataset_soft
                         p_loss = (1.0 - soft_alpha) * hard_ce + soft_alpha * soft_ce
                         st_w = policy_soft_temp_weight(
                             use_bonus, soft_temp_weight, bonus_soft_temp_weight,
@@ -1064,7 +1112,12 @@ def train_trial(
                             )
                         if v_ok is not None:
                             v_ok = v_ok.to(device=device, dtype=torch.float32)
-                        v_loss = masked_mean_ce(out["value_logits"], wdl, v_ok)
+                        if t_out is not None and teacher_value:
+                            v_loss = teacher_wdl_kl_loss(
+                                out["value_logits"], t_out["value_logits"],
+                            )
+                        else:
+                            v_loss = masked_mean_ce(out["value_logits"], wdl, v_ok)
                         loss = (p_loss + value_weight * v_loss) / accum
                     # Search-value-head aux: learn the backed-up best-child scalar
                     # against the game-result scalar (Stockfish-style retrogression).
