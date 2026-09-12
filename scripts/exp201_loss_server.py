@@ -322,6 +322,7 @@ async function refresh(){
   const vals = d.vals || [];
   const lastSoft = [...vals].reverse().find(v=>v.split==='sf19' || v.split==='soft');
   const lastDeep = [...vals].reverse().find(v=>v.split==='syzygy' || v.split==='deep');
+  const lastPuzzle = [...vals].reverse().find(v=>v.split==='puzzles');
   const mix = last && last.mix_s!=null ? (100*last.mix_d/(last.mix_s+last.mix_d)).toFixed(0)+'% deep' : (info.deep_mix!=null ? (100*info.deep_mix).toFixed(0)+'% deep' : '—');
   document.getElementById('stats').innerHTML = [
     ['Step', last ? last.step.toLocaleString()+' / '+Number(total).toLocaleString() : '— / '+fmt(total)],
@@ -331,6 +332,7 @@ async function refresh(){
     ['Recent min', lo!==null ? lo.toFixed(4) : '—'],
     ['pos/s', last ? last.pos_s.toFixed(0) : '—'],
     ['VRAM', last && last.vram ? last.vram.toFixed(2)+' GB' : '—'],
+    ['Val puzzles', lastPuzzle?lastPuzzle.hard_ce.toFixed(3):'—'],
     ['Val sf19 / syzygy', (lastSoft?lastSoft.hard_ce.toFixed(3):'—')+' / '+(lastDeep?lastDeep.hard_ce.toFixed(3):'—')],
     ['Teacher KL', lastSoft && lastSoft.teacher_kl!=null ? lastSoft.teacher_kl.toFixed(3) : '—'],
     ['Elo', (d.elos||[]).at(-1)?.elo!=null ? Number((d.elos||[]).at(-1).elo).toFixed(0) : '—'],
@@ -360,7 +362,9 @@ async function refresh(){
     <table><thead><tr><th>shard</th><th>in</th><th>kept</th><th>internal dups</th><th>vs prior</th></tr></thead>
     <tbody>${rows || '<tr><td colspan=5>waiting for attach</td></tr>'}</tbody></table>`;
   const logName = (d.log || '').split('/').slice(-2).join('/');
-  document.getElementById('title').textContent = logName.includes('exp271')
+  document.getElementById('title').textContent = logName.includes('exp273')
+    ? 'exp273 · 99M puzzle FT'
+    : logName.includes('exp271')
     ? 'exp271 · 99M → 270M KD loss' : 'squares64 loss';
   document.getElementById('sub').textContent =
     `Auto-refreshes every 10s · ${steps.length} step points · resume ${fmt(info.resume_step)} · log ${d.log}`;
