@@ -362,7 +362,11 @@ async function refresh(){
     <table><thead><tr><th>shard</th><th>in</th><th>kept</th><th>internal dups</th><th>vs prior</th></tr></thead>
     <tbody>${rows || '<tr><td colspan=5>waiting for attach</td></tr>'}</tbody></table>`;
   const logName = (d.log || '').split('/').slice(-2).join('/');
-  document.getElementById('title').textContent = logName.includes('exp274')
+  document.getElementById('title').textContent = logName.includes('exp276')
+    ? 'exp276 · 99M Lichess <14 one-hot'
+    : logName.includes('exp275')
+    ? 'exp275 · 99M endgame FT'
+    : logName.includes('exp274')
     ? 'exp274 · 99M syzygy FT'
     : logName.includes('exp273')
     ? 'exp273 · 99M puzzle FT'

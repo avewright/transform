@@ -528,6 +528,57 @@ def train_trial(
             "n_params": n_params,
         }
 
+    soft_inbox = Path(train["soft_inbox"]) if train.get("soft_inbox") else None
+    soft_seen_h = None
+    if soft_data is not None:
+        soft_seen_h = np.unique(position_hashes(soft_data).astype(np.uint64, copy=False))
+        for ev in ext_eval_data.values():
+            eh = position_hashes(ev).astype(np.uint64, copy=False)
+            soft_seen_h = np.unique(np.concatenate([soft_seen_h, eh]))
+
+    def _ingest_soft_inbox() -> int:
+        """Append new READY harvest shards into the live train table. No disk rewrite."""
+        nonlocal soft_data, train_soft_idx, train_soft_n, soft_seen_h
+        if soft_inbox is None or soft_data is None:
+            return 0
+        cap = int(train.get("max_soft_n") or 0)
+        if cap > 0 and train_soft_n >= cap:
+            return 0
+        chunks, soft_seen_h, reports = ingest_ready_bonus_shards(soft_inbox, soft_seen_h)
+        if not chunks:
+            return 0
+        if cap > 0:
+            room = cap - int(train_soft_n)
+            kept: list[dict] = []
+            used = 0
+            for ch in chunks:
+                n = int(ch["board_array"].shape[0])
+                if used >= room:
+                    break
+                if used + n > room:
+                    take = room - used
+                    ch = {
+                        k: (v[:take] if torch.is_tensor(v) and int(v.shape[0]) == n else v)
+                        for k, v in ch.items()
+                    }
+                    n = take
+                kept.append(ch)
+                used += n
+            chunks = kept
+        if not chunks:
+            return 0
+        for ch in chunks:
+            attach_static_targets(ch)
+        soft_data = concat_soft_tables([soft_data, *chunks])
+        train_soft_n = int(soft_data["board_array"].shape[0])
+        train_soft_idx = torch.arange(train_soft_n, dtype=torch.int64)
+        added = sum(int(r["n_out"]) for r in reports)
+        names = ",".join(str(r["shard"]) for r in reports if int(r["n_out"]))
+        _log(log_path, f"soft inbox +{added:,} train_n={train_soft_n:,} shards={names}")
+        return added
+
+    _ingest_soft_inbox()
+
     bonus_data = None
     train_bonus_idx = None
     train_bonus_n = 0
@@ -1215,6 +1266,7 @@ def train_trial(
                 window_loss_t = None
                 window_n = 0
                 clip_hits = 0
+                _ingest_soft_inbox()
                 _ingest_bonus_inbox()
                 if not finite:
                     interrupted = True

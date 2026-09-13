@@ -10,11 +10,13 @@ Lichess cp/mate are White-relative; we convert to STM scores for soft labels.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 os.environ.setdefault("MOVE_VOCAB_VERSION", "compact")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -61,13 +63,30 @@ def phase_from_board(arr: np.ndarray) -> int:
     return 2
 
 
+def pieces_fen(fen: str) -> int:
+    """Piece count from the placement field (letters only)."""
+    return sum(c.isalpha() for c in fen.split()[0])
+
+
+def find_parquet_roots() -> list[Path]:
+    roots: list[Path] = []
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(Path(hf_home) / "hub" / "datasets--Lichess--chess-position-evaluations")
+    roots.append(ROOT / ".hf_cache" / "hub" / "datasets--Lichess--chess-position-evaluations")
+    roots.append(Path.home() / ".cache/huggingface/hub/datasets--Lichess--chess-position-evaluations")
+    return roots
+
+
 def find_parquet_files(explicit: list[str] | None) -> list[Path]:
     if explicit:
         return [Path(p) for p in explicit]
-    hub = Path.home() / ".cache/huggingface/hub/datasets--Lichess--chess-position-evaluations"
-    snaps = sorted(hub.glob("snapshots/*/data/data_*.parquet"))
-    if snaps:
-        return snaps
+    for hub in find_parquet_roots():
+        snaps = sorted(hub.glob("snapshots/*/data/data_*.parquet"))
+        if not snaps:
+            snaps = sorted(hub.glob("snapshots/*/data/*.parquet"))
+        if snaps:
+            return snaps
     raise FileNotFoundError(
         "No local Lichess eval parquets. Download with:\n"
         "  huggingface-cli download Lichess/chess-position-evaluations --repo-type dataset"
@@ -82,11 +101,18 @@ def accumulate_shard(
     min_knodes: int,
     target: int,
     batch_rows: int,
+    min_pieces: int = 0,
+    max_pieces: int = 32,
+    one_hot: bool = False,
+    written: set[str] | None = None,
+    flush_every: int = 0,
+    flush_cb: Callable[[dict], None] | None = None,
 ) -> tuple[int, int]:
-    """Update acc[fen] = {uci: (depth, knodes, stm_score)}.
+    """Update acc by FEN.
 
-    Keeps the best (depth, knodes) score per first-move across snapshots so soft
-    width is not wiped when a deeper single-PV row arrives.
+    Soft mode: acc[fen] = {uci: (depth, knodes, stm_score)}.
+    One-hot / first-line: acc[fen] = (depth, knodes, stm_score, uci) for the
+    strongest snapshot's best first move.
     """
     pf = pq.ParquetFile(path)
     rows = kept = 0
@@ -116,28 +142,70 @@ def accumulate_shard(
             parts = fen.split(" ")
             if len(parts) < 2:
                 continue
+            if written is not None and fen in written:
+                continue
+            n_pcs = pieces_fen(fen)
+            if n_pcs < min_pieces or n_pcs > max_pieces:
+                continue
             turn_black = parts[1] == "b"
             score = white_score_to_stm(cps[j], mates[j], turn_black)
             if score is None:
                 continue
             d = int(depth[j])
             k = int(kn[j])
-            kept += 1
-            moves = acc.get(fen)
-            if moves is None:
-                if len(acc) >= target:
-                    continue
-                acc[fen] = {mv: (d, k, score)}
-                continue
-            old = moves.get(mv)
-            if old is None or (d, k) > (old[0], old[1]):
-                moves[mv] = (d, k, score)
-        if len(acc) >= target:
-            # Cap fill: stop scanning this shard once target unique FENs hit.
+            if update_acc(acc, fen, mv, d, k, score, target=target, one_hot=one_hot):
+                kept += 1
+            if flush_every > 0 and flush_cb is not None and len(acc) >= flush_every:
+                flush_cb(acc)
+                if written is not None:
+                    written.update(acc.keys())
+                acc.clear()
+        if target < 10**18 and len(acc) >= target and not one_hot:
             return rows, kept
         if rows and rows % (batch_rows * 2) < batch_rows:
             log(f"    … rows={rows:,} kept={kept:,} unique={len(acc):,}")
     return rows, kept
+
+
+def update_acc(
+    acc: dict,
+    fen: str,
+    mv: str,
+    depth: int,
+    knodes: int,
+    score: int,
+    *,
+    target: int,
+    one_hot: bool,
+) -> bool:
+    """Insert / upgrade a row. Returns True if the row was usable."""
+    if one_hot:
+        trip = (int(depth), int(knodes), int(score), mv)
+        old = acc.get(fen)
+        if old is None:
+            if len(acc) >= target:
+                return False
+            acc[fen] = trip
+            return True
+        if trip[:3] > old[:3]:
+            acc[fen] = trip
+        return True
+    moves = acc.get(fen)
+    if moves is None:
+        if len(acc) >= target:
+            return False
+        acc[fen] = {mv: (int(depth), int(knodes), int(score))}
+        return True
+    old = moves.get(mv)
+    if old is None or (depth, knodes) > (old[0], old[1]):
+        moves[mv] = (int(depth), int(knodes), int(score))
+    return True
+
+
+def acc_for_materialize(acc: dict, *, one_hot: bool) -> dict:
+    if not one_hot:
+        return acc
+    return {fen: {uci: (d, k, s)} for fen, (d, k, s, uci) in acc.items()}
 
 
 def materialize(acc: dict, tau: float) -> dict:
@@ -208,56 +276,139 @@ def materialize(acc: dict, tau: float) -> dict:
     }
 
 
+def next_inbox_shard(inbox: Path) -> Path:
+    n = 0
+    for p in inbox.glob("shard_*"):
+        try:
+            n = max(n, int(p.name.split("_")[1]) + 1)
+        except (IndexError, ValueError):
+            continue
+    return inbox / f"shard_{n:06d}"
+
+
+def write_inbox_shard(
+    inbox: Path,
+    acc: dict,
+    *,
+    one_hot: bool,
+    tau: float,
+    meta: dict | None = None,
+) -> Path:
+    """Materialize acc to a READY inbox shard. Caller clears acc after."""
+    inbox.mkdir(parents=True, exist_ok=True)
+    sh = next_inbox_shard(inbox)
+    sh.mkdir(parents=True, exist_ok=True)
+    table = materialize(acc_for_materialize(acc, one_hot=one_hot), tau)
+    table.pop("_meta_skip", None)
+    n = int(table.pop("_meta_n"))
+    tmp = sh / "soft_cache.pt.tmp"
+    torch.save(table, tmp)
+    os.replace(tmp, sh / "soft_cache.pt")
+    payload = {"n": n, "teacher": "lichess-evals-bestline", "one_hot": one_hot}
+    if meta:
+        payload.update(meta)
+    (sh / "meta.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    (sh / "READY").write_text("ok\n", encoding="utf-8")
+    return sh
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", default="outputs/lichess_evals_soft/soft_cache.pt")
     ap.add_argument("--parquet", nargs="*", default=None)
     ap.add_argument("--min-depth", type=int, default=22)
     ap.add_argument("--min-knodes", type=int, default=5000)
-    ap.add_argument("--target", type=int, default=3_000_000)
+    ap.add_argument("--target", type=int, default=3_000_000, help="0 = no unique-FEN cap")
     ap.add_argument("--tau", type=float, default=120.0)
     ap.add_argument("--batch-rows", type=int, default=250_000)
     ap.add_argument("--max-shards", type=int, default=0, help="0 = all available")
     ap.add_argument("--download", action="store_true", help="Ensure shards via hub download")
+    ap.add_argument("--min-pieces", type=int, default=0)
+    ap.add_argument("--max-pieces", type=int, default=32)
+    ap.add_argument("--one-hot", action="store_true", help="Keep only the best first-move per FEN")
+    ap.add_argument("--flush-every", type=int, default=0, help="Write a READY inbox shard every N unique FENs")
+    ap.add_argument("--inbox", default="", help="Inbox dir for --flush-every shards")
     args = ap.parse_args()
 
     if args.download:
         from huggingface_hub import snapshot_download
 
         log(f"downloading {DEFAULT_REPO}…")
-        snapshot_download(DEFAULT_REPO, repo_type="dataset")
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        snapshot_download(
+            DEFAULT_REPO,
+            repo_type="dataset",
+            token=token,
+        )
 
     files = find_parquet_files(args.parquet)
     if args.max_shards > 0:
         files = files[: args.max_shards]
-    log(f"shards={len(files)} min_depth={args.min_depth} min_knodes={args.min_knodes} target={args.target:,}")
+    target = args.target if args.target > 0 else 10**18
+    log(
+        f"shards={len(files)} min_depth={args.min_depth} min_knodes={args.min_knodes} "
+        f"pieces={args.min_pieces}-{args.max_pieces} one_hot={args.one_hot} "
+        f"target={'all' if args.target <= 0 else f'{args.target:,}'} "
+        f"flush_every={args.flush_every or 'off'}"
+    )
 
     acc: dict = {}
+    written: set[str] = set()
     t0 = time.time()
-    total_rows = total_kept = 0
+    total_rows = total_kept = flushed = 0
+    inbox = Path(args.inbox) if args.inbox else Path(args.output).parent / "inbox"
+
+    def _flush(chunk: dict) -> None:
+        nonlocal flushed
+        sh = write_inbox_shard(
+            inbox,
+            chunk,
+            one_hot=args.one_hot,
+            tau=args.tau,
+            meta={"min_pieces": args.min_pieces, "max_pieces": args.max_pieces},
+        )
+        flushed += 1
+        log(f"flush {sh.name} n={len(chunk):,} written={len(written) + len(chunk):,} inbox={inbox}")
+
     for i, path in enumerate(files):
-        if len(acc) >= args.target:
+        if args.target > 0 and len(acc) >= target and not args.one_hot and args.flush_every <= 0:
             log(f"target reached — stopping before {path.name}")
             break
-        log(f"[{i+1}/{len(files)}] {path.name} acc={len(acc):,}")
+        log(f"[{i+1}/{len(files)}] {path.name} acc={len(acc):,} written={len(written):,}")
         rows, kept = accumulate_shard(
             path,
             acc,
             min_depth=args.min_depth,
             min_knodes=args.min_knodes,
-            target=args.target,
+            target=target,
             batch_rows=args.batch_rows,
+            min_pieces=args.min_pieces,
+            max_pieces=args.max_pieces,
+            one_hot=args.one_hot,
+            written=written,
+            flush_every=int(args.flush_every),
+            flush_cb=_flush if args.flush_every > 0 else None,
         )
         total_rows += rows
         total_kept += kept
-        rate = len(acc) / max(time.time() - t0, 1e-6)
+        sealed = len(written) + len(acc)
+        rate = sealed / max(time.time() - t0, 1e-6)
         log(
-            f"  rows={rows:,} kept={kept:,} unique={len(acc):,} "
+            f"  rows={rows:,} kept={kept:,} unique={sealed:,} "
             f"({rate:.0f} fen/s wall)"
         )
 
-    log(f"materialize unique={len(acc):,} tau={args.tau}")
-    out = materialize(acc, args.tau)
+    if acc and args.flush_every > 0:
+        _flush(acc)
+        written.update(acc.keys())
+        acc.clear()
+
+    if args.flush_every > 0:
+        log(f"inbox_done shards={flushed} unique={len(written):,} rows_scanned={total_rows:,} {time.time()-t0:.1f}s")
+        return
+
+    log(f"materialize unique={len(acc):,} tau={args.tau} one_hot={args.one_hot}")
+    out = materialize(acc_for_materialize(acc, one_hot=args.one_hot), args.tau)
     n = out.pop("_meta_n")
     skip = out.pop("_meta_skip")
     widths = (out["soft_indices"] >= 0).sum(dim=1).float()

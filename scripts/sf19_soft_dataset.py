@@ -177,7 +177,7 @@ def collect_inbox_endgame_fens(
     *,
     lo: int = ENDGAME_MIN_PIECES,
     hi: int = ENDGAME_MAX_PIECES,
-    limit: int = 40_000,
+    limit: int = 80_000,
 ) -> list[str]:
     """Unique FENs from READY shards with lo ≤ n_pieces ≤ hi."""
     from scripts.harvest_exp201_lapses import board_array_to_fen
@@ -1750,11 +1750,34 @@ def generate(args) -> None:
             log(f"hf-ingest after committed={committed:,}", log_path)
         if endgame:
             endgame_fens = collect_inbox_endgame_fens(inbox)
+            extra_path = out / "extra_seeds.jsonl"
+            extra_n = 0
+            if extra_path.exists():
+                have = {" ".join(f.split()[:4]) for f in endgame_fens}
+                for line in extra_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    fen = str(json.loads(line).get("fen") or "")
+                    key = " ".join(fen.split()[:4])
+                    if not fen or key in have:
+                        continue
+                    have.add(key)
+                    endgame_fens.append(fen)
+                    extra_n += 1
             (out / "seeds.json").write_text(
-                json.dumps({"n": len(endgame_fens), "min": ENDGAME_MIN_PIECES, "max": ENDGAME_MAX_PIECES}),
+                json.dumps({
+                    "n": len(endgame_fens),
+                    "extra": extra_n,
+                    "min": ENDGAME_MIN_PIECES,
+                    "max": ENDGAME_MAX_PIECES,
+                }),
                 encoding="utf-8",
             )
-            log(f"endgame seeds={len(endgame_fens):,} window={ENDGAME_MIN_PIECES}-{ENDGAME_MAX_PIECES}", log_path)
+            log(
+                f"endgame seeds={len(endgame_fens):,} extra_hf={extra_n:,} "
+                f"window={ENDGAME_MIN_PIECES}-{ENDGAME_MAX_PIECES}",
+                log_path,
+            )
         if piece_curve:
             curve_have = recount_inbox_pieces(inbox)
             log(f"piece_curve resume {curve_summary(curve_have)}", log_path)
