@@ -362,7 +362,9 @@ async function refresh(){
     <table><thead><tr><th>shard</th><th>in</th><th>kept</th><th>internal dups</th><th>vs prior</th></tr></thead>
     <tbody>${rows || '<tr><td colspan=5>waiting for attach</td></tr>'}</tbody></table>`;
   const logName = (d.log || '').split('/').slice(-2).join('/');
-  document.getElementById('title').textContent = logName.includes('exp273')
+  document.getElementById('title').textContent = logName.includes('exp274')
+    ? 'exp274 · 99M syzygy FT'
+    : logName.includes('exp273')
     ? 'exp273 · 99M puzzle FT'
     : logName.includes('exp271')
     ? 'exp271 · 99M → 270M KD loss' : 'squares64 loss';

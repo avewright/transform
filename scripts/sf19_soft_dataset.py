@@ -115,6 +115,99 @@ OPENINGS = [
     ["a2a4"],
 ]
 
+ENDGAME_MIN_PIECES = 6
+ENDGAME_MAX_PIECES = 13  # seeds and labels: n_pieces < 14
+ENDGAME_CAPTURE_P = 1.0
+ENDGAME_HF_REPO = "avewright/chess-soft-sf19"
+ENDGAME_INGEST_CAP = 80_000
+ENDGAME_EPSILONS = (0.25, 0.40, 0.55, 0.70)
+
+
+def in_piece_window(n_pcs: int, lo: int = ENDGAME_MIN_PIECES, hi: int = ENDGAME_MAX_PIECES) -> bool:
+    return int(lo) <= int(n_pcs) <= int(hi)
+
+
+def pick_fast_forward_move(board: chess.Board, rng: random.Random, *, capture_p: float = ENDGAME_CAPTURE_P) -> chess.Move:
+    """No search. Capture when possible so we reach 6–12 pieces in pure Python."""
+    legal = list(board.legal_moves)
+    if not legal:
+        raise RuntimeError("no legal moves")
+    caps = [m for m in legal if board.is_capture(m)]
+    if caps and rng.random() < float(capture_p):
+        return rng.choice(caps)
+    return rng.choice(legal)
+
+
+def build_endgame_game_spec(
+    game_i: int,
+    starts: list[dict],
+    *,
+    seed: int,
+    holdout_frac: float,
+    min_pieces: int = ENDGAME_MIN_PIECES,
+    max_pieces: int = ENDGAME_MAX_PIECES,
+    seed_fens: list[str] | None = None,
+) -> dict:
+    """Start from a <14-piece seed and branch with epsilon. Fallback: ECO."""
+    if seed_fens:
+        split = 1 if random.Random(game_i + 17).random() < holdout_frac else 0
+        spec = {
+            "game_id": game_i,
+            "seed": seed + game_i * 10007,
+            "start_fen": seed_fens[game_i % len(seed_fens)],
+            "opening": [],
+            "book_noise": 0,
+            "epsilon": ENDGAME_EPSILONS[game_i % len(ENDGAME_EPSILONS)],
+            "wild": 0.10 if game_i % 4 == 0 else 0.03,
+            "split": split,
+        }
+    else:
+        spec = build_eco_game_spec(game_i, starts, seed=seed, holdout_frac=holdout_frac)
+        spec["epsilon"] = max(float(spec.get("epsilon") or 0.0), 0.28)
+        spec["wild"] = max(float(spec.get("wild") or 0.0), 0.16)
+    spec["endgame"] = True
+    spec["label_min_pieces"] = int(min_pieces)
+    spec["label_max_pieces"] = int(max_pieces)
+    spec["label_when_pieces_le"] = int(max_pieces)
+    return spec
+
+
+def collect_inbox_endgame_fens(
+    inbox: Path,
+    *,
+    lo: int = ENDGAME_MIN_PIECES,
+    hi: int = ENDGAME_MAX_PIECES,
+    limit: int = 40_000,
+) -> list[str]:
+    """Unique FENs from READY shards with lo ≤ n_pieces ≤ hi."""
+    from scripts.harvest_exp201_lapses import board_array_to_fen
+
+    seen: set[str] = set()
+    fens: list[str] = []
+    for cache in sorted(Path(inbox).glob("shard_*/soft_cache.pt")):
+        if not (cache.parent / "READY").exists():
+            continue
+        data = torch.load(cache, map_location="cpu", weights_only=False)
+        n = int(data["turn"].shape[0])
+        pcs = (data["board_array"] != 0).sum(dim=1)
+        for i in range(n):
+            if not in_piece_window(int(pcs[i]), lo, hi):
+                continue
+            fen = board_array_to_fen(
+                data["board_array"][i].numpy(),
+                int(data["turn"][i]),
+                int(data["castling"][i]),
+                int(data["ep_square"][i]),
+            )
+            key = " ".join(fen.split()[:4])
+            if key in seen:
+                continue
+            seen.add(key)
+            fens.append(fen)
+            if len(fens) >= limit:
+                return fens
+    return fens
+
 
 def log(msg: str, path: Path | None = None) -> None:
     print(msg, flush=True)
@@ -860,6 +953,101 @@ def ingest_existing_curve(
     return kept
 
 
+def _parquet_row(table, i: int) -> dict:
+    row = {}
+    for name in table.schema.names:
+        val = table.column(name)[i].as_py()
+        if val is None:
+            continue
+        row[name] = val
+    return row
+
+
+def ingest_hf_endgame(
+    *,
+    inbox: Path,
+    seen,
+    target: int,
+    shard_size: int,
+    teacher_meta: dict,
+    log_path: Path,
+    repo: str = ENDGAME_HF_REPO,
+    min_pieces: int = ENDGAME_MIN_PIECES,
+    max_pieces: int = ENDGAME_MAX_PIECES,
+) -> int:
+    """Copy already-labeled SF19 rows in the 6–12 piece window. No new search."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    token = _hf_token()
+    files = [
+        f for f in list_repo_files(repo, repo_type="dataset", token=token)
+        if f.startswith("data/") and f.endswith(".parquet")
+    ]
+    files.sort()
+    log(f"hf-ingest repo={repo} shards={len(files)} window={min_pieces}-{max_pieces}", log_path)
+    pending: list[dict] = []
+    pending_keys: set[bytes] = set()
+    kept = 0
+    scanned = 0
+    skipped = {"dup": 0, "window": 0, "bad": 0}
+
+    def flush(force: bool = False) -> None:
+        nonlocal pending, pending_keys
+        if not pending or (len(pending) < shard_size and not force):
+            return
+        take = pending[:shard_size] if not force else pending
+        pending = pending[len(take):] if not force else []
+        keys = [row_key(r) for r in take]
+        data = stack_rows(take)
+        sh = next_shard_dir(inbox)
+        write_shard(data, sh, {**teacher_meta, "origin": "hf_ingest", "max_game_id": -1})
+        seen.add_many(keys)
+        seen.mark_shard(sh.name, len(take))
+        seen.forget_hot(keys)
+        pending_keys.difference_update(keys)
+        log(f"hf-ingest wrote {sh} n={len(take)} copied={kept:,}", log_path)
+
+    dest = ROOT / ".hf_cache" / "endgame_sf19"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        if kept >= target:
+            break
+        path = hf_hub_download(repo, name, repo_type="dataset", token=token, local_dir=str(dest))
+        table = pq.read_table(path)
+        n = table.num_rows
+        ba = np.stack([np.asarray(x, dtype=np.int8).reshape(64) for x in table.column("board_array").to_pylist()])
+        pcs = (ba != 0).sum(axis=1)
+        for i in range(n):
+            scanned += 1
+            if not in_piece_window(int(pcs[i]), min_pieces, max_pieces):
+                skipped["window"] += 1
+                continue
+            row = normalize_harvest_row(_parquet_row(table, i))
+            if row is None:
+                skipped["bad"] += 1
+                continue
+            k = row_key(row)
+            if seen.has(k) or k in pending_keys:
+                skipped["dup"] += 1
+                continue
+            pending.append(row)
+            pending_keys.add(k)
+            seen.remember_hot([k])
+            kept += 1
+            if len(pending) >= shard_size:
+                flush(False)
+            if kept >= target:
+                break
+        log(
+            f"hf-ingest {name} scanned={scanned:,} kept={kept:,} skip={skipped}",
+            log_path,
+        )
+    flush(True)
+    log(f"hf-ingest done kept={kept:,} scanned={scanned:,} skip={skipped}", log_path)
+    return kept
+
+
 @dataclass
 class GenConfig:
     nodes: int = 30_000
@@ -896,7 +1084,7 @@ def _start_engine() -> None:
     global _W_ENGINE
     _close_worker()
     assert _W_SF is not None and _W_CFG is not None
-    _W_ENGINE = chess.engine.SimpleEngine.popen_uci(_W_SF)
+    _W_ENGINE = chess.engine.SimpleEngine.popen_uci(_W_SF, timeout=60.0)
     _W_ENGINE.configure({
         "Threads": 1,
         "Hash": int(_W_CFG.hash_mb),
@@ -912,6 +1100,7 @@ def _init_worker(sf_path: str, cfg: GenConfig, seen_path: str | None = None):
     _W_SF = sf_path
     _W_CFG = cfg
     _W_SEEN = SeenDB(Path(seen_path), readonly=True) if seen_path else None
+    time.sleep(random.random() * 3.0)
     _start_engine()
     atexit.register(_close_worker)
 
@@ -954,13 +1143,23 @@ def _play_one_game(spec: dict) -> dict:
     last_kept_ply = -999
     n_search = 0
     piece_curve = bool(spec.get("piece_curve"))
+    endgame = bool(spec.get("endgame"))
     label_le = int(spec.get("label_when_pieces_le") or 32)
+    label_min = int(spec.get("label_min_pieces") or 0)
+    label_max = int(spec.get("label_max_pieces") or label_le)
     while not board.is_game_over(claim_draw=True) and ply < cfg.ply_cap:
         n_pcs = int(board.occupied.bit_count())
+        if label_min and n_pcs < label_min:
+            break
+        if endgame and n_pcs > label_max:
+            board.push(pick_fast_forward_move(board, rng))
+            ply += 1
+            continue
         stride = label_stride(n_pcs, default=cfg.ply_stride) if piece_curve else cfg.ply_stride
         keep = (
             ply >= cfg.ply_skip_open
-            and n_pcs <= label_le
+            and n_pcs <= label_max
+            and n_pcs >= label_min
             and (ply - cfg.ply_skip_open) % stride == 0
             and (ply - last_kept_ply) >= stride
         )
@@ -992,6 +1191,8 @@ def _play_one_game(spec: dict) -> dict:
                 row["game_id"] = np.int64(spec["game_id"])
                 row["ply"] = np.int16(ply)
                 row["split"] = np.int8(spec.get("split") or 0)
+                if endgame:
+                    row["origin"] = np.int8(ORIGIN_SELFPLAY)
                 rows.append(row)
                 last_kept_ply = ply
                 ucis, weights = [], []
@@ -1011,6 +1212,8 @@ def _play_one_game(spec: dict) -> dict:
             break
         if parsed and parsed.get("items"):
             mv = pick_play_move(parsed, board, rng, epsilon=eps, wild=wild)
+        elif endgame:
+            mv = pick_fast_forward_move(board, rng, capture_p=0.45)
         else:
             play = analyze_board(
                 _W_ENGINE, board,
@@ -1496,11 +1699,23 @@ def generate(args) -> None:
         added = seen.ingest_cache_keys(p, f"exclude:{p}")
         log(f"exclude {p} +{added:,} keys seen={len(seen):,}", log_path)
     eco_starts: list[dict] = []
+    endgame_fens: list[str] = []
     piece_curve = getattr(args, "mode", "") == "piece_curve"
+    endgame = getattr(args, "mode", "") == "endgame"
     curve_pmf = target_pmf() if piece_curve else None
     curve_have = empty_counts()
     fen_buckets: dict[int, list[str]] = {}
-    if getattr(args, "mode", "") in ("eco", "piece_curve"):
+    if endgame:
+        (out / "endgame.json").write_text(json.dumps({
+            "min_pieces": ENDGAME_MIN_PIECES,
+            "max_pieces": ENDGAME_MAX_PIECES,
+            "label_nodes": cfg.nodes,
+            "play_nodes": cfg.play_nodes,
+            "multipv": cfg.multipv,
+            "tau": cfg.tau,
+            "target": target,
+        }, indent=2), encoding="utf-8")
+    if getattr(args, "mode", "") in ("eco", "piece_curve", "endgame"):
         openings = load_eco_openings()
         eco_starts = eco_start_positions(
             openings,
@@ -1509,12 +1724,37 @@ def generate(args) -> None:
         summary = openings_summary(openings, eco_starts)
         (out / "openings.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         log(
-            f"{'piece_curve' if piece_curve else 'eco'} openings={summary['n_rows']} "
+            f"{'piece_curve' if piece_curve else 'endgame' if endgame else 'eco'} openings={summary['n_rows']} "
             f"unique={summary['n_unique']} starts={len(eco_starts)} "
             f"prefixes={not getattr(args, 'no_prefixes', False)} "
             f"volumes={summary['volumes']}",
             log_path,
         )
+        if endgame and committed < 40_000 and committed < target:
+            ingest_hf_endgame(
+                inbox=inbox,
+                seen=seen,
+                target=min(int(ENDGAME_INGEST_CAP), int(target)),
+                shard_size=args.shard_size,
+                teacher_meta={
+                    "teacher": fp["uci_name"],
+                    "binary_sha256": fp["binary_sha256"],
+                    "fingerprint_id": run_fp["fingerprint_id"],
+                    "nodes": cfg.nodes,
+                    "multipv": cfg.multipv,
+                    "tau": cfg.tau,
+                },
+                log_path=log_path,
+            )
+            committed, next_game = inbox_state(inbox)
+            log(f"hf-ingest after committed={committed:,}", log_path)
+        if endgame:
+            endgame_fens = collect_inbox_endgame_fens(inbox)
+            (out / "seeds.json").write_text(
+                json.dumps({"n": len(endgame_fens), "min": ENDGAME_MIN_PIECES, "max": ENDGAME_MAX_PIECES}),
+                encoding="utf-8",
+            )
+            log(f"endgame seeds={len(endgame_fens):,} window={ENDGAME_MIN_PIECES}-{ENDGAME_MAX_PIECES}", log_path)
         if piece_curve:
             curve_have = recount_inbox_pieces(inbox)
             log(f"piece_curve resume {curve_summary(curve_have)}", log_path)
@@ -1635,6 +1875,14 @@ def generate(args) -> None:
                             "opening": list(OPENINGS[game_i % len(OPENINGS)]),
                             "split": 0,
                         }
+                elif endgame and (endgame_fens or eco_starts):
+                    spec = build_endgame_game_spec(
+                        game_i,
+                        eco_starts,
+                        seed=args.seed,
+                        holdout_frac=args.holdout_frac,
+                        seed_fens=endgame_fens or None,
+                    )
                 elif eco_starts:
                     spec = build_eco_game_spec(
                         game_i, eco_starts, seed=args.seed, holdout_frac=args.holdout_frac,
@@ -1664,8 +1912,11 @@ def generate(args) -> None:
                     if seen.has(k) or k in pending_keys:
                         rejected["dup"] += 1
                         continue
+                    n_pcs = n_pieces_from_row(row)
+                    if endgame and not in_piece_window(n_pcs):
+                        rejected["curve"] += 1
+                        continue
                     if curve_pmf is not None:
-                        n_pcs = n_pieces_from_row(row)
                         if not curve_should_keep(n_pcs, curve_have, int(curve_have.sum()), curve_pmf):
                             rejected["curve"] += 1
                             continue
@@ -1802,6 +2053,18 @@ def _hf_token() -> str:
         val = os.environ.get(key)
         if val:
             return val
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+                value = value.strip().strip("'").strip('"')
+                if value:
+                    os.environ["HF_TOKEN"] = value
+                    return value
     for path in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
         if path.exists():
             val = path.read_text(encoding="utf-8").strip()
@@ -1990,6 +2253,65 @@ Deduped by 4-field board key against this run and existing local mixes.
 """
 
 
+def _endgame_readme(
+    repo: str,
+    n_total: int,
+    tau: float,
+    endgame: dict,
+    openings: dict,
+    teacher: dict,
+    stats: dict,
+) -> str:
+    cfg = (teacher.get("config") or {})
+    run = (teacher.get("run") or {})
+    fp = run.get("source_revision") or (teacher.get("teacher") or {}).get("source_revision") or ""
+    lo = int(endgame.get("min_pieces") or ENDGAME_MIN_PIECES)
+    hi = int(endgame.get("max_pieces") or ENDGAME_MAX_PIECES)
+    return f"""---
+license: mit
+tags:
+- chess
+- stockfish-19
+- soft-labels
+- multipv
+- endgame
+pretty_name: Endgame Stockfish 19 soft targets
+---
+
+# {repo}
+
+**{lo}–{hi} piece** positions with official **Stockfish 19** MultiPV soft
+targets. SF vs SF games start from Lichess ECO, fast-forward (capture-biased)
+until the piece window, then label.
+
+**{n_total:,}** rows. Source id `4`. Vocab `compact` (1968).
+
+## Filter
+
+- Keep only boards with `{lo} ≤ n_pieces ≤ {hi}`
+- Stop the game below {lo} pieces (Syzygy territory)
+- `split=1` is a ~5% holdout. Honor `split`.
+
+ECO starts: {int(openings.get('n_starts') or 0):,}.
+
+## Teacher
+
+- Stockfish 19 tag `sf_19` (`{str(fp)[:8]}`)
+- Full strength, `Threads=1`, `Hash=64`, `UCI_ShowWDL=true`
+- Label: **{int(cfg.get('nodes') or endgame.get('label_nodes') or 100000):,} nodes / MultiPV={int(cfg.get('multipv') or 8)}** / `tau={tau:g}`
+- Fast-forward play: captures first, else ≤800-node search
+- `cp` / `mate` / `wdl`: **White-absolute**
+- `soft_indices` / `soft_probs`: width 8
+
+Accepted so far: {int(stats.get('accepted') or n_total):,}.
+
+## Files
+
+- `data/shard_XXXXXX.parquet`
+- `teacher.json`, `endgame.json`, `openings.json`, `manifest.json`, `stats.json`
+"""
+
+
 def push_hf(args) -> None:
     from huggingface_hub import HfApi, create_repo
     from scripts.export_soft_caches_to_hf import sf19_chunk_table
@@ -2053,7 +2375,7 @@ def push_hf(args) -> None:
     extras = (
         "teacher.json", "bench.json", "manifest.json", "summary.json",
         "sampling.json", "audit.json", "eval_manifest.json",
-        "openings.json", "stats.json",
+        "openings.json", "stats.json", "endgame.json",
     )
     for name in extras:
         src = out / name
@@ -2069,7 +2391,13 @@ def push_hf(args) -> None:
     teacher = _load_json(out / "teacher.json")
     stats = _load_json(out / "stats.json")
     readme = staging / "README.md"
-    if openings:
+    endgame = _load_json(out / "endgame.json")
+    if endgame:
+        readme.write_text(
+            _endgame_readme(repo, n_total, float(args.tau), endgame, openings, teacher, stats),
+            encoding="utf-8",
+        )
+    elif openings:
         readme.write_text(
             _sf19_eco_readme(repo, n_total, float(args.tau), openings, teacher, stats),
             encoding="utf-8",
@@ -2175,7 +2503,7 @@ def main() -> None:
     g.add_argument("--no-seed-caches", action="store_true")
     g.add_argument("--no-prefixes", action="store_true",
                    help="ECO mode: start only from named leaves, not book prefixes.")
-    g.add_argument("--mode", choices=("selfplay", "mix", "eco", "piece_curve"), default="mix")
+    g.add_argument("--mode", choices=("selfplay", "mix", "eco", "piece_curve", "endgame"), default="mix")
     g.add_argument("--relabel-frac", type=float, default=0.8)
     a = sub.add_parser("audit")
     add_shared(a)
@@ -2226,24 +2554,29 @@ def main() -> None:
     elif args.cmd == "generate":
         if not args.go:
             raise SystemExit("pass --go")
-        if args.mode in ("eco", "piece_curve"):
+        if args.mode in ("eco", "piece_curve", "endgame"):
             args.no_seed_caches = True
             if args.ply_skip_open == 4:
                 args.ply_skip_open = 0
             if args.ply_cap == 140:
-                args.ply_cap = 220 if args.mode == "piece_curve" else 180
+                args.ply_cap = 220 if args.mode in ("piece_curve", "endgame") else 180
             if args.watchdog_s == 8.0:
                 args.watchdog_s = 20.0
             if args.target == 25_000 and not args.pilot and not args.smoke:
-                args.target = 300_000 if args.mode == "piece_curve" else 1_000_000
+                args.target = 300_000 if args.mode in ("piece_curve", "endgame") else 1_000_000
             if args.workers == 14:
-                args.workers = max(1, (os.cpu_count() or 8) - 2)
+                spare = 16 if args.mode == "endgame" else 2
+                cap = 64 if args.mode == "endgame" else 10**9
+                args.workers = max(1, min(cap, (os.cpu_count() or 8) - spare))
         if args.smoke:
             args.target = min(args.target, 48)
             args.workers = min(args.workers, 2)
             args.nodes = min(args.nodes, 4_000)
             args.play_nodes = min(args.play_nodes, 800)
-            args.ply_cap = min(args.ply_cap, 24)
+            if args.mode == "endgame":
+                args.ply_cap = min(max(args.ply_cap, 180), 220)
+            else:
+                args.ply_cap = min(args.ply_cap, 24)
             args.shard_size = min(args.shard_size, 32)
             args.watchdog_s = min(args.watchdog_s, 6.0)
         if args.pilot:

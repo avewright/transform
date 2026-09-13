@@ -8,6 +8,10 @@ echo "=== RunPod setup (chess-transformer) ==="
 
 apt-get update -qq && apt-get install -y -qq wget unzip git >/dev/null 2>&1 || true
 
+git config --global user.name "avewright"
+git config --global user.email "averywright.21202@gmail.com"
+echo "git identity: $(git config --global user.name) <$(git config --global user.email)>"
+
 pip install -q -U pip
 pip install -q -e .
 pip install -q git+https://github.com/KellerJordan/Muon

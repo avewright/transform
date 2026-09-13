@@ -421,6 +421,19 @@ def trial_config() -> dict:
     }
 
 
+def pick_resume(out: Path, init_path: Path, resume_arg: str | None) -> Path:
+    """Full-resume an in-progress exp273 run; otherwise weights-only init."""
+    if resume_arg:
+        p = Path(resume_arg)
+        if not p.exists():
+            raise SystemExit(f"resume ckpt missing: {p}")
+        return p
+    latest = out / "latest.pt"
+    if latest.exists():
+        return latest
+    return init_path
+
+
 def train(args: argparse.Namespace) -> dict:
     from autoresearch_8gb.train_trial import train_trial
 
@@ -470,6 +483,9 @@ def train(args: argparse.Namespace) -> dict:
         cfg["fill_vram"] = bool(args.fill_vram)
     cfg["external_eval"] = {"puzzles": str(eval_cache.resolve())}
 
+    resume_ckpt = pick_resume(out, init_path, args.resume)
+    print(f"resume_ckpt={resume_ckpt}", flush=True)
+
     result = train_trial(
         trial,
         out,
@@ -478,10 +494,20 @@ def train(args: argparse.Namespace) -> dict:
         max_steps=args.max_steps,
         max_minutes=args.train_minutes,
         smoke=False,
-        resume_ckpt=init_path,
+        resume_ckpt=resume_ckpt,
     )
     (out / "train_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2), flush=True)
+    if not args.no_push:
+        latest = out / "latest.pt"
+        if latest.exists():
+            sys.path.insert(0, str(ROOT / "scripts"))
+            from upload_exp273_hf import upload as upload_puzzle
+
+            print(f"pushing {latest} → {args.hf_repo}", flush=True)
+            upload_puzzle(args.hf_repo, latest, private=bool(args.hf_private))
+        else:
+            print(f"skip HF push: missing {latest}", flush=True)
     return result
 
 
@@ -491,6 +517,7 @@ def main() -> None:
     ap.add_argument("--pull", action="store_true", help="Download 99M checkpoint")
     ap.add_argument("--pack", action="store_true", help="Pack Lichess/chess-puzzles 80/20")
     ap.add_argument("--refresh-init", action="store_true")
+    ap.add_argument("--resume", default=None, help="Full resume this run (default: output-dir/latest.pt if present)")
     ap.add_argument("--checkpoint", default=None, help="99M latest.pt (default outputs/hf_models/99m/latest.pt)")
     ap.add_argument("--output-dir", default=str(OUT_DIR))
     ap.add_argument("--soft-cache", default=str(OUT_DIR / "puzzle_train.pt"))
@@ -508,6 +535,9 @@ def main() -> None:
     ap.add_argument("--val-every", type=int, default=None)
     ap.add_argument("--save-every", type=int, default=None)
     ap.add_argument("--fill-vram", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--hf-repo", default="avewright/puzzle-model")
+    ap.add_argument("--hf-private", action="store_true")
+    ap.add_argument("--no-push", action="store_true", help="Skip Hugging Face upload at end of --go")
     args = ap.parse_args()
     _assert_compact()
 
