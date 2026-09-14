@@ -61,6 +61,10 @@ def load_checkpoint(
     dev = _pick_device(device)
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    from chess_moe import is_moe_router_ckpt, load_moe_pipeline
+
+    if is_moe_router_ckpt(ckpt):
+        return load_moe_pipeline(ckpt_path, device=dev, ckpt=ckpt)
     config_data = ckpt.get("config")
     if _is_squares64(ckpt, config_data):
         from chess_squares64 import Squares64RecurrentConfig, build_squares64

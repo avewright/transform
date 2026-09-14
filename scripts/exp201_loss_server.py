@@ -50,6 +50,15 @@ DONE_RE = re.compile(r"done steps=(\d+) .* status=(\w+)")
 SWA_RE = re.compile(r"(?:restored SWA eval weights n=|eval_swa\.pt n=)(\d+)")
 SWA_FROM_RE = re.compile(r"SWA from step (\d+)/(\d+)")
 PROBE_RE = re.compile(r"batch probe (?:OOM at bs=(\d+); retry bs=(\d+)|ok bs=(\d+))")
+ROUTER_VAL_RE = re.compile(
+    r"val_exp_ce=([-\d.]+)\s+val_route_ce=([-\d.]+)\s+"
+    r"prior_ce=([-\d.]+)\s+oracle_ce=([-\d.]+)"
+)
+CLS_RE = re.compile(r"trn_cls=([-\d.]+)\s+val_cls_ce=([-\d.]+)")
+ACC_RE = re.compile(r"trn_acc=([-\d.]+).*?best_acc=([-\d.]+)")
+SACC_RE = re.compile(
+    r"sacc ope=([-\d.]+)\s+mid=([-\d.]+)\s+end=([-\d.]+)\s+gen=([-\d.]+)\s+puz=([-\d.]+)"
+)
 
 
 def _i(s: str) -> int:
@@ -87,6 +96,56 @@ def parse_log(path: Path) -> dict:
                 rec["mix_s"] = int(mx.group(1))
                 rec["mix_d"] = int(mx.group(2))
                 rec["mix_b"] = int(mx.group(3)) if mx.group(3) else 0
+            rv = ROUTER_VAL_RE.search(line)
+            if rv:
+                rec["val_exp_ce"] = float(rv.group(1))
+                rec["val_route_ce"] = float(rv.group(2))
+                rec["prior_ce"] = float(rv.group(3))
+                rec["oracle_ce"] = float(rv.group(4))
+            cr = CLS_RE.search(line)
+            if cr:
+                rec["trn_cls"] = float(cr.group(1))
+                rec["val_cls_ce"] = float(cr.group(2))
+            ar = ACC_RE.search(line)
+            if ar:
+                rec["trn_acc"] = float(ar.group(1))
+                rec["val_acc"] = float(ar.group(2))
+            sr = SACC_RE.search(line)
+            if sr:
+                rec["sacc"] = {
+                    "opening": float(sr.group(1)),
+                    "middlegame": float(sr.group(2)),
+                    "endgame": float(sr.group(3)),
+                    "puzzle": float(sr.group(5)),
+                }
+            if rv:
+                cls_only = rec.get("val_route_ce", 1) == 0 and rec.get("prior_ce", 1) == 0
+                series = (
+                    (("val_cls", "val_cls_ce" if "val_cls_ce" in rec else "val_exp_ce"),)
+                    if cls_only
+                    else (
+                        ("expected", "val_exp_ce"),
+                        ("route", "val_route_ce"),
+                        ("prior", "prior_ce"),
+                        ("oracle", "oracle_ce"),
+                    )
+                )
+                for split, key in series:
+                    if rec.get(key) is None:
+                        continue
+                    vals.append(
+                        {
+                            "t": rec["t"],
+                            "split": split,
+                            "hard_ce": rec[key],
+                            "soft_ce": rec[key],
+                            "soft_temp_ce": rec[key],
+                            "teacher_entropy": None,
+                            "teacher_kl": None,
+                            "wdl_ce": None,
+                            "step": rec["step"],
+                        }
+                    )
             if steps and steps[-1]["step"] == rec["step"]:
                 steps[-1] = rec
             else:
@@ -262,7 +321,7 @@ HTML = """<!DOCTYPE html>
 <div class="stats" id="stats"></div>
 <div class="grid two">
   <div class="card"><h2>Soft data · this attach</h2><div id="data"></div></div>
-  <div class="card"><h2>Val (hard CE)</h2><canvas id="val"></canvas></div>
+  <div class="card"><h2 id="val-title">Val (hard CE)</h2><canvas id="val"></canvas></div>
 </div>
 <div class="grid two">
   <div class="card"><h2>Loss vs step</h2><canvas id="loss"></canvas></div>
@@ -324,7 +383,21 @@ async function refresh(){
   const lastDeep = [...vals].reverse().find(v=>v.split==='syzygy' || v.split==='deep');
   const lastPuzzle = [...vals].reverse().find(v=>v.split==='puzzles');
   const mix = last && last.mix_s!=null ? (100*last.mix_d/(last.mix_s+last.mix_d)).toFixed(0)+'% deep' : (info.deep_mix!=null ? (100*info.deep_mix).toFixed(0)+'% deep' : '—');
-  document.getElementById('stats').innerHTML = [
+  const logName = (d.log || '').split('/').slice(-2).join('/');
+  const isRouter = logName.includes('exp279');
+  const clsOnly = isRouter && last && !(last.val_route_ce > 0);
+  const sacc = last && last.sacc ? last.sacc : {};
+  document.getElementById('stats').innerHTML = (clsOnly ? [
+    ['Step', last ? last.step.toLocaleString()+' / '+Number(total).toLocaleString() : '— / '+fmt(total)],
+    ['Phase', info.phase || '—'],
+    ['Train cls', last && last.trn_cls!=null ? last.trn_cls.toFixed(4) : (last ? last.loss.toFixed(4) : '—')],
+    ['Val cls CE', last && (last.val_cls_ce??last.val_exp_ce)!=null ? (last.val_cls_ce??last.val_exp_ce).toFixed(4) : '—'],
+    ['Val acc', last && last.val_acc!=null ? last.val_acc.toFixed(3) : '—'],
+    ['Opening acc', sacc.opening!=null ? sacc.opening.toFixed(2) : '—'],
+    ['Middlegame acc', sacc.middlegame!=null ? sacc.middlegame.toFixed(2) : '—'],
+    ['Endgame acc', sacc.endgame!=null ? sacc.endgame.toFixed(2) : '—'],
+    ['Puzzle acc', sacc.puzzle!=null ? sacc.puzzle.toFixed(2) : '—'],
+  ] : [
     ['Step', last ? last.step.toLocaleString()+' / '+Number(total).toLocaleString() : '— / '+fmt(total)],
     ['Phase', info.phase || '—'],
     ['Loss', last ? last.loss.toFixed(4) : '—'],
@@ -338,7 +411,7 @@ async function refresh(){
     ['Elo', (d.elos||[]).at(-1)?.elo!=null ? Number((d.elos||[]).at(-1).elo).toFixed(0) : '—'],
     ['Mix', mix],
     ['SWA n', fmt(info.swa_n)],
-  ].map(([k,v])=>stat(k,v)).join('');
+  ]).map(([k,v])=>stat(k,v)).join('');
   const shards = info.shards || [];
   const badge = info.disjoint
     ? '<span class="badge ok">disjoint · vs_prior=0</span>'
@@ -347,7 +420,15 @@ async function refresh(){
   const ids = shards.map(s=>s.name.replace('shard_',''));
   const names = ids.length ? (ids[0]+'–'+ids[ids.length-1]) : '';
   const rows = shards.map(s=>`<tr><td>${s.name}</td><td>${fmt(s.n_in)}</td><td>${fmt(s.n_out)}</td><td>${fmt(s.internal_dups)}</td><td>${s.vs_prior}</td></tr>`).join('');
-  document.getElementById('data').innerHTML = `
+  document.getElementById('data').innerHTML = isRouter
+    ? `<div class="stats" style="padding:0">
+        ${stat('Train cls', last && last.trn_cls!=null ? last.trn_cls.toFixed(4) : '—')}
+        ${stat('Val cls CE', last && (last.val_cls_ce??last.val_exp_ce)!=null ? (last.val_cls_ce??last.val_exp_ce).toFixed(4) : '—')}
+        ${stat('Val acc', last && last.val_acc!=null ? last.val_acc.toFixed(3) : '—')}
+        ${stat('Train acc', last && last.trn_acc!=null ? last.trn_acc.toFixed(3) : '—')}
+      </div>
+      <div class="sub" style="margin-top:8px">400k/source source classifier · live 99M encode · no expert CE on this pack</div>`
+    : `
     <div style="margin-bottom:8px">${badge}
       <span class="sub"> · ${fmt(info.n_shards)} new shards ${names?('('+names+')'):''}
       · exclude ${fmt(info.prior_attached)} prior ATTACHED (${fmt(info.prior_hashes)} hashes)</span></div>
@@ -361,8 +442,15 @@ async function refresh(){
     </div>
     <table><thead><tr><th>shard</th><th>in</th><th>kept</th><th>internal dups</th><th>vs prior</th></tr></thead>
     <tbody>${rows || '<tr><td colspan=5>waiting for attach</td></tr>'}</tbody></table>`;
-  const logName = (d.log || '').split('/').slice(-2).join('/');
-  document.getElementById('title').textContent = logName.includes('exp276')
+  document.getElementById('title').textContent = logName.includes('exp280')
+    ? 'exp280 · full MoE (router + experts) · general Lichess'
+    : logName.includes('exp279')
+    ? (clsOnly ? 'exp279 · source classifier' : 'exp279 · frozen-expert MoE router')
+    : logName.includes('exp278')
+    ? 'exp278 · 99M Lichess 16–26 middlegame one-hot'
+    : logName.includes('exp277')
+    ? 'exp277 · 99M Lichess ≥26 opening one-hot'
+    : logName.includes('exp276')
     ? 'exp276 · 99M Lichess <14 one-hot'
     : logName.includes('exp275')
     ? 'exp275 · 99M endgame FT'
@@ -372,18 +460,41 @@ async function refresh(){
     ? 'exp273 · 99M puzzle FT'
     : logName.includes('exp271')
     ? 'exp271 · 99M → 270M KD loss' : 'squares64 loss';
-  document.getElementById('sub').textContent =
-    `Auto-refreshes every 10s · ${steps.length} step points · resume ${fmt(info.resume_step)} · log ${d.log}`;
+  const vt = document.getElementById('val-title');
+  if (vt) vt.textContent = clsOnly ? 'Val accuracy by source' : (isRouter ? 'Val CE (route / expected / prior / oracle)' : 'Val (hard CE)');
+  document.getElementById('sub').textContent = isRouter && !steps.length
+    ? 'Router not training yet. Scoring frozen experts on HF next-move data. Train/val curves appear after --go.'
+    : `Auto-refreshes every 10s · ${steps.length} step points · resume ${fmt(info.resume_step)} · log ${d.log}`;
   const stride = steps.length > 400 ? Math.ceil(steps.length/400) : 1;
   const S = steps.filter((_,i)=> i%stride===0 || i===steps.length-1);
   const L = S.map(s=>s.step);
   const raw = S.map(s=>s.loss);
-  upsert('loss', L, [
-    line('loss', raw, '#8ab4f8', {borderWidth:1, pointRadius:0}),
-    line('EMA', ema(raw, 0.08), '#81c995'),
-  ], 'loss');
+  if (clsOnly) {
+    upsert('loss', L, [
+      line('train cls', S.map(s=>s.trn_cls ?? s.loss), '#8ab4f8', {borderWidth:1.6, pointRadius:0}),
+      line('val cls CE', S.map(s=>s.val_cls_ce ?? s.val_exp_ce), '#f9ab00', {pointRadius:2}),
+    ], 'CE');
+    upsert('val', L, [
+      line('val acc', S.map(s=>s.val_acc), '#e8eaed', {pointRadius:2}),
+      line('opening', S.map(s=>s.sacc && s.sacc.opening), '#f9ab00', {pointRadius:2}),
+      line('middlegame', S.map(s=>s.sacc && s.sacc.middlegame), '#fdd663', {pointRadius:2}),
+      line('endgame', S.map(s=>s.sacc && s.sacc.endgame), '#81c995', {pointRadius:2}),
+      line('puzzle', S.map(s=>s.sacc && s.sacc.puzzle), '#c58af9', {pointRadius:2}),
+    ], 'acc');
+  } else if (isRouter) {
+    upsert('loss', L, [
+      line('train expected CE', raw, '#8ab4f8', {borderWidth:1.6, pointRadius:0}),
+      line('val expected CE', S.map(s=>s.val_exp_ce), '#f9ab00', {pointRadius:2}),
+      line('val route CE', S.map(s=>s.val_route_ce), '#81c995', {pointRadius:2}),
+    ], 'CE');
+  } else {
+    upsert('loss', L, [
+      line('loss', raw, '#8ab4f8', {borderWidth:1, pointRadius:0}),
+      line('EMA', ema(raw, 0.08), '#81c995'),
+    ], 'loss');
+  }
   upsert('speed', L, [line('pos/s', S.map(s=>s.pos_s), '#c58af9')], 'pos/s');
-  const colors = {sf19:'#8ab4f8', lichess:'#f9ab00', puzzles:'#c58af9', syzygy:'#81c995', soft:'#8ab4f8', deep:'#f9ab00'};
+  const colors = {sf19:'#8ab4f8', lichess:'#f9ab00', lichess_opening:'#f9ab00', lichess_middlegame:'#fdd663', lichess_endgame:'#81c995', puzzles:'#c58af9', syzygy:'#81c995', soft:'#8ab4f8', deep:'#f9ab00', expected:'#f9ab00', route:'#81c995', prior:'#c58af9', oracle:'#e8eaed'};
   const splits = [...new Set(vals.map(v=>v.split))];
   const valSets = splits.filter(s=>vals.some(v=>v.split===s && v.step!=null)).map(s =>
     line(s+' hard CE', vals.filter(v=>v.split===s && v.step!=null).map(v=>v.hard_ce), colors[s]||'#e8eaed', {pointRadius:2})
@@ -392,8 +503,10 @@ async function refresh(){
   if(sf19V.some(v=>v.teacher_kl!=null)){
     valSets.push(line('sf19 teacher KL', sf19V.map(v=>v.teacher_kl), '#81c995', {pointRadius:2, borderDash:[4,3]}));
   }
-  const valLabels = (vals.find(v=>v.step!=null) ? vals.filter(v=>v.split===splits[0] && v.step!=null).map(v=>v.step) : []);
-  upsert('val', valLabels, valSets, 'hard CE / KL');
+  if (!clsOnly) {
+    const valLabels = (vals.find(v=>v.step!=null) ? vals.filter(v=>v.split===splits[0] && v.step!=null).map(v=>v.step) : []);
+    upsert('val', valLabels, valSets, 'hard CE / KL');
+  }
   const elos = d.elos || [];
   if(elos.length){
     upsert('elo', elos.map(e=>e.step), [

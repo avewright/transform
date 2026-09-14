@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Upload exp276 Lichess <14 FT checkpoint to avewright/endgame-model.
+"""Upload exp278 Lichess 16–26 FT checkpoint to avewright/middlegame-model.
 
-Never writes the 99M incumbent, puzzle expert, or syzygy expert.
+Never writes the 99M incumbent or other specialist repos.
 """
 from __future__ import annotations
 
@@ -17,20 +17,23 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from upload_exp201_hf import ckpt_steps, load_hf_token  # noqa: E402
 
-DEFAULT_REPO = "avewright/endgame-model"
+DEFAULT_REPO = "avewright/middlegame-model"
 BLOCKED = {
     "avewright/chess-transformer-100m-squares64",
     "avewright/puzzle-model",
     "avewright/syzygy-model",
-    "avewright/endgame-dataset",
+    "avewright/endgame-model",
     "avewright/opening-model",
+    "avewright/endgame-dataset",
+    "avewright/lichess-endgame-bestline",
+    "avewright/lichess-opening-bestline",
 }
-OUT = ROOT / "outputs" / "exp276_lichess_endgame_stream"
+OUT = ROOT / "outputs" / "exp278_lichess_middlegame_stream"
 
 
 def refuse_blocked(repo: str) -> None:
     if repo.strip() in BLOCKED:
-        raise SystemExit(f"refusing to upload endgame FT over {repo}")
+        raise SystemExit(f"refusing to upload middlegame FT over {repo}")
 
 
 def write_card(repo: str, steps: int, extra: dict) -> Path:
@@ -47,30 +50,29 @@ tags:
   - transformer
   - recurrent
   - policy
-  - endgame
+  - middlegame
   - pytorch
 library_name: pytorch
 ---
 
-# 99M endgame specialist (squares64)
+# 99M middlegame specialist (squares64)
 
 Same **99M** squares64 architecture as
 [`avewright/chess-transformer-100m-squares64`](https://huggingface.co/avewright/chess-transformer-100m-squares64),
-finetuned on `<14`-piece positions (one-hot best first move) from
+finetuned on `16–26`-piece positions (one-hot best first move) from
 [`Lichess/chess-position-evaluations`](https://huggingface.co/datasets/Lichess/chess-position-evaluations)
-via [`avewright/lichess-endgame-bestline`](https://huggingface.co/datasets/avewright/lichess-endgame-bestline).
+via [`avewright/lichess-middlegame-bestline`](https://huggingface.co/datasets/avewright/lichess-middlegame-bestline).
 
-This file is **`latest.pt` at endgame-FT step {steps}** ({stamp}).
+This file is **`latest.pt` at middlegame-FT step {steps}** ({stamp}).
 Train loss ~{loss}. Frozen holdout hard CE ~{val}.
 
-Not the generalist incumbent, the puzzle expert, or the Syzygy expert.
-Not [`avewright/endgame-dataset`](https://huggingface.co/datasets/avewright/endgame-dataset) (SF19 MultiPV harvest).
+Not the generalist incumbent, the opening expert, the puzzle expert, the Syzygy expert, or the endgame expert.
 
 ## Training
 
 - Warm start: public 99M `latest.pt` (weights only), then full resume.
-- Split: position-hash 80/20 (seed 276). Frozen piece-stratified val {pack.get("val_n", 8192)}.
-- One-hot PV1 (`soft_alpha=0`). Pieces 2–13.
+- Split: position-hash 80/20 (seed 278). Frozen piece-stratified val {pack.get("val_n", 8192)}.
+- One-hot PV1 (`soft_alpha=0`). Pieces 16–26.
 - Polar-NorMuon, bs=528. Best disk ckpt at upload: step {steps}.
 
 ## Files
@@ -96,9 +98,7 @@ def recent_metrics(log: Path) -> dict:
         extra["recent_loss"] = losses[-1]
     step_loss = dict(re.findall(r"step (\d+)/\d+ \| loss=([\d.]+)", text))
     extra["loss_by_step"] = step_loss
-    vals = re.findall(r"val/lichess_endgame hard_ce=([\d.]+)", text)
-    if not vals:
-        vals = re.findall(r"val/endgame hard_ce=([\d.]+)", text)
+    vals = re.findall(r"val/lichess_middlegame hard_ce=([\d.]+)", text)
     if vals:
         extra["recent_val"] = vals[-1]
         extra["best_val"] = min(vals, key=float)
@@ -127,10 +127,10 @@ def upload(repo: str, ckpt: Path, *, private: bool = False) -> dict:
     create_repo(repo, repo_type="model", exist_ok=True, private=private, token=token)
     api = HfApi(token=token)
     files = [
-        (ckpt, "latest.pt", f"exp276 endgame FT latest.pt step {steps}"),
-        (ckpt, f"step_{steps:06d}.pt", f"exp276 endgame FT step {steps}"),
+        (ckpt, "latest.pt", f"exp278 middlegame FT latest.pt step {steps}"),
+        (ckpt, f"step_{steps:06d}.pt", f"exp278 middlegame FT step {steps}"),
         (out / "model_config.json", "model_config.json", "model_config.json"),
-        (card, "README.md", "endgame expert model card"),
+        (card, "README.md", "middlegame expert model card"),
         (out / "train.log", "train.log", "train.log"),
         (pack_path, "pack.json", "pack.json"),
     ]
