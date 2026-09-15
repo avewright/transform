@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 def resolve_stockfish() -> Path:
     for p in [
         Path(os.environ.get("STOCKFISH_PATH", "")),
+        Path(os.environ.get("HOME", "")) / ".local/bin/stockfish-19",
+        Path("/root/.local/bin/stockfish-19"),
         Path(shutil.which("stockfish") or ""),
+        ROOT / "stockfish" / "stockfish" / "stockfish-19",
         ROOT / "stockfish" / "stockfish" / "stockfish-windows-x86-64-avx2.exe",
         ROOT / "stockfish" / "stockfish" / "stockfish-ubuntu-x86-64-avx2",
     ]:

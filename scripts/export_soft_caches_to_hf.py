@@ -80,6 +80,7 @@ SF19_SCHEMA = pa.schema(list(SCHEMA) + [
     pa.field("origin", pa.int8()),
     pa.field("flags", pa.int16()),
     pa.field("bound_skipped", pa.int16()),
+    pa.field("n_pieces", pa.int8()),
 ])
 
 
@@ -145,6 +146,7 @@ def sf19_chunk_table(d: dict, name: str, start: int, end: int) -> pa.Table:
         pa.array(np.asarray(_col("origin", None, 0), dtype=np.int8)),
         pa.array(np.asarray(_col("flags", None, 0), dtype=np.int16)),
         pa.array(np.asarray(_col("bound_skipped", None, 0), dtype=np.int16)),
+        pa.array(np.asarray(_col("n_pieces", None, 0), dtype=np.int8)),
     ]
     table = base
     extra_fields = [SF19_SCHEMA.field(i) for i in range(len(SCHEMA), len(SF19_SCHEMA))]
@@ -158,8 +160,13 @@ def sf19_table_to_cache(table: pa.Table) -> dict:
     def _list_np(name, dtype):
         return np.asarray(table.column(name).to_pylist(), dtype=dtype)
 
+    board = torch.from_numpy(_list_np("board_array", np.int8))
+    if "n_pieces" in table.column_names:
+        n_pieces = torch.from_numpy(table.column("n_pieces").to_numpy().astype(np.int8))
+    else:
+        n_pieces = torch.from_numpy(np.count_nonzero(board.numpy(), axis=1).astype(np.int8))
     out = {
-        "board_array": torch.from_numpy(_list_np("board_array", np.int8)),
+        "board_array": board,
         "turn": torch.from_numpy(table.column("turn").to_numpy().astype(np.int8)),
         "castling": torch.from_numpy(table.column("castling").to_numpy().astype(np.int8)),
         "ep_square": torch.from_numpy(table.column("ep_square").to_numpy().astype(np.int8)),
@@ -184,6 +191,7 @@ def sf19_table_to_cache(table: pa.Table) -> dict:
         "origin": torch.from_numpy(table.column("origin").to_numpy().astype(np.int8)),
         "flags": torch.from_numpy(table.column("flags").to_numpy().astype(np.int16)),
         "bound_skipped": torch.from_numpy(table.column("bound_skipped").to_numpy().astype(np.int16)),
+        "n_pieces": n_pieces,
     }
     return out
 

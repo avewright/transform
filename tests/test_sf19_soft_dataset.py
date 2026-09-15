@@ -82,6 +82,7 @@ def test_parse_skips_bound_scores_and_pads():
     assert row["soft_probs"][1] == 0
     assert row["policy_mask"] == 1
     assert row["soft_indices"].shape == (SOFT_K,)
+    assert int(row["n_pieces"]) == 32
 
 
 def test_terminal_masks_policy():
@@ -122,6 +123,11 @@ def test_inbox_state_counts_ready_shards(tmp_path):
     n, next_game = inbox_state(inbox)
     assert n == 1
     assert next_game == 8
+    labels = (inbox / "shard_000000" / "labels.jsonl").read_text(encoding="utf-8").strip()
+    rec = json.loads(labels)
+    assert rec["n_pieces"] == 32
+    assert rec["moves"][0]["uci"] == "e2e4"
+    assert rec["moves"][0]["cp"] == 30
 
 
 def test_probs_sum_and_legal_indices():

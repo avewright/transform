@@ -287,7 +287,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>train loss</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="vendor/chart.umd.min.js"></script>
 <style>
   :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --text:#e8eaed; --muted:#9aa0a6; --line:#2a2f3a; --ok:#81c995; --bad:#f28b82; }
   * { box-sizing: border-box; }
@@ -346,7 +346,7 @@ function line(label, data, color, extra={}){
 }
 function upsert(id, labels, datasets, yTitle){
   const el = document.getElementById(id);
-  if(!el) return;
+  if(!el || typeof Chart === 'undefined') return;
   if(charts[id]){
     charts[id].data.labels = labels;
     charts[id].data.datasets = datasets;
@@ -369,7 +369,7 @@ function upsert(id, labels, datasets, yTitle){
 }
 function stat(k,v){ return `<div class="stat"><b>${v}</b><span>${k}</span></div>`; }
 async function refresh(){
-  const r = await fetch('/api/metrics');
+  const r = await fetch('api/metrics');
   const d = await r.json();
   const steps = d.steps || [];
   const last = steps[steps.length-1];
@@ -456,6 +456,8 @@ async function refresh(){
     ? 'exp275 · 99M endgame FT'
     : logName.includes('exp274')
     ? 'exp274 · 99M syzygy FT'
+    : logName.includes('exp282')
+    ? 'exp282 · 99M phase-mix continue-pretrain'
     : logName.includes('exp273')
     ? 'exp273 · 99M puzzle FT'
     : logName.includes('exp271')
@@ -522,30 +524,49 @@ setInterval(refresh, 10000);
 """
 
 
+VENDOR_CHART = Path(__file__).resolve().parent / "vendor" / "chart.umd.min.js"
+CHART_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+
+
+def ensure_chart() -> Path:
+    if VENDOR_CHART.exists() and VENDOR_CHART.stat().st_size > 10_000:
+        return VENDOR_CHART
+    VENDOR_CHART.parent.mkdir(parents=True, exist_ok=True)
+    from urllib.request import urlopen
+
+    with urlopen(CHART_URL, timeout=30) as r:
+        VENDOR_CHART.write_bytes(r.read())
+    return VENDOR_CHART
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     log_path: Path = DEFAULT_LOG
 
     def log_message(self, fmt, *args):
         pass
 
+    def _send(self, body: bytes, content_type: str, *, cache: str = "no-store") -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", cache)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            body = HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self._send(HTML.encode(), "text/html; charset=utf-8")
             return
-        if self.path.startswith("/api/metrics"):
-            payload = json.dumps(parse_log(self.log_path)).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+        if path in ("/vendor/chart.umd.min.js", "/chart.js"):
+            p = ensure_chart()
+            self._send(p.read_bytes(), "application/javascript; charset=utf-8", cache="public, max-age=86400")
+            return
+        if path.startswith("/api/metrics"):
+            self._send(json.dumps(parse_log(self.log_path)).encode(), "application/json")
             return
         self.send_error(404)
 
@@ -555,8 +576,15 @@ def main() -> None:
     ap.add_argument("--log", default=str(DEFAULT_LOG))
     ap.add_argument("-p", "--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
-    Handler.log_path = Path(args.log)
-    print(f"exp201 loss: http://0.0.0.0:{args.port}/  (log={Handler.log_path})", flush=True)
+    log_path = Path(args.log)
+    if not log_path.is_absolute():
+        log_path = (ROOT / log_path).resolve()
+    Handler.log_path = log_path
+    try:
+        ensure_chart()
+    except Exception as e:
+        print(f"warn: chart.js vendor failed ({e}); charts may be empty", flush=True)
+    print(f"exp201 loss: http://127.0.0.1:{args.port}/  (log={Handler.log_path})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
 

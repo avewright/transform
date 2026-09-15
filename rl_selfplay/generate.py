@@ -246,6 +246,12 @@ def generate_positions(
 ) -> tuple[list[dict], list[float]]:
     """Run games and return (positions, per-game results)."""
     n = n_games if n_games is not None else cfg.n_games
+    if not cfg.use_search:
+        from rl_selfplay.searchfree import generate_searchfree
+
+        return generate_searchfree(
+            model, device, cfg, n_games=n, opponent=prior_model, log_fn=log_fn,
+        )
     mcts = build_mcts(model, device, cfg)
     all_positions: list[dict] = []
     results: list[float] = []

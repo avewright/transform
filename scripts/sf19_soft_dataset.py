@@ -50,7 +50,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data_loader import CASTLING_MAP, _fast_parse_fen, compute_wdl  # noqa: E402
-from move_vocab import UCI_TO_IDX, VOCAB_SIZE  # noqa: E402
+from move_vocab import IDX_TO_UCI, UCI_TO_IDX, VOCAB_SIZE  # noqa: E402
 from scripts.lichess_openings import (  # noqa: E402
     load_openings as load_eco_openings,
     openings_summary,
@@ -531,6 +531,7 @@ def label_to_row(board: chess.Board, parsed: dict, *, tau: float, nodes_budget: 
             "policy_mask": np.int8(0),
             "tau": np.float32(tau),
             "nodes_budget": np.int32(nodes_budget),
+            "n_pieces": np.int8(int(np.count_nonzero(arr))),
         }, parsed)
     enc = encode_board(board)
     if enc is None:
@@ -582,6 +583,7 @@ def label_to_row(board: chess.Board, parsed: dict, *, tau: float, nodes_budget: 
         "policy_mask": np.int8(1),
         "tau": np.float32(tau),
         "nodes_budget": np.int32(nodes_budget),
+        "n_pieces": np.int8(int(np.count_nonzero(arr))),
     }, parsed)
 
 
@@ -746,7 +748,7 @@ ROW_STACK_KEYS = (
     "cp", "mate", "soft_indices", "soft_probs", "soft_cps", "soft_mates",
     "label_depth", "phase", "source", "wdl", "nodes", "policy_mask",
     "tau", "nodes_budget", "game_id", "ply", "split",
-    "origin", "flags", "bound_skipped",
+        "origin", "flags", "bound_skipped", "n_pieces",
 )
 
 
@@ -797,6 +799,7 @@ def normalize_harvest_row(row: dict) -> dict | None:
         "origin": (np.int8, ORIGIN_RELABEL),
         "flags": (np.int16, 0),
         "bound_skipped": (np.int16, 0),
+        "n_pieces": (np.int8, 0),
     }
     for key, (dtype, fill) in defaults.items():
         out[key] = _as_numpy(out[key], dtype) if key in out else np.asarray(fill, dtype=dtype)
@@ -804,6 +807,8 @@ def normalize_harvest_row(row: dict) -> dict | None:
         out["wdl"] = np.array([0.33, 0.34, 0.33], dtype=np.float32)
     else:
         out["wdl"] = _as_numpy(out["wdl"], np.float32).reshape(-1)[:3]
+    if "n_pieces" not in row or int(out["n_pieces"]) <= 0:
+        out["n_pieces"] = np.int8(n_pieces_from_row(out))
     if int(out["policy_mask"]) == 0 or int(out["move_idx"]) < 0:
         return None
     return out
@@ -1255,12 +1260,52 @@ def stack_rows(rows: list[dict]) -> dict:
         "cp", "mate", "soft_indices", "soft_probs", "soft_cps", "soft_mates",
         "label_depth", "phase", "source", "wdl", "nodes", "policy_mask",
         "tau", "nodes_budget", "game_id", "ply", "split",
-        "origin", "flags", "bound_skipped",
+        "origin", "flags", "bound_skipped", "n_pieces",
     ]
     out = {}
     for k in keys:
+        if k == "n_pieces" and any("n_pieces" not in r for r in rows):
+            pcs = [int(r["n_pieces"]) if "n_pieces" in r else n_pieces_from_row(r) for r in rows]
+            out[k] = torch.tensor(pcs, dtype=torch.int8)
+            continue
         out[k] = torch.from_numpy(np.stack([r[k] for r in rows]))
     return out
+
+
+def _row_moves(data: dict, i: int) -> list[dict]:
+    moves = []
+    for k in range(SOFT_K):
+        idx = int(data["soft_indices"][i, k])
+        if idx < 0:
+            continue
+        uci = IDX_TO_UCI[idx] if 0 <= idx < len(IDX_TO_UCI) else str(idx)
+        moves.append({
+            "rank": k + 1,
+            "uci": uci,
+            "cp": int(data["soft_cps"][i, k]),
+            "mate": int(data["soft_mates"][i, k]),
+            "prob": float(data["soft_probs"][i, k]),
+        })
+    return moves
+
+
+def write_labels_jsonl(data: dict, dest: Path) -> None:
+    n = int(data["move_idx"].shape[0])
+    path = dest / "labels.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for i in range(n):
+            rec = {
+                "n_pieces": int(data["n_pieces"][i]) if "n_pieces" in data else n_pieces_from_row({
+                    "board_array": data["board_array"][i],
+                }),
+                "turn": int(data["turn"][i]),
+                "ply": int(data["ply"][i]) if "ply" in data else -1,
+                "move_idx": int(data["move_idx"][i]),
+                "cp": int(data["cp"][i]),
+                "mate": int(data["mate"][i]),
+                "moves": _row_moves(data, i),
+            }
+            f.write(json.dumps(rec) + "\n")
 
 
 def write_shard(data: dict, dest: Path, meta: dict) -> None:
@@ -1269,6 +1314,7 @@ def write_shard(data: dict, dest: Path, meta: dict) -> None:
     tmp = cache.with_suffix(".pt.tmp")
     torch.save(data, tmp)
     os.replace(tmp, cache)
+    write_labels_jsonl(data, dest)
     n = int(data["move_idx"].shape[0])
     payload = {"n": n, **meta}
     (dest / "meta.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

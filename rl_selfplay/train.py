@@ -11,9 +11,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast
 
-from chess_features import batch_boards_to_fused_token_ids
 from move_vocab import VOCAB_SIZE, legal_move_mask
 from rl_selfplay.config import SelfPlayConfig
+from rl_selfplay.searchfree import encode_boards
 from rl_selfplay.utils import q_to_wdl
 
 SIGMA_HL_GAUSS = 0.04
@@ -93,15 +93,17 @@ def _maybe_sf_batch(shard_dir: Path | None, batch_size: int, device: torch.devic
         return None
 
 
-def _split_sources(positions: list[dict]) -> tuple[list[int], list[int]]:
-    mcts_idx, sf_idx = [], []
+def _split_sources(positions: list[dict]) -> tuple[list[int], list[int], list[int]]:
+    mcts_idx, sf_idx, winner_idx = [], [], []
     for i, p in enumerate(positions):
         src = p.get("source", "mcts")
         if src == "sf":
             sf_idx.append(i)
+        elif src == "winner":
+            winner_idx.append(i)
         else:
             mcts_idx.append(i)
-    return mcts_idx, sf_idx
+    return mcts_idx, sf_idx, winner_idx
 
 
 def prior_kl_loss(
@@ -144,20 +146,23 @@ def train_on_positions(
 
     fens, visit_targets, root_qs = _build_visit_tensor(positions)
     value_targets = _value_targets(root_qs, n_value_classes)
-    mcts_idx, sf_idx = _split_sources(positions)
+    mcts_idx, sf_idx, winner_idx = _split_sources(positions)
     shard_dir = Path(cfg.sf_shard_dir) if cfg.sf_shard_dir else None
 
     log_fn(
         f"  train mix: {len(mcts_idx)} soft-MCTS + {len(sf_idx)} SF-hard "
+        f"+ {len(winner_idx)} winner "
         f"(sf_move_frac={cfg.mix_sf_move_frac} prior_kl={cfg.prior_kl_weight})"
     )
 
-    totals = {"loss": 0.0, "policy": 0.0, "value": 0.0, "batches": 0, "sf_batches": 0, "mcts_batches": 0}
+    totals = {
+        "loss": 0.0, "policy": 0.0, "value": 0.0, "batches": 0,
+        "sf_batches": 0, "mcts_batches": 0, "winner_batches": 0,
+    }
 
     # Prefer the larger pool for epoch length so we see most data once.
-    primary = mcts_idx if len(mcts_idx) >= len(sf_idx) else (sf_idx or mcts_idx)
-    if not primary:
-        primary = list(range(len(positions)))
+    pools = [p for p in (winner_idx, mcts_idx, sf_idx) if p]
+    primary = max(pools, key=len) if pools else list(range(len(positions)))
 
     for epoch in range(cfg.train_epochs):
         random.shuffle(primary)
@@ -180,7 +185,7 @@ def train_on_positions(
                 batch_idx = random.sample(sf_idx, min(cfg.train_batch_size, len(sf_idx)))
                 batch = [positions[i] for i in batch_idx]
                 boards = [chess.Board(p["fen"]) for p in batch]
-                batch_input = batch_boards_to_fused_token_ids(boards, device)
+                batch_input = encode_boards(model, boards, device)
                 move_targets = torch.tensor(
                     [int(p["chosen_move"]) for p in batch], device=device, dtype=torch.long,
                 )
@@ -199,19 +204,31 @@ def train_on_positions(
                 use_external_sf = False
 
             if not use_recorded_sf and not use_external_sf:
-                pool = mcts_idx if mcts_idx else primary
-                batch_idx = random.sample(pool, min(cfg.train_batch_size, len(pool)))
-                batch = [positions[i] for i in batch_idx]
-                boards = [chess.Board(p["fen"]) for p in batch]
-                batch_input = batch_boards_to_fused_token_ids(boards, device)
-                visit_batch = visit_targets[batch_idx].to(device)
-                value_batch = value_targets[batch_idx].to(device)
-                mode = "mcts"
+                use_winner = bool(winner_idx) and (cfg.winner_only or not mcts_idx)
+                if use_winner:
+                    batch_idx = random.sample(winner_idx, min(cfg.train_batch_size, len(winner_idx)))
+                    batch = [positions[i] for i in batch_idx]
+                    boards = [chess.Board(p["fen"]) for p in batch]
+                    batch_input = encode_boards(model, boards, device)
+                    move_targets = torch.tensor(
+                        [int(p["chosen_move"]) for p in batch], device=device, dtype=torch.long,
+                    )
+                    value_batch = value_targets[batch_idx].to(device)
+                    mode = "winner"
+                else:
+                    pool = mcts_idx if mcts_idx else primary
+                    batch_idx = random.sample(pool, min(cfg.train_batch_size, len(pool)))
+                    batch = [positions[i] for i in batch_idx]
+                    boards = [chess.Board(p["fen"]) for p in batch]
+                    batch_input = encode_boards(model, boards, device)
+                    visit_batch = visit_targets[batch_idx].to(device)
+                    value_batch = value_targets[batch_idx].to(device)
+                    mode = "mcts"
 
             optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 out = model(batch_input)
-                if mode == "sf_hard":
+                if mode in ("sf_hard", "winner"):
                     p_loss = F.cross_entropy(out["policy_logits"], move_targets)
                     v_loss = value_loss(out["value_logits"], value_batch, n_value_classes)
                 elif mode == "sf_shard":
@@ -269,6 +286,8 @@ def train_on_positions(
             totals["batches"] += 1
             if mode.startswith("sf"):
                 totals["sf_batches"] += 1
+            elif mode == "winner":
+                totals["winner_batches"] += 1
             else:
                 totals["mcts_batches"] += 1
             epoch_batches += 1
@@ -279,7 +298,8 @@ def train_on_positions(
                 f"loss={totals['loss']/totals['batches']:.4f} "
                 f"p={totals['policy']/totals['batches']:.4f} "
                 f"v={totals['value']/totals['batches']:.4f} "
-                f"(mcts_batches={totals['mcts_batches']} sf_batches={totals['sf_batches']})"
+                f"(winner_batches={totals['winner_batches']} "
+                f"mcts_batches={totals['mcts_batches']} sf_batches={totals['sf_batches']})"
             )
 
     model.eval()

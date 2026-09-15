@@ -20,6 +20,14 @@ class SelfPlayConfig:
     mcts_c_puct: float = 2.5
     visit_temp: float = 1.0
     ply_cap: int = 200
+    # Search-free (AlphaZero minus MCTS): sample π at sample_temp, optionally
+    # keep only the winner's moves as CE targets.
+    use_search: bool = True
+    sample_temp: float = 0.7
+    winner_only: bool = False
+    play_batch_size: int = 64
+    vs_incumbent: bool = False
+    incumbent_temp: float = 1.0
     sf_elo: int = 1500  # ignored when sf_full_strength=True
     sf_full_strength: bool = False  # True = no UCI_LimitStrength
     sf_depth: int | None = None  # if set, Limit(depth=...) instead of time
@@ -209,5 +217,37 @@ def kl_anchored_config(**overrides) -> SelfPlayConfig:
         use_fp16=False,
         use_bf16=False,
         output_dir="outputs/rl_selfplay_kl_anchored",
+    )
+    return replace(cfg, **overrides) if overrides else cfg
+
+
+def searchfree_99m_config(**overrides) -> SelfPlayConfig:
+    """Frozen 99M at T=1 vs student T=0.7. CE only when the student wins."""
+    cfg = SelfPlayConfig(
+        mode="self",
+        use_search=False,
+        sample_temp=0.7,
+        vs_incumbent=True,
+        incumbent_temp=1.0,
+        winner_only=True,
+        n_games=128,
+        games_per_iter=128,
+        play_batch_size=64,
+        ply_cap=180,
+        train_epochs=1,
+        train_batch_size=64,
+        train_lr=5e-6,
+        value_weight=0.0,
+        grad_clip=0.5,
+        entropy_weight=0.0,
+        mix_sf_frac=0.0,
+        mix_sf_move_frac=0.0,
+        iterations=10,
+        eval_games=8,
+        eval_sims=0,
+        use_fp16=False,
+        use_bf16=True,
+        output_dir="outputs/exp281_searchfree_selfplay",
+        dataset_dir="outputs/exp281_searchfree_selfplay/dataset",
     )
     return replace(cfg, **overrides) if overrides else cfg
