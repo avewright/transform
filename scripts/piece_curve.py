@@ -62,7 +62,10 @@ def recount_inbox_pieces(inbox) -> np.ndarray:
         if not (cache.parent / "READY").exists():
             continue
         data = torch.load(cache, map_location="cpu", weights_only=False)
-        pcs = (data["board_array"] != 0).sum(dim=1).cpu().numpy().astype(int)
+        if "n_pieces" in data:
+            pcs = data["n_pieces"].cpu().numpy().astype(int).reshape(-1)
+        else:
+            pcs = (data["board_array"] != 0).sum(dim=1).cpu().numpy().astype(int)
         for n in pcs:
             if MIN_N <= int(n) <= MAX_N:
                 have[int(n)] += 1

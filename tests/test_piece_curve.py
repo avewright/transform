@@ -92,6 +92,9 @@ def test_normalize_row_pads_short_cache():
     assert out is not None
     assert out["soft_cps"].shape == (8,)
     assert int(out["nodes_budget"]) == 100000
+    assert int(out["n_pieces"]) == 1
+    assert int(out["n_soft"]) == 8
+    assert abs(float(out["wdl"].sum()) - 1.0) < 1e-5
 
 
 def test_specs_rotate_streams():

@@ -81,6 +81,7 @@ SF19_SCHEMA = pa.schema(list(SCHEMA) + [
     pa.field("flags", pa.int16()),
     pa.field("bound_skipped", pa.int16()),
     pa.field("n_pieces", pa.int8()),
+    pa.field("n_soft", pa.int8()),
 ])
 
 
@@ -146,7 +147,16 @@ def sf19_chunk_table(d: dict, name: str, start: int, end: int) -> pa.Table:
         pa.array(np.asarray(_col("origin", None, 0), dtype=np.int8)),
         pa.array(np.asarray(_col("flags", None, 0), dtype=np.int16)),
         pa.array(np.asarray(_col("bound_skipped", None, 0), dtype=np.int16)),
-        pa.array(np.asarray(_col("n_pieces", None, 0), dtype=np.int8)),
+        pa.array(
+            np.asarray(_col("n_pieces", None, 0), dtype=np.int8)
+            if "n_pieces" in d
+            else np.count_nonzero(d["board_array"][start:end].numpy(), axis=1).astype(np.int8)
+        ),
+        pa.array(
+            np.asarray(_col("n_soft", None, 0), dtype=np.int8)
+            if "n_soft" in d
+            else (d["soft_indices"][start:end].numpy() >= 0).sum(axis=1).astype(np.int8)
+        ),
     ]
     table = base
     extra_fields = [SF19_SCHEMA.field(i) for i in range(len(SCHEMA), len(SF19_SCHEMA))]
@@ -161,10 +171,15 @@ def sf19_table_to_cache(table: pa.Table) -> dict:
         return np.asarray(table.column(name).to_pylist(), dtype=dtype)
 
     board = torch.from_numpy(_list_np("board_array", np.int8))
+    soft_indices = torch.from_numpy(_list_np("soft_indices", np.int64))
     if "n_pieces" in table.column_names:
         n_pieces = torch.from_numpy(table.column("n_pieces").to_numpy().astype(np.int8))
     else:
         n_pieces = torch.from_numpy(np.count_nonzero(board.numpy(), axis=1).astype(np.int8))
+    if "n_soft" in table.column_names:
+        n_soft = torch.from_numpy(table.column("n_soft").to_numpy().astype(np.int8))
+    else:
+        n_soft = (soft_indices >= 0).sum(dim=1).to(torch.int8)
     out = {
         "board_array": board,
         "turn": torch.from_numpy(table.column("turn").to_numpy().astype(np.int8)),
@@ -173,7 +188,7 @@ def sf19_table_to_cache(table: pa.Table) -> dict:
         "move_idx": torch.from_numpy(table.column("move_idx").to_numpy().astype(np.int64)),
         "cp": torch.from_numpy(table.column("cp").to_numpy().astype(np.int32)),
         "mate": torch.from_numpy(table.column("mate").to_numpy().astype(np.int32)),
-        "soft_indices": torch.from_numpy(_list_np("soft_indices", np.int64)),
+        "soft_indices": soft_indices,
         "soft_probs": torch.from_numpy(_list_np("soft_probs", np.float32)),
         "label_depth": torch.from_numpy(table.column("label_depth").to_numpy().astype(np.int16)),
         "phase": torch.from_numpy(table.column("phase").to_numpy().astype(np.int8)),
@@ -192,6 +207,7 @@ def sf19_table_to_cache(table: pa.Table) -> dict:
         "flags": torch.from_numpy(table.column("flags").to_numpy().astype(np.int16)),
         "bound_skipped": torch.from_numpy(table.column("bound_skipped").to_numpy().astype(np.int16)),
         "n_pieces": n_pieces,
+        "n_soft": n_soft,
     }
     return out
 

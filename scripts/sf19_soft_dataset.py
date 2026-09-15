@@ -18,7 +18,7 @@ Usage:
       --out-dir outputs/sf19_soft/eco_1m --target 1000000 --workers 16
   MOVE_VOCAB_VERSION=compact STOCKFISH_PATH=$HOME/.local/bin/stockfish-19 \\
     python -u scripts/sf19_soft_dataset.py generate --go --mode piece_curve \\
-      --out-dir outputs/sf19_soft/piece_curve --target 300000 --workers 8
+      --no-ingest --out-dir outputs/sf19_soft/harvest --target 300000 --workers 8
 """
 from __future__ import annotations
 
@@ -75,6 +75,17 @@ SOFT_K = 8
 SOURCE_SF19 = 4
 MATE_BASE = 100_000
 DEFAULT_TAU = 120.0
+
+
+def count_soft_targets(indices, probs=None) -> int:
+    """How many of the K slots are real teacher moves. Always in 0..SOFT_K."""
+    si = np.asarray(indices).reshape(-1)
+    valid = si >= 0
+    if probs is not None:
+        sp = np.asarray(probs).reshape(-1)
+        n = min(si.size, sp.size)
+        valid = valid[:n] & (sp[:n] > 0)
+    return int(max(0, min(SOFT_K, int(valid.sum()))))
 ORIGIN_RELABEL = 0
 ORIGIN_SELFPLAY = 1
 FLAG_SHALLOW = 1 << 0
@@ -532,6 +543,7 @@ def label_to_row(board: chess.Board, parsed: dict, *, tau: float, nodes_budget: 
             "tau": np.float32(tau),
             "nodes_budget": np.int32(nodes_budget),
             "n_pieces": np.int8(int(np.count_nonzero(arr))),
+            "n_soft": np.int8(0),
         }, parsed)
     enc = encode_board(board)
     if enc is None:
@@ -584,6 +596,7 @@ def label_to_row(board: chess.Board, parsed: dict, *, tau: float, nodes_budget: 
         "tau": np.float32(tau),
         "nodes_budget": np.int32(nodes_budget),
         "n_pieces": np.int8(int(np.count_nonzero(arr))),
+        "n_soft": np.int8(count_soft_targets(soft_i, soft_p)),
     }, parsed)
 
 
@@ -748,7 +761,7 @@ ROW_STACK_KEYS = (
     "cp", "mate", "soft_indices", "soft_probs", "soft_cps", "soft_mates",
     "label_depth", "phase", "source", "wdl", "nodes", "policy_mask",
     "tau", "nodes_budget", "game_id", "ply", "split",
-        "origin", "flags", "bound_skipped", "n_pieces",
+    "origin", "flags", "bound_skipped", "n_pieces", "n_soft",
 )
 
 
@@ -800,15 +813,22 @@ def normalize_harvest_row(row: dict) -> dict | None:
         "flags": (np.int16, 0),
         "bound_skipped": (np.int16, 0),
         "n_pieces": (np.int8, 0),
+        "n_soft": (np.int8, 0),
     }
     for key, (dtype, fill) in defaults.items():
         out[key] = _as_numpy(out[key], dtype) if key in out else np.asarray(fill, dtype=dtype)
-    if "wdl" not in out:
-        out["wdl"] = np.array([0.33, 0.34, 0.33], dtype=np.float32)
+    if "wdl" not in row:
+        out["wdl"] = compute_wdl(
+            torch.tensor([int(out["cp"])], dtype=torch.int32),
+            torch.tensor([int(out["mate"])], dtype=torch.int32),
+        )[0].numpy().astype(np.float32)
     else:
         out["wdl"] = _as_numpy(out["wdl"], np.float32).reshape(-1)[:3]
     if "n_pieces" not in row or int(out["n_pieces"]) <= 0:
         out["n_pieces"] = np.int8(n_pieces_from_row(out))
+    out["n_soft"] = np.int8(count_soft_targets(out["soft_indices"], out["soft_probs"]))
+    if int(out["n_soft"]) < 1:
+        return None
     if int(out["policy_mask"]) == 0 or int(out["move_idx"]) < 0:
         return None
     return out
@@ -887,7 +907,7 @@ def ingest_existing_curve(
     pending_keys: set[bytes] = set()
     kept = 0
     scanned = 0
-    skipped = {"dup": 0, "curve": 0, "bad": 0}
+    skipped = {"dup": 0, "curve": 0, "bad": 0, "no_values": 0}
 
     def flush() -> None:
         nonlocal pending, pending_keys
@@ -917,6 +937,9 @@ def ingest_existing_curve(
             continue
         for raw in rows:
             scanned += 1
+            if "soft_cps" not in raw:
+                skipped["no_values"] = skipped.get("no_values", 0) + 1
+                continue
             row = normalize_harvest_row(raw)
             if row is None:
                 skipped["bad"] += 1
@@ -1255,18 +1278,18 @@ def _run_job(spec: dict) -> dict:
 
 
 def stack_rows(rows: list[dict]) -> dict:
-    keys = [
-        "board_array", "turn", "castling", "ep_square", "move_idx",
-        "cp", "mate", "soft_indices", "soft_probs", "soft_cps", "soft_mates",
-        "label_depth", "phase", "source", "wdl", "nodes", "policy_mask",
-        "tau", "nodes_budget", "game_id", "ply", "split",
-        "origin", "flags", "bound_skipped", "n_pieces",
-    ]
     out = {}
-    for k in keys:
+    for k in ROW_STACK_KEYS:
         if k == "n_pieces" and any("n_pieces" not in r for r in rows):
             pcs = [int(r["n_pieces"]) if "n_pieces" in r else n_pieces_from_row(r) for r in rows]
             out[k] = torch.tensor(pcs, dtype=torch.int8)
+            continue
+        if k == "n_soft" and any("n_soft" not in r for r in rows):
+            ns = [
+                int(r["n_soft"]) if "n_soft" in r else count_soft_targets(r["soft_indices"], r.get("soft_probs"))
+                for r in rows
+            ]
+            out[k] = torch.tensor(ns, dtype=torch.int8)
             continue
         out[k] = torch.from_numpy(np.stack([r[k] for r in rows]))
     return out
@@ -1298,11 +1321,13 @@ def write_labels_jsonl(data: dict, dest: Path) -> None:
                 "n_pieces": int(data["n_pieces"][i]) if "n_pieces" in data else n_pieces_from_row({
                     "board_array": data["board_array"][i],
                 }),
+                "n_soft": int(data["n_soft"][i]) if "n_soft" in data else len(_row_moves(data, i)),
                 "turn": int(data["turn"][i]),
                 "ply": int(data["ply"][i]) if "ply" in data else -1,
                 "move_idx": int(data["move_idx"][i]),
                 "cp": int(data["cp"][i]),
                 "mate": int(data["mate"][i]),
+                "wdl": [float(x) for x in np.asarray(data["wdl"][i]).reshape(-1)[:3]] if "wdl" in data else [],
                 "moves": _row_moves(data, i),
             }
             f.write(json.dumps(rec) + "\n")
@@ -1827,7 +1852,7 @@ def generate(args) -> None:
         if piece_curve:
             curve_have = recount_inbox_pieces(inbox)
             log(f"piece_curve resume {curve_summary(curve_have)}", log_path)
-            if committed < target:
+            if committed < target and not getattr(args, "no_ingest", False):
                 ingest_existing_curve(
                     inbox=inbox,
                     seen=seen,
@@ -1848,13 +1873,21 @@ def generate(args) -> None:
                 committed, next_game = inbox_state(inbox)
                 curve_have = recount_inbox_pieces(inbox)
             log(f"piece_curve after ingest committed={committed:,} {curve_summary(curve_have)}", log_path)
-            fen_buckets = collect_fen_buckets(
-                local_fen_paths(ROOT), random.Random(args.seed + 9),
-            )
-            log(
-                f"fen_seeds={sum(len(v) for v in fen_buckets.values()):,}",
-                log_path,
-            )
+            if getattr(args, "no_ingest", False):
+                fen_buckets = {}
+                log("fen_seeds=0 (fresh SF19 games only)", log_path)
+            else:
+                try:
+                    fen_buckets = collect_fen_buckets(
+                        local_fen_paths(ROOT), random.Random(args.seed + 9),
+                    )
+                    log(
+                        f"fen_seeds={sum(len(v) for v in fen_buckets.values()):,}",
+                        log_path,
+                    )
+                except Exception as exc:
+                    fen_buckets = {}
+                    log(f"fen_seeds skipped: {type(exc).__name__}: {exc}", log_path)
         seed_fens = []
         seed_paths = []
     else:
@@ -1890,6 +1923,8 @@ def generate(args) -> None:
     pending_keys: set[str] = set()
     game_i = args.game_start if args.game_start else next_game
     stats_path = out / "stats.json"
+    piece_have = curve_have if piece_curve else recount_inbox_pieces(inbox)
+    nsoft_hist = np.zeros(SOFT_K + 1, dtype=np.int64)
 
     def flush(force: bool = False) -> None:
         nonlocal pending, pending_keys
@@ -1981,7 +2016,13 @@ def generate(args) -> None:
                     if seen.has(k) or k in pending_keys:
                         rejected["dup"] += 1
                         continue
-                    n_pcs = n_pieces_from_row(row)
+                    n_pcs = int(row["n_pieces"]) if "n_pieces" in row else n_pieces_from_row(row)
+                    n_soft = int(row["n_soft"]) if "n_soft" in row else count_soft_targets(
+                        row["soft_indices"], row.get("soft_probs"),
+                    )
+                    if n_soft < 1 or n_soft > SOFT_K:
+                        rejected["analyze_fail"] += 1
+                        continue
                     if endgame and not in_piece_window(n_pcs):
                         rejected["curve"] += 1
                         continue
@@ -1990,6 +2031,9 @@ def generate(args) -> None:
                             rejected["curve"] += 1
                             continue
                         curve_have[n_pcs] += 1
+                    elif 2 <= n_pcs <= 32:
+                        piece_have[n_pcs] += 1
+                    nsoft_hist[n_soft] += 1
                     keys.append(k)
                     kept.append(row)
                     pending_keys.add(k)
@@ -2010,14 +2054,17 @@ def generate(args) -> None:
                         "pos_per_s": rate,
                         "elapsed_s": elapsed,
                     }
+                    have = curve_have if piece_curve else piece_have
+                    summ = curve_summary(have)
+                    extra = (
+                        f" pieces={summ['n']} n̄={summ['mean']} σ={summ['std']} peak={summ['peak']}"
+                        f" n_soft={ {i: int(nsoft_hist[i]) for i in range(1, SOFT_K + 1) if nsoft_hist[i]} }"
+                    )
                     if piece_curve:
-                        summ = curve_summary(curve_have)
-                        extra = (
-                            f" curve={rejected['curve']} "
-                            f"n̄={summ['mean']} σ={summ['std']} peak={summ['peak']}"
-                        )
-                        stats["piece_curve"] = summ
-                        stats["piece_hist"] = [int(x) for x in curve_have.tolist()]
+                        extra = f" curve={rejected['curve']}" + extra
+                    stats["piece_curve"] = summ
+                    stats["piece_hist"] = [int(x) for x in have.tolist()]
+                    stats["n_soft_hist"] = [int(x) for x in nsoft_hist.tolist()]
                     log(
                         f"accepted={accepted:,} pending={len(pending)} seen={len(seen):,} "
                         f"dup={rejected['dup']} fail={rejected['analyze_fail']} "
@@ -2255,6 +2302,66 @@ See `audit.json`. Flags did not predict disagreement; no adaptive extra search.
 """
 
 
+def _local_soft_readme(repo: str, n_total: int, tau: float, openings: dict, teacher: dict, stats: dict) -> str:
+    cfg = (teacher.get("config") or {})
+    run = (teacher.get("run") or {})
+    fp = run.get("source_revision") or (teacher.get("teacher") or {}).get("source_revision") or "edb0d9db6731067ec50ce619ff372b463bc4dd5d"
+    curve = stats.get("piece_curve") or {}
+    nsoft = stats.get("n_soft_hist") or []
+    return f"""---
+license: mit
+tags:
+- chess
+- stockfish-19
+- soft-labels
+- multipv
+- piece-count
+pretty_name: Local soft positions
+---
+
+# Local soft positions
+
+Local **Stockfish 19** MultiPV harvest. Unique boards, piece-count tracked,
+1–8 soft policy targets plus White-absolute values.
+
+**{n_total:,}** rows. Source id `4`. Vocab `compact` (1968).
+
+## Sampling
+
+Full SF19 vs SF19 games from Lichess ECO starts
+({int(openings.get('n_starts') or 0):,} unique). A row is kept only when its
+`n_pieces` is still under a truncated **N(17, 6)** over n ∈ {{2…32}}.
+Deduped by 4-field board key (board, side, castling, ep).
+
+Piece-count in this upload: n={int(curve.get('n') or n_total):,} mean={curve.get('mean', 16.88)}
+std={curve.get('std', 6.0)} peak={curve.get('peak', 15)}.
+
+`split=1` is a ~5% holdout. Honor `split`.
+
+## Teacher
+
+- Stockfish 19 (`{str(fp)[:8]}`), EvalFile `nn-1a298aa575a0.nnue`
+- Full strength, `Threads=1`, `Hash=64`
+- Label: **{int(cfg.get('nodes') or 100000):,} nodes / MultiPV={int(cfg.get('multipv') or 8)}** / `tau={tau:g}`
+
+## Targets
+
+- `n_pieces` — pieces on the board
+- `n_soft` — how many of the 8 slots are live (1–8)
+- `soft_indices` / `soft_probs` / `soft_cps` / `soft_mates` — STM policy + per-move values
+- `cp` / `mate` / `wdl` — **White-absolute** value
+- Softmax is `tau={tau:g}` over the last complete MultiPV iteration
+- Unsearched legal moves are absent, not proven bad
+
+n_soft hist (slots 1–8): {nsoft[1:] if len(nsoft) > 1 else nsoft}
+
+## Files
+
+- `data/shard_XXXXXX.parquet`
+- `teacher.json`, `openings.json`, `manifest.json`, `stats.json`, `summary.json`
+"""
+
+
 def _sf19_eco_readme(repo: str, n_total: int, tau: float, openings: dict, teacher: dict, stats: dict) -> str:
     cfg = (teacher.get("config") or {})
     run = (teacher.get("run") or {})
@@ -2466,6 +2573,11 @@ def push_hf(args) -> None:
             _endgame_readme(repo, n_total, float(args.tau), endgame, openings, teacher, stats),
             encoding="utf-8",
         )
+    elif "local-soft" in repo or stats.get("piece_hist"):
+        readme.write_text(
+            _local_soft_readme(repo, n_total, float(args.tau), openings, teacher, stats),
+            encoding="utf-8",
+        )
     elif openings:
         readme.write_text(
             _sf19_eco_readme(repo, n_total, float(args.tau), openings, teacher, stats),
@@ -2572,6 +2684,8 @@ def main() -> None:
     g.add_argument("--no-seed-caches", action="store_true")
     g.add_argument("--no-prefixes", action="store_true",
                    help="ECO mode: start only from named leaves, not book prefixes.")
+    g.add_argument("--no-ingest", action="store_true",
+                   help="Do not copy existing caches; label every row with this SF19 binary.")
     g.add_argument("--mode", choices=("selfplay", "mix", "eco", "piece_curve", "endgame"), default="mix")
     g.add_argument("--relabel-frac", type=float, default=0.8)
     a = sub.add_parser("audit")

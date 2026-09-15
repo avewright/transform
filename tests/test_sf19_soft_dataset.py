@@ -8,6 +8,7 @@ import torch
 
 from scripts.sf19_soft_dataset import (
     SOFT_K,
+    count_soft_targets,
     encode_board,
     label_to_row,
     mate_rank_score,
@@ -16,6 +17,13 @@ from scripts.sf19_soft_dataset import (
     stm_rank_score,
     to_white_abs,
 )
+
+
+def test_n_soft_is_one_to_eight():
+    assert count_soft_targets([-1] * 8) == 0
+    assert count_soft_targets([3, -1, -1, -1, -1, -1, -1, -1], [1, 0, 0, 0, 0, 0, 0, 0]) == 1
+    assert count_soft_targets(list(range(8)), [0.125] * 8) == 8
+    assert count_soft_targets(list(range(8)), [0.5, 0.5, 0, 0, 0, 0, 0, 0]) == 2
 
 
 def test_softmax_stable_and_normalized():
@@ -83,6 +91,9 @@ def test_parse_skips_bound_scores_and_pads():
     assert row["policy_mask"] == 1
     assert row["soft_indices"].shape == (SOFT_K,)
     assert int(row["n_pieces"]) == 32
+    assert 1 <= int(row["n_soft"]) <= SOFT_K
+    assert int(row["n_soft"]) == 1
+    assert int(row["soft_cps"][0]) == 40
 
 
 def test_terminal_masks_policy():
@@ -126,8 +137,10 @@ def test_inbox_state_counts_ready_shards(tmp_path):
     labels = (inbox / "shard_000000" / "labels.jsonl").read_text(encoding="utf-8").strip()
     rec = json.loads(labels)
     assert rec["n_pieces"] == 32
+    assert rec["n_soft"] == 1
     assert rec["moves"][0]["uci"] == "e2e4"
     assert rec["moves"][0]["cp"] == 30
+    assert len(rec["wdl"]) == 3
 
 
 def test_probs_sum_and_legal_indices():
@@ -157,6 +170,9 @@ def test_probs_sum_and_legal_indices():
     assert abs(float(row["soft_probs"].sum()) - 1) < 1e-5
     assert int(row["soft_indices"][0]) == UCI_TO_IDX["e2e4"]
     assert int(row["cp"]) == 30  # white to move, white-abs == stm
+    assert int(row["n_soft"]) == 2
+    assert int(row["soft_cps"][0]) == 30
+    assert int(row["soft_cps"][1]) == 20
 
 
 class _Cp:
@@ -277,6 +293,8 @@ def test_sf19_parquet_round_trip_keeps_wdl_scores_and_split(tmp_path):
     assert torch.allclose(back["wdl"], data["wdl"])
     assert torch.equal(back["soft_cps"], data["soft_cps"])
     assert torch.equal(back["soft_indices"], data["soft_indices"])
+    assert int(back["n_pieces"][0]) == 32
+    assert int(back["n_soft"][0]) == 2
     assert int(back["origin"][0]) == 0
     assert int(row["flags"]) & 0 == 0
 
