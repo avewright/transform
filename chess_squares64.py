@@ -72,6 +72,12 @@ class Squares64RecurrentConfig:
     n_value_classes: int = 3  # WDL aux
     use_history: bool = False
     use_threat_head: bool = False
+    # Optional recurrent geometry variant. Defaults preserve old checkpoints.
+    geometry_attention: str = "none"  # none | gab | shaw | both
+    geometry_scope: str = "bank"  # bank | all
+    gab_d1: int = 16
+    gab_d2: int = 64
+    gab_d3: int = 32
 
     @property
     def unique_layers(self) -> int:
@@ -90,6 +96,14 @@ class Squares64RecurrentConfig:
 
     def validate(self) -> None:
         """Head / kernel compatibility. Width scaling is not a free lunch."""
+        if self.geometry_attention not in {"none", "gab", "shaw", "both"}:
+            raise ValueError("Unknown geometry_attention")
+        if self.geometry_scope not in {"bank", "all"}:
+            raise ValueError("geometry_scope must be bank or all")
+        if self.geometry_attention != "none" and not self.use_qk_norm:
+            raise ValueError("Geometry attention requires QK normalization")
+        if min(self.gab_d1, self.gab_d2, self.gab_d3) < 1:
+            raise ValueError("GAB dimensions must be positive")
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim={self.hidden_dim} must be divisible by "
@@ -225,6 +239,19 @@ class Squares64RecurrentTransformer(nn.Module):
         self.prefix = nn.ModuleList([_layer() for _ in range(config.prefix_layers)])
         self.bank = nn.ModuleList([_layer() for _ in range(config.recurrent_layers)])
         self.suffix = nn.ModuleList([_layer() for _ in range(config.suffix_layers)])
+        if config.geometry_attention != "none":
+            from chess_geometry_attention import GeometryAttention
+            layers = list(self.bank)
+            if config.geometry_scope == "all":
+                layers += list(self.prefix) + list(self.suffix)
+            for layer in layers:
+                old_state = layer.attn.state_dict()
+                layer.attn = GeometryAttention(config.hidden_dim, config.num_heads,
+                    config.dropout, mode=config.geometry_attention,
+                    d1=config.gab_d1, d2=config.gab_d2, d3=config.gab_d3)
+                state = layer.attn.state_dict()
+                state.update(old_state)
+                layer.attn.load_state_dict(state, strict=True)
         self.norm = nn.LayerNorm(config.hidden_dim)
 
         # n_ctx=0: policy reads all 64 tokens as squares.
@@ -255,13 +282,19 @@ class Squares64RecurrentTransformer(nn.Module):
             return checkpoint(layer, h, None, use_reentrant=False)
         return layer(h, attn_bias=None)
 
-    def forward(self, board_input: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, board_input: dict[str, torch.Tensor], *, recurrent_unrolls: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        # Runtime override keeps checkpoint configuration and weights unchanged.
+        unrolls = self.config.recurrent_unrolls if recurrent_unrolls is None else recurrent_unrolls
+        if isinstance(unrolls, bool) or not isinstance(unrolls, int) or unrolls < 1:
+            raise ValueError("recurrent_unrolls must be a positive integer")
         h = self.input_proj(self.encoder(board_input))  # (B, 64, D)
 
         for layer in self.prefix:
             h = self._run_block(layer, h)
 
-        for _ in range(self.config.recurrent_unrolls):
+        for _ in range(unrolls):
             for layer in self.bank:
                 h = self._run_block(layer, h)
 
@@ -342,6 +375,31 @@ def upgrade_with_history(model: Squares64RecurrentTransformer, *, threat_head: b
     for key, value in old.items():
         if key not in state or state[key].shape != value.shape:
             raise ValueError(f"Incompatible checkpoint parameter: {key}")
+        state[key] = value
+    upgraded.load_state_dict(state, strict=True)
+    upgraded.train(model.training)
+    return upgraded
+
+
+def upgrade_with_geometry(model: Squares64RecurrentTransformer, **geometry):
+    """Copy every pretrained tensor; initialize only new geometry parameters.
+
+    Rebuild the optimizer after upgrading. Extra attention arithmetic may cause
+    floating-point differences; mathematical initial behavior is unchanged.
+    """
+    from dataclasses import replace
+    allowed = {"geometry_attention", "geometry_scope", "gab_d1", "gab_d2", "gab_d3"}
+    if set(geometry) - allowed:
+        raise ValueError(f"Unknown geometry fields: {set(geometry) - allowed}")
+    if model.config.geometry_attention != "none":
+        raise ValueError("Upgrade requires an original no-geometry checkpoint")
+    cfg = replace(model.config, **geometry)
+    param = next(model.parameters())
+    upgraded = build_squares64(cfg).to(device=param.device, dtype=param.dtype)
+    state = upgraded.state_dict()
+    for key, value in model.state_dict().items():
+        if key not in state or state[key].shape != value.shape:
+            raise ValueError(f"Incompatible pretrained parameter: {key}")
         state[key] = value
     upgraded.load_state_dict(state, strict=True)
     upgraded.train(model.training)

@@ -1,0 +1,34 @@
+{
+  "name": "exp284_recurrent_geometry_99m",
+  "checkpoint": "outputs/hf_100m_squares64/latest.pt",
+  "output": "outputs/exp284_recurrent_geometry_99m",
+  "model": {
+    "geometry_attention": "gab",
+    "geometry_scope": "bank",
+    "gab_d1": 16,
+    "gab_d2": 64,
+    "gab_d3": 32
+  },
+  "data": {
+    "train_cache": "outputs/organized_chess_v1/soft_cache.pt",
+    "eval_cache": "outputs/organized_chess_v1/sf19_eval.pt",
+    "eval_rows": 1000
+  },
+  "train": {
+    "arm": "variable",
+    "train_depths": [2, 3, 4],
+    "steps": 3000,
+    "batch_size": 8,
+    "lr": 0.00001,
+    "geometry_lr": 0.0001,
+    "weight_decay": 0.01,
+    "warmup": 100,
+    "cosine_decay": true,
+    "min_lr_fraction": 0.1,
+    "soft_alpha": 0.55,
+    "value_weight": 0.15,
+    "save_every": 250,
+    "seed": 284
+  },
+  "eval_depths": [1, 2, 3, 4, 6, 8]
+}
