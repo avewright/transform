@@ -1,0 +1,21 @@
+{
+  "name": "full_strength_stockfish_policy_screen_v1",
+  "nodes": 100000,
+  "movetime": 0,
+  "threads": 1,
+  "hash_mb": 128,
+  "ply_cap": 800,
+  "depth": 3,
+  "openings": [
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"],
+    ["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "g8f6"],
+    ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"],
+    ["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"],
+    ["e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"],
+    ["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"],
+    ["d2d4", "g8f6", "c2c4", "e7e6", "b1c3", "f8b4"],
+    ["d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7"],
+    ["c2c4", "e7e5", "b1c3", "g8f6", "g2g3", "d7d5"],
+    ["g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "c7c6"]
+  ]
+}

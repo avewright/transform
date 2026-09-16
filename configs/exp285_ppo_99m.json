@@ -1,0 +1,33 @@
+{
+  "checkpoint": "outputs/hf_100m_squares64/latest.pt",
+  "output": "outputs/exp285_ppo_99m",
+  "replay_cache": "outputs/organized_chess_v1/soft_cache.pt",
+  "seed": 285,
+  "iterations": 20,
+  "league_size": 4,
+  "reference_opponent_fraction": 0.5,
+  "ppo": {
+    "games_per_iteration": 32,
+    "rollout_batch_size": 8,
+    "ply_cap": 400,
+    "depths": [3],
+    "temperature": 0.8,
+    "opponent_temperature": 0.8,
+    "epochs": 2,
+    "minibatch_size": 32,
+    "microbatch_size": 8,
+    "learning_rate": 0.000002,
+    "clip_ratio": 0.15,
+    "value_clip": 0.2,
+    "value_weight": 0.5,
+    "reference_kl_weight": 0.02,
+    "entropy_weight": 0.001,
+    "target_kl": 0.02,
+    "max_grad_norm": 0.5,
+    "gamma": 1.0,
+    "gae_lambda": 0.95,
+    "replay_weight": 0.25,
+    "replay_batch_size": 8,
+    "weight_decay": 0.01
+  }
+}
