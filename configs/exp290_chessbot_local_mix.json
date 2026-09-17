@@ -1,0 +1,24 @@
+{
+  "output": "outputs/exp290_chessbot_local_mix",
+  "train": {
+    "seed": 290,
+    "steps": 156250,
+    "batch_size": 32,
+    "lr": 1e-5,
+    "warmup": 8000,
+    "cosine_decay": true,
+    "min_lr_fraction": 0.1,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "soft_alpha": 0.55,
+    "value_weight": 0.15,
+    "kl_weight": 0.20,
+    "unrolls": [2, 3],
+    "save_every": 200,
+    "log_every": 25,
+    "val_every": 50,
+    "val_unrolls": [1, 2, 3],
+    "val_per_bucket": 48,
+    "val_batch_size": 16
+  }
+}

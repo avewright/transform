@@ -1,0 +1,50 @@
+{
+  "name": "exp287_chessbot_99m",
+  "output": "outputs/exp287_chessbot_99m",
+  "dataset": "Maxlegrec/ChessFENS",
+  "chessbot_repo": "Maxlegrec/ChessBot",
+  "model": {
+    "d_model": 736,
+    "d_ff": 2112,
+    "num_heads": 8,
+    "dropout": 0.05,
+    "prefix_layers": 4,
+    "recurrent_layers": 7,
+    "recurrent_unrolls": 3,
+    "suffix_layers": 4,
+    "vocab_size": 1929,
+    "n_value_classes": 3,
+    "value_hidden": 128,
+    "gradient_checkpointing": false,
+    "use_swiglu": true,
+    "use_qk_norm": true,
+    "zero_init_out_proj": true
+  },
+  "train": {
+    "steps": 11431278,
+    "batch_size": 64,
+    "accum_steps": 1,
+    "optimizer": "polar_normuon",
+    "muon_lr": 0.02,
+    "adam_lr": 0.0003,
+    "lr": 0.0003,
+    "weight_decay": 0.01,
+    "warmup": 500,
+    "cosine_decay": false,
+    "min_lr_fraction": 1.0,
+    "soft_alpha": 0.85,
+    "value_weight": 0.15,
+    "hflip_p": 0.5,
+    "grad_clip": 1.0,
+    "save_every": 200,
+    "log_every": 10,
+    "seed": 287,
+    "torch_compile": false
+  },
+  "eval": {
+    "sf_elos": [1900, 2050, 2200],
+    "games_per_opening_per_color": 2,
+    "vs_chessbot_games": 48,
+    "temperature": 0.0
+  }
+}

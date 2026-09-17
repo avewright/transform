@@ -56,7 +56,7 @@ def load_checkpoint(
     path: str | Path | None = None,
     device: torch.device | str | None = None,
 ):
-    """Load a trained ChessTransformer or squares64 recurrent checkpoint."""
+    """Load a ChessTransformer, squares64, or ChessBot-99M checkpoint."""
     ckpt_path = resolve_checkpoint(path)
     dev = _pick_device(device)
 
@@ -65,6 +65,30 @@ def load_checkpoint(
 
     if is_moe_router_ckpt(ckpt):
         return load_moe_pipeline(ckpt_path, device=dev, ckpt=ckpt)
+    from chess_chessbot_recurrent import is_recurrent_chessbot_ckpt
+
+    if is_recurrent_chessbot_ckpt(ckpt):
+        from experiments.exp290_chessbot_local_mix import load_model as load_chessbot34
+        model = load_chessbot34(ckpt_path, dev)
+        model.eval()
+        return model
+    from chess_chessbot import is_chessbot99_ckpt, ChessBot99Config, build_chessbot99
+
+    if is_chessbot99_ckpt(ckpt):
+        config_data = ckpt.get("config")
+        if config_data is None:
+            config = ChessBot99Config()
+        elif isinstance(config_data, ChessBot99Config):
+            config = config_data
+        else:
+            config = ChessBot99Config.from_dict(config_data)
+        model = build_chessbot99(config)
+        state = ckpt.get("model_state_dict", ckpt)
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+        model.to(dev)
+        model.eval()
+        return model
     config_data = ckpt.get("config")
     if _is_squares64(ckpt, config_data):
         from chess_squares64 import Squares64RecurrentConfig, build_squares64
@@ -119,6 +143,8 @@ def get_model_move(
     temperature: float = 0.0,
 ) -> tuple[chess.Move, dict]:
     """Pick a legal move from the model policy head."""
+    if hasattr(model, "select_move"):
+        return model.select_move(board, device, temperature)
     board_input = batch_boards_to_fused_token_ids([board], device)
     if getattr(getattr(model, "config", None), "use_history", False):
         from chess_history import batch_history_features

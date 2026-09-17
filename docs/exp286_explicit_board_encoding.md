@@ -157,6 +157,7 @@ fixed follow-up budget. Never auto-promote from a diagnostic loss improvement.
 - Only C wins: missing clock information is the leading explanation; run clock-only.
 - Neither wins: this pilot does not support prioritizing rule encoding. Test the
   ChessBot-style global square-pair policy head next, under matched supervision.
+  That follow-up is exp287: ChessBot architecture at 99M size/depth on ChessFENS.
 - Loss improves but games do not: no playing-strength win.
 - All arms regress: inspect continuation/forgetting before judging encoding.
 
