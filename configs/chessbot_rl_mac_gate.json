@@ -1,0 +1,13 @@
+{
+  "seed": 291,
+  "iterations": 2,
+  "decisions": 4096,
+  "environments": 16,
+  "ply_cap": 800,
+  "epochs": 2,
+  "minibatch": 256,
+  "microbatch": 8,
+  "anchor_batch": 128,
+  "audit_size": 512,
+  "eval_pairs": 16
+}

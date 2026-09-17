@@ -1,0 +1,23 @@
+{
+  "seed": 293,
+  "train_parents": 192,
+  "val_parents": 64,
+  "teacher_nodes": 20000,
+  "label_workers": 2,
+  "stockfish": "/Users/avewright/.local/bin/stockfish",
+  "inference_batch": 64,
+  "epochs": 5,
+  "parent_batch": 4,
+  "learning_rate": 0.00001,
+  "rank_temperature": 0.15,
+  "ranking_weight": 0.25,
+  "anchor_weight": 0.10,
+  "eval_pairs": 16,
+  "ply_cap": 800,
+  "openings": "outputs/chessbot_rl_mac_incumbent/development_openings.json",
+  "game_sources": [
+    "outputs/chessbot_rl_mac_incumbent/games_001.json",
+    "outputs/chessbot_rl_mac_incumbent/games_002.json",
+    "outputs/chessbot_rl_mac/games_001.json"
+  ]
+}
