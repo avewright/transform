@@ -1,0 +1,23 @@
+{
+  "seed": 294,
+  "data": "outputs/value99_data_live",
+  "model": {
+    "width": 576,
+    "layers": 24,
+    "heads": 8,
+    "ffn_inner": 1584,
+    "value_square": 128,
+    "value_hidden": 128,
+    "dropout": 0.05,
+    "gradient_checkpointing": true
+  },
+  "steps": 16,
+  "batch": 512,
+  "microbatch": 64,
+  "lr": 0.0002,
+  "warmup": 2000,
+  "save_every": 8,
+  "log_every": 1,
+  "val_rows": 512,
+  "precision": "bf16"
+}

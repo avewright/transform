@@ -169,6 +169,17 @@ def test_wdl_fingerprint_changes_with_nodes():
     assert a["fingerprint_id"] != b["fingerprint_id"]
 
 
+def test_wdl_shard_cursor_starts_after_hf(tmp_path):
+    from scripts.sf19_wdl_dataset import next_wdl_shard_dir
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (tmp_path / "shard_cursor").write_text("200")
+    first = next_wdl_shard_dir(inbox)
+    assert first.name == "shard_000200"
+    first.mkdir()
+    assert next_wdl_shard_dir(inbox).name == "shard_000201"
+
+
 def test_resume_rejects_other_fingerprint(tmp_path):
     from scripts.sf19_soft_dataset import assert_resume_compatible
     (tmp_path / "teacher.json").write_text('{"fingerprint_id": "wdl-aaa"}')

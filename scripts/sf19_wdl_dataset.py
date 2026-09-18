@@ -85,6 +85,20 @@ from scripts.sf19_soft_dataset import (  # noqa: E402
 
 WDL_SOURCE_UCI = 1
 WDL_SOURCE_TERMINAL = 2
+
+
+def next_wdl_shard_dir(inbox: Path) -> Path:
+    """Continue after HF shards. `shard_cursor` is the first unused index."""
+    n = 0
+    cursor = inbox.parent / "shard_cursor"
+    if cursor.exists():
+        n = max(n, int(cursor.read_text(encoding="utf-8").strip() or 0))
+    for p in inbox.glob("shard_*"):
+        try:
+            n = max(n, int(p.name.split("_", 1)[1]) + 1)
+        except ValueError:
+            continue
+    return inbox / f"shard_{n:06d}"
 WDL_FINGERPRINT_KEYS = (
     "uci_name", "binary_sha256", "eval_file",
     "nodes", "multipv", "wdl_required", "source_id",
@@ -569,6 +583,8 @@ def generate(args) -> None:
     pending: list[dict] = []
     pending_keys: set[bytes] = set()
     game_i = args.game_start if args.game_start else next_game
+    if game_i == 0 and (out / "game_start").exists():
+        game_i = int((out / "game_start").read_text().strip() or 0)
     relabel_i = 0
 
     def flush(force: bool = False) -> None:
@@ -579,7 +595,7 @@ def generate(args) -> None:
         pending = pending[len(take):] if not force else []
         keys = [row_key(r) for r in take]
         data = stack_wdl_rows(take)
-        sh = next_shard_dir(inbox)
+        sh = next_wdl_shard_dir(inbox)
         write_shard(data, sh, {
             "teacher": fp["uci_name"],
             "binary_sha256": fp["binary_sha256"],
@@ -972,8 +988,10 @@ def push_hf(args) -> None:
     stats = _load_json(out / "stats.json")
     if not stats:
         stats = {"accepted": n_new, "rejected": {}}
+    remote_rows = int(state.get("remote_rows") or 0)
+    card_rows = remote_rows + n_new
     readme = staging / "README.md"
-    readme.write_text(_local_wdl_readme(repo, n_new, openings, teacher, stats), encoding="utf-8")
+    readme.write_text(_local_wdl_readme(repo, card_rows, openings, teacher, stats), encoding="utf-8")
     extras.append("README.md")
     allow = pending + extras
     if allow:
@@ -1001,8 +1019,107 @@ def push_hf(args) -> None:
     uploaded.update(pending)
     state_path.write_text(json.dumps({
         "repo": repo, "uploaded": sorted(uploaded), "rows": n_new, "done": True,
+        "remote_rows": remote_rows, "card_rows": card_rows,
     }, indent=2), encoding="utf-8")
-    log(f"https://huggingface.co/datasets/{repo} rows={n_new:,}")
+    log(f"https://huggingface.co/datasets/{repo} local={n_new:,} card={card_rows:,}")
+
+
+def seed_hf(args) -> None:
+    """Ingest existing HF 4-field keys and start new shards after them."""
+    from huggingface_hub import snapshot_download
+    import pyarrow.parquet as pq
+
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "inbox").mkdir(parents=True, exist_ok=True)
+    log_path = out / "harvest.log"
+    cache = Path(snapshot_download(
+        repo_id=args.repo, repo_type="dataset",
+        allow_patterns=["data/*.parquet", "manifest.json", "teacher.json"],
+    ))
+    files = sorted(cache.glob("data/shard_*.parquet"))
+    if not files:
+        raise SystemExit(f"no parquet shards in {args.repo}")
+    seen = SeenDB(out / "seen.sqlite")
+    uploaded = []
+    max_idx = -1
+    max_game = -1
+    n_keys = 0
+    for path in files:
+        try:
+            idx = int(path.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            idx = -1
+        max_idx = max(max_idx, idx)
+        uploaded.append(f"data/{path.name}")
+        table = pq.read_table(path, columns=["board_array", "turn", "castling", "ep_square", "game_id"])
+        ba = table.column("board_array").to_pylist()
+        turn = table.column("turn").to_pylist()
+        castle = table.column("castling").to_pylist()
+        ep = table.column("ep_square").to_pylist()
+        games = table.column("game_id").to_pylist()
+        keys = [compact_key_bytes(ba[i], turn[i], castle[i], ep[i]) for i in range(len(ba))]
+        n_keys += seen.add_many(keys)
+        if games:
+            max_game = max(max_game, int(max(games)))
+        log(f"seed {path.name} n={len(ba)} keys={len(seen):,}", log_path)
+    next_shard = max_idx + 1
+    (out / "shard_cursor").write_text(str(next_shard), encoding="utf-8")
+    (out / "game_start").write_text(str(max_game + 1), encoding="utf-8")
+    state = {
+        "repo": args.repo,
+        "uploaded": uploaded,
+        "rows": 0,
+        "remote_rows": n_keys if n_keys else sum(1 for _ in uploaded) * 5000,
+        "next_shard": next_shard,
+        "seeded": True,
+    }
+    # n_keys is newly inserted; len(seen) is the full remote set.
+    state["remote_rows"] = len(seen)
+    (out / "hf_upload.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+    log(f"seeded repo={args.repo} remote={state['remote_rows']:,} next_shard={next_shard} next_game={max_game + 1}", log_path)
+
+
+def watch_push(args) -> None:
+    from scripts.sf19_soft_dataset import should_push_rows
+
+    out = Path(args.out_dir)
+    inbox = out / "inbox"
+    log_path = out / "push_watch.log"
+    halt = out / "HALT_PUSH"
+    lock = out / "push.lock"
+    every = max(1, int(args.every))
+    poll = max(5.0, float(args.poll))
+    _hf_token()
+    log(f"watch-push out={out} repo={args.repo} every={every} poll={poll}s", log_path)
+    while True:
+        if halt.exists():
+            log("HALT_PUSH", log_path)
+            return
+        ready, _ = inbox_state(inbox)
+        uploaded = int(_load_json(out / "hf_upload.json").get("rows") or 0)
+        finished = (out / "summary.json").exists()
+        if should_push_rows(ready, uploaded, every, finished):
+            if lock.exists() and time.time() - lock.stat().st_mtime < 30 * 60:
+                time.sleep(poll)
+                continue
+            lock.write_text(str(os.getpid()), encoding="utf-8")
+            try:
+                log(f"push ready={ready:,} uploaded={uploaded:,}", log_path)
+                push_hf(args)
+            finally:
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+            uploaded = int(_load_json(out / "hf_upload.json").get("rows") or 0)
+            if finished and ready <= uploaded:
+                log(f"watch-push done uploaded={uploaded:,}", log_path)
+                return
+        elif finished and ready <= uploaded:
+            log(f"watch-push done uploaded={uploaded:,}", log_path)
+            return
+        time.sleep(poll)
 
 
 def apply_generate_defaults(args) -> None:
@@ -1064,6 +1181,15 @@ def main() -> None:
     p.add_argument("--repo", default="avewright/local-wdl")
     p.add_argument("--wait-s", type=float, default=0,
                    help="Sleep first (HF commit rate limit). Remaining files go in one folder upload.")
+    s = sub.add_parser("seed-hf")
+    add_shared(s)
+    s.add_argument("--repo", default="avewright/local-wdl")
+    w = sub.add_parser("watch-push")
+    add_shared(w)
+    w.add_argument("--repo", default="avewright/local-wdl")
+    w.add_argument("--every", type=int, default=50_000)
+    w.add_argument("--poll", type=float, default=120)
+    w.add_argument("--wait-s", type=float, default=0)
     args = ap.parse_args()
     if args.cmd == "smoke":
         args.cmd = "generate"
@@ -1095,6 +1221,12 @@ def main() -> None:
         return
     if args.cmd == "push":
         push_hf(args)
+        return
+    if args.cmd == "seed-hf":
+        seed_hf(args)
+        return
+    if args.cmd == "watch-push":
+        watch_push(args)
         return
     if not args.go:
         raise SystemExit("pass --go")

@@ -147,6 +147,9 @@ def test_tiny_wrap_n1_matches_published_loop():
     planes[:, :, 12] = 1.0
     err = identity_errors(model, planes)
     assert max(err.values()) < 1e-5
+    from chess_chessbot_recurrent import depth_identity_errors
+    assert max(depth_identity_errors(model, planes, 2).values()) < 1e-5
+    assert float(model.alpha) == 0
     assert model.effective_depth(1) == 4
     assert model.effective_depth(2) == 6
     assert model.effective_depth(3) == 8

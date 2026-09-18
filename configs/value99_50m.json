@@ -1,0 +1,31 @@
+{
+  "seed": 294,
+  "data": "outputs/value99_data_50m",
+  "model": {
+    "width": 576,
+    "layers": 24,
+    "heads": 8,
+    "ffn_inner": 1584,
+    "value_square": 128,
+    "value_hidden": 128,
+    "dropout": 0.05,
+    "gradient_checkpointing": true
+  },
+  "steps": 96677,
+  "batch": 512,
+  "microbatch": 64,
+  "optimizer": "polar_normuon",
+  "muon_lr": 0.02,
+  "adam_lr": 0.0003,
+  "weight_decay": 0.01,
+  "torch_compile": true,
+  "lr": 0.0002,
+  "warmup": 2000,
+  "save_every": 2000,
+  "log_every": 20,
+  "val_rows": 8192,
+  "precision": "bf16",
+  "sfwdl_data": "outputs/value99_data_sfwdl_train",
+  "sfwdl_mix": 0.125,
+  "sfwdl_reload_s": 1800
+}

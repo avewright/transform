@@ -102,9 +102,14 @@ def planes_to_chessbot_input(planes: torch.Tensor) -> torch.Tensor:
 
 
 class RecurrentChessBot(nn.Module):
-    """Published ChessBot with a runtime unroll count on the middle bank."""
+    """Published ChessBot with a runtime unroll count on the middle bank.
 
-    def __init__(self, base, default_unrolls: int = 2, split: RecurrentSplit | None = None):
+    Extra bank passes are ``h + tanh(alpha) * (bank(h) - h)``. Alpha starts at 0
+    so N>1 matches the published one-pass net until the gate learns.
+    """
+
+    def __init__(self, base, default_unrolls: int = 2, split: RecurrentSplit | None = None,
+                 gate_extra: bool = True):
         super().__init__()
         self.base = base
         self.default_unrolls = int(default_unrolls)
@@ -112,6 +117,8 @@ class RecurrentChessBot(nn.Module):
         self.split.validate(int(base.num_layers))
         if self.default_unrolls < 1:
             raise ValueError("default_unrolls must be >= 1")
+        self.gate_extra = bool(gate_extra)
+        self.alpha = nn.Parameter(torch.zeros(1))
 
     @property
     def config(self):
@@ -126,6 +133,15 @@ class RecurrentChessBot(nn.Module):
         end = start + self.split.bank
         for layer in self.base.layers[start:end]:
             yield from layer.parameters()
+
+    def extra_gate(self) -> torch.Tensor:
+        return torch.tanh(self.alpha) if self.gate_extra else self.alpha.new_ones(1)
+
+    def _bank(self, x: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
+        p, k = self.split.prefix, self.split.bank
+        for layer in self.base.layers[p:p + k]:
+            x = layer(x, pos_enc)
+        return x
 
     def _encode(self, planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         x = planes_to_chessbot_input(planes)
@@ -164,9 +180,11 @@ class RecurrentChessBot(nn.Module):
         p, k, s = self.split.prefix, self.split.bank, self.split.suffix
         for layer in self.base.layers[:p]:
             x = layer(x, pos_enc)
-        for _ in range(n):
-            for layer in self.base.layers[p:p + k]:
-                x = layer(x, pos_enc)
+        x = self._bank(x, pos_enc)
+        gate = self.extra_gate()
+        for _ in range(n - 1):
+            nxt = self._bank(x, pos_enc)
+            x = x + gate * (nxt - x)
         for layer in self.base.layers[p + k:p + k + s]:
             x = layer(x, pos_enc)
         return self._heads(x, pos_enc, b, seq_len)
@@ -200,12 +218,15 @@ class RecurrentChessBot(nn.Module):
         }
 
 
-def wrap_published(device: torch.device, default_unrolls: int = 2, repo: str = REPO) -> RecurrentChessBot:
-    return RecurrentChessBot(load_published_chessbot(device, repo), default_unrolls=default_unrolls)
+def wrap_published(device: torch.device, default_unrolls: int = 2, repo: str = REPO,
+                   gate_extra: bool = True) -> RecurrentChessBot:
+    return RecurrentChessBot(
+        load_published_chessbot(device, repo), default_unrolls=default_unrolls, gate_extra=gate_extra,
+    ).to(device)
 
 
 def average_recurrent_grads(model: RecurrentChessBot, unrolls: int) -> None:
-    if unrolls <= 1:
+    if unrolls <= 1 or getattr(model, "gate_extra", False):
         return
     scale = 1.0 / float(unrolls)
     for p in model.recurrent_parameters():
@@ -217,6 +238,18 @@ def identity_errors(student: RecurrentChessBot, planes: torch.Tensor) -> dict[st
     student.eval()
     with torch.no_grad():
         a = student(planes, recurrent_unrolls=1)
+        b = student.published_forward(planes)
+    return {
+        name: float((a[name] - b[name]).abs().max())
+        for name in ("policy_logits", "value_logits", "value_logits_q")
+    }
+
+
+def depth_identity_errors(student: RecurrentChessBot, planes: torch.Tensor, unrolls: int) -> dict[str, float]:
+    """Compare the training-depth forward to the published one-pass loop."""
+    student.eval()
+    with torch.no_grad():
+        a = student(planes, recurrent_unrolls=int(unrolls))
         b = student.published_forward(planes)
     return {
         name: float((a[name] - b[name]).abs().max())

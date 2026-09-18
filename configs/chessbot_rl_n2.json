@@ -1,0 +1,23 @@
+{
+  "seed": 291,
+  "unrolls": 2,
+  "iterations": 20,
+  "decisions": 32768,
+  "environments": 16,
+  "ply_cap": 800,
+  "epochs": 2,
+  "minibatch": 256,
+  "microbatch": 32,
+  "audit_microbatch": 128,
+  "audit_cheap_size": 256,
+  "audit_full_every": 8,
+  "cache_rollout": true,
+  "anchor_batch": 128,
+  "audit_size": 2048,
+  "eval_pairs": 32,
+  "confirm_pairs": 96,
+  "sf_nodes": 8000,
+  "lr": 1e-6,
+  "sl_warmup": 200,
+  "sl_batch": 32
+}

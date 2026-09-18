@@ -193,6 +193,19 @@ def legal_policy_mask(board: chess.Board, device: torch.device | None = None) ->
     return mask if device is None else mask.to(device)
 
 
+def expand_chessbot_policy(policy_idx, policy_p) -> np.ndarray:
+    """Sparse MultiPV slots → ChessBot-1929 vector. Unused logits stay -1."""
+    out = np.full(CHESSBOT_VOCAB_SIZE, -1.0, dtype=np.float32)
+    for idx, p in zip(policy_idx, policy_p):
+        i = int(idx)
+        if i < 0:
+            continue
+        if i >= CHESSBOT_VOCAB_SIZE:
+            raise ValueError(f"policy index {i} is outside the ChessBot vocab")
+        out[i] = float(p)
+    return out
+
+
 def move_to_policy_index(move: chess.Move) -> int:
     uci = move.uci()
     if uci.endswith("n"):
